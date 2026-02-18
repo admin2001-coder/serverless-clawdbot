@@ -1,0 +1,41 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "redirects": [
+    {
+      "source": "/health",
+      "destination": "/api/claw?op=health",
+      "permanent": false
+    },
+    {
+      "source": "/pair",
+      "destination": "/api/claw?op=pair",
+      "permanent": false
+    },
+    {
+      "source": "/webhook",
+      "destination": "/api/claw?op=webhook",
+      "permanent": false
+    },
+    {
+      "source": "/telegram",
+      "destination": "/api/claw?op=telegram",
+      "permanent": false
+    },
+    {
+      "source": "/whatsapp",
+      "destination": "/api/claw?op=whatsapp",
+      "permanent": false
+    },
+    {
+      "source": "/sms",
+      "destination": "/api/claw?op=sms",
+      "permanent": false
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/claw?op=cron",
+      "schedule": "* * * * *"
+    }
+  ]
+}

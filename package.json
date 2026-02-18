@@ -1,0 +1,35 @@
+{
+  "name": "zeroclaw-vercel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "workflow:web": "npx workflow web"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "latest",
+    "@composio/core": "latest",
+    "@composio/vercel": "latest",
+    "@upstash/redis": "latest",
+    "ai": "latest",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "ssh2": "latest",
+    "workflow": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/ssh2": "^1.15.5",
+    "eslint": "latest",
+    "eslint-config-next": "latest",
+    "typescript": "latest"
+  }
+}
