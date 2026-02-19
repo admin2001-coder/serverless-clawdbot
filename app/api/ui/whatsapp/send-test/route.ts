@@ -1,4 +1,4 @@
-/* import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { env } from "@/app/lib/env";
 import { getUiCookie, verifyUiToken } from "@/app/lib/uiAuth";
 import { whatsappSendMessage } from "@/app/lib/providers/whatsapp";
@@ -21,4 +21,3 @@ export async function POST(req: Request) {
   const baseUrl = env("APP_BASE_URL") ?? `${url.protocol}//${url.host}`;
   return NextResponse.redirect(`${baseUrl.replace(/\/$/, "")}/ui#whatsapp`, 303);
 }
-*/
