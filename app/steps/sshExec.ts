@@ -1,4 +1,8 @@
 import { env, csvEnv } from "@/app/lib/env";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 export async function sshExec(command: string) {
   "use step";
@@ -6,10 +10,9 @@ export async function sshExec(command: string) {
   const host = env("SSH_HOST");
   const user = env("SSH_USER");
   const port = Number(env("SSH_PORT") ?? "22");
-  const keyB64 = env("SSH_PRIVATE_KEY_B64");
 
-  if (!host || !user || !keyB64) {
-    throw new Error("SSH not configured (SSH_HOST/SSH_USER/SSH_PRIVATE_KEY_B64).");
+  if (!host || !user) {
+    throw new Error("SSH not configured (SSH_HOST/SSH_USER).");
   }
 
   const allowedPrefixes = csvEnv("SSH_ALLOWED_PREFIXES");
@@ -17,30 +20,19 @@ export async function sshExec(command: string) {
     throw new Error(`SSH command not allowed by policy. Allowed prefixes: ${allowedPrefixes.join(", ")}`);
   }
 
-  // ✅ Dynamic import so Turbopack doesn't bundle ssh2
-  const mod: any = await import("ssh2");
-  const Client = mod.Client ?? mod.default?.Client ?? mod.default ?? mod;
+  // Use your local ssh agent or a key file path env var (recommended)
+  const keyPath = env("SSH_KEY_PATH"); // e.g. /Users/weave1/.ssh/clawdbot_key
 
-  const privateKey = Buffer.from(keyB64, "base64").toString("utf8");
+  const args = [
+    "-p", String(port),
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    ...(keyPath ? ["-i", keyPath] : []),
+    `${user}@${host}`,
+    command,
+  ];
 
-  return await new Promise<string>((resolve, reject) => {
-    const conn = new Client();
-    conn
-      .on("ready", () => {
-        conn.exec(command, (err: any, stream: any) => {
-          if (err) return reject(err);
-          let out = "";
-          let errOut = "";
-          stream.on("data", (d: any) => (out += d.toString("utf8")));
-          stream.stderr.on("data", (d: any) => (errOut += d.toString("utf8")));
-          stream.on("close", (code: any) => {
-            conn.end();
-            if (code && code !== 0) return reject(new Error(`SSH exit code ${code}: ${errOut || out}`));
-            resolve(out || errOut);
-          });
-        });
-      })
-      .on("error", reject)
-      .connect({ host, port, username: user, privateKey });
-  });
+  const { stdout, stderr } = await execFileAsync("ssh", args, { timeout: 60_000 });
+
+  return (stdout || stderr || "").toString();
 }
