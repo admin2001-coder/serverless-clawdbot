@@ -1,9 +1,5 @@
 import { env, csvEnv } from "@/app/lib/env";
 
-// ssh2 is CommonJS; use a default import for best interop across bundlers.
-import ssh2 from "ssh2";
-const { Client } = ssh2 as any;
-
 export async function sshExec(command: string) {
   "use step";
 
@@ -20,6 +16,10 @@ export async function sshExec(command: string) {
   if (allowedPrefixes.length > 0 && !allowedPrefixes.some((p) => command.startsWith(p))) {
     throw new Error(`SSH command not allowed by policy. Allowed prefixes: ${allowedPrefixes.join(", ")}`);
   }
+
+  // ✅ Dynamic import so Turbopack doesn't bundle ssh2
+  const mod: any = await import("ssh2");
+  const Client = mod.Client ?? mod.default?.Client ?? mod.default ?? mod;
 
   const privateKey = Buffer.from(keyB64, "base64").toString("utf8");
 
