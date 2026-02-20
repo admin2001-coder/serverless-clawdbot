@@ -259,7 +259,73 @@ export async function GET(req: Request) {
 
     return new Response(res.body, { status: 200, headers });
   }
+  if (op === "webhook") {
+    const ok = await verifyGatewayBearer(req);
+    if (!ok) return new Response("Unauthorized", { status: 401 });
 
+    const body = await req.json().catch(() => null);
+    if (!body) return new Response("Bad JSON", { status: 400 });
+
+    const message = String(body.message ?? "");
+    if (!message) return new Response("Missing field: message", { status: 400 });
+
+    const deliver = body.deliver !== undefined ? Boolean(body.deliver) : true;
+    const channel = String(body.channel ?? "last");
+    const allowSessionOverride = env("ALLOW_WEBHOOK_SESSION_ID") === "true";
+    const requestedSessionId = allowSessionOverride ? String(body.sessionId ?? "") : "";
+
+    let target: { channel: Channel; sessionId: string } | null = null;
+
+    if (requestedSessionId) {
+      const meta = await getSessionMeta(requestedSessionId);
+      if (meta) target = { channel: meta.channel, sessionId: meta.sessionId };
+    } else if (channel === "last") {
+      target = await getLastSession("any");
+    } else if (channel === "telegram" || channel === "whatsapp" || channel === "sms") {
+      target = await getLastSession(channel);
+    }
+
+    if (!deliver) return new Response(null, { status: 202 });
+    if (!target) return new Response("No active chat session to deliver to", { status: 409 });
+
+    const meta = await getSessionMeta(target.sessionId);
+    if (!meta) return new Response("Missing session metadata", { status: 409 });
+
+    const synthetic: InboundMessage = {
+      channel: meta.channel,
+      sessionId: meta.sessionId,
+      senderId: meta.senderId,
+      senderUsername: meta.senderUsername,
+      text: message,
+      ts: Date.now(),
+      raw: { source: "webhook" },
+    };
+
+    await routeToSession(synthetic);
+    return new Response(null, { status: 202 });
+  }
+
+  if (op === "telegram") {
+    if (!(await telegramValidateWebhook(req))) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    const update = await req.json().catch(() => null);
+    if (!update) return new Response("Bad JSON", { status: 400 });
+
+    // ✅ Dedupe Telegram retries
+    const updateId = (update as any)?.update_id;
+    if (typeof updateId === "number") {
+      const store = getStore();
+      const key = `dedupe:telegram:update:${updateId}`;
+      const inserted = await store.set(key, "1", { exSeconds: 600, nx: true });
+      if (!inserted) return jsonOk({ deduped: true });
+    }
+
+    const msg = await normalizeTelegram(update);
+    if (msg) await handleInbound(msg);
+    return jsonOk();
+  }
   return new Response("Not found", { status: 404 });
 }
 
@@ -405,3 +471,4 @@ export async function POST(req: Request) {
 
   return new Response("Not found", { status: 404 });
 }
+
