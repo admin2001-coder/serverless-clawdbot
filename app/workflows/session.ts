@@ -126,6 +126,9 @@ export async function sessionWorkflow(sessionId: string, first?: InboundMessage)
       history,
     });
 // ✅ if Telegram streaming delivered, skip sendOutbound
+
+    history.push({ role: "assistant", content: result.text });
+
 if (!(result as any).delivered) {
   await sendOutbound({
     channel: msg.channel,
@@ -133,14 +136,6 @@ if (!(result as any).delivered) {
     text: result.text,
   });
 }
-    history.push({ role: "assistant", content: result.text });
-
-    await sendOutbound({
-      channel: msg.channel,
-      sessionId: msg.sessionId,
-      text: result.text,
-    });
-
     await saveHistoryStep(sessionId, history);
   }
 
