@@ -19,7 +19,138 @@ function filterTools(tools: ToolSet, allow: string[]): ToolSet {
   }
   return out as ToolSet;
 }
+// --- Telegram streaming + typing (drop-in) ---
 
+const telegramStreamingEnabled =
+  args.channel === "telegram" &&
+  (args.showTyping ?? true) &&
+  (env("TELEGRAM_STREAMING") ?? "true") !== "false";
+
+const editThrottleMs = Math.max(250, Number(env("TELEGRAM_STREAM_EDIT_THROTTLE_MS") ?? 750));
+const typingIntervalMs = Math.max(1000, Number(env("TELEGRAM_TYPING_INTERVAL_MS") ?? 4000));
+const maxEditChars = Math.max(800, Math.min(3800, Number(env("TELEGRAM_STREAM_CHUNK_CHARS") ?? 3500)));
+
+let typingLoop: { stop: () => void } | null = null;
+let placeholderMsgId: number | null = null;
+
+function createEditCoalescer() {
+  let lastSent = "";
+  let lastAt = 0;
+  let inflight: Promise<void> | null = null;
+  let pending: string | null = null;
+
+  async function doEdit(text: string) {
+    const t = clampNonEmptyText(text);
+    if (t === lastSent) return;
+
+    const now = Date.now();
+    const wait = editThrottleMs - (now - lastAt);
+    if (wait > 0) await sleep(wait);
+
+    try {
+      await telegramEditMessageText(args.sessionId, placeholderMsgId!, t);
+      lastSent = t;
+      lastAt = Date.now();
+    } catch {
+      // best-effort (rate limits / "message not modified")
+    }
+  }
+
+  async function worker() {
+    while (pending !== null) {
+      const t = pending;
+      pending = null;
+      await doEdit(t);
+    }
+    inflight = null;
+  }
+
+  return {
+    request(text: string) {
+      pending = text;
+      if (!inflight) inflight = worker();
+    },
+    async flush() {
+      if (inflight) await inflight;
+      if (pending !== null) {
+        const t = pending;
+        pending = null;
+        await doEdit(t);
+      }
+    },
+  };
+}
+
+async function deliverFinalTelegram(text: string) {
+  const chunks = splitForTelegram(text, maxEditChars);
+
+  // Edit placeholder to first chunk
+  if (placeholderMsgId != null) {
+    try {
+      await telegramEditMessageText(args.sessionId, placeholderMsgId, chunks[0]);
+    } catch {
+      placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
+    }
+  } else {
+    placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
+  }
+
+  // Send remaining chunks once (only at the end)
+  for (let i = 1; i < chunks.length; i++) {
+    await telegramSendMessage(args.sessionId, chunks[i], { disableNotification: true });
+  }
+
+  return { delivered: true };
+}
+
+async function streamToTelegram(textStream: AsyncIterable<string>): Promise<string> {
+  let full = "";
+  const editor = createEditCoalescer();
+
+  for await (const delta of textStream) {
+    full += delta;
+    // only edit the preview window while streaming (prevents message spam)
+    editor.request(full.slice(0, maxEditChars));
+  }
+
+  await editor.flush();
+  return full;
+}
+
+// --- In your main try/finally around generation ---
+try {
+  if (telegramStreamingEnabled) {
+    // start typing loop (non-blocking)
+    typingLoop = telegramStartChatActionLoop(args.sessionId, "typing", { intervalMs: typingIntervalMs });
+
+    // send placeholder immediately
+    placeholderMsgId = await telegramSendMessage(args.sessionId, "…", { disableNotification: true });
+
+    // run model with streamText and progressively edit
+    const s = streamText({
+      model: openai(modelName),
+      system,
+      messages,
+      tools,
+      temperature,
+      stopWhen: stepCountIs(10),
+    });
+
+    const text = await streamToTelegram(s.textStream);
+
+    // finalize message (and split if long)
+    await deliverFinalTelegram(text);
+
+    return { text, responseMessages: [], delivered: true };
+  }
+
+  // non-telegram or streaming disabled -> normal generateText
+  const r = await generateText({ model: openai(modelName), system, messages, tools, temperature, stopWhen: stepCountIs(10) });
+  return { text: r.text, responseMessages: r.response?.messages as any };
+
+} finally {
+  typingLoop?.stop();
+}
 export async function agentTurn(args: {
   sessionId: string;
   userId: string;
