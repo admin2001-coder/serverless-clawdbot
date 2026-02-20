@@ -247,11 +247,11 @@ export async function agentTurn(args: {
   const hasImages = historyHasImages(messages);
 
   // Model selection (fast by default)
-  const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o-mini";
-  const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o";
+  const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-5-mini";
+  const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-5.2";
   const modelName = hasImages ? smartModel : fastModel;
 
-  const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.2");
+  const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.99");
 
   // Telegram streaming + typing
   const isTelegram = args.channel === "telegram";
@@ -307,19 +307,62 @@ export async function agentTurn(args: {
       return { ok: true, output };
     },
   });
+const connectToolkit = tool({
+  description:
+    "Generate a Composio connect/authorize link for any supported toolkit. Accepts user-friendly names (e.g., Typeform, Slack, Gmail) and resolves them to the correct Composio slug automatically. Must support and correctly resolve ALL enabled toolkits in the environment, including: Typeform (typeform-t45t95) OpenAI (openai-her6j8) Gist (gist-awuq4e) LinkedIn (linkedin--mngyu) v0 (v0-zgpxgp) Vercel (vercel-hpgide) Twitter / X (twitter-fxsrrm) Discord (auth_config_discord_1771545162164) Notion (auth_config_notion_1771454798561, auth_config_notion_1770964056205) Google Docs (auth_config_googledocs_1771452482255) Slack (both configs) Google Calendar (both configs) Google Sheets (auth_config_googlesheets_1771378414575) Instagram (auth_config_instagram_1771377025656) Google Drive (auth_config_googledrive_1771375378647) Linear (both configs) Gmail (both configs) Airtable (auth_config_airtable_1771371468427) GitHub (auth_config_github_1771037795645) Figma (auth_config_figma_1771025866889) WhatsApp (auth_config_whatsapp_1771025557413) Zoom (auth_config_zoom_1771021569586) Asana (auth_config_asana_1770961995408) The system must: Normalize casing and spacing (e.g., google drive, GoogleDrive, GDrive). Handle common aliases (e.g., X → Twitter, Docs→ Google Docs). Automatically select the correct auth config if multiple exist. Return a fully constructed Composio authorization URL. Fail gracefully with a helpful error if the toolkit is unsupported.",
+  inputSchema: zodSchema(z.object({ toolkit: z.string().min(1) })),
+  execute: async (input: { toolkit: string }) => {
+    if (!env("COMPOSIO_API_KEY")) {
+      return { ok: false, error: "COMPOSIO_API_KEY not set" };
+    }
 
-  // Composio helper tools so the model can connect users WITHOUT requiring /connect
-  const connectToolkit = tool({
-    description:
-      "If a Composio toolkit is not connected for this user, generate a connect/authorize link for it (e.g. twitter, discord, slack).",
-    inputSchema: zodSchema(z.object({ toolkit: z.string().min(1) })),
-    execute: async (input: { toolkit: string }) => {
-      if (!env("COMPOSIO_API_KEY")) {
-        return { ok: false, error: "COMPOSIO_API_KEY not set" };
-      }
-      return composioConnectLink(args.userId, input.toolkit.toLowerCase());
-    },
-  });
+    const wanted = input.toolkit.trim().toLowerCase();
+    const userScoped = await composio.create(args.userId, { manageConnections: false } as any);
+
+    const toolkits: any = await userScoped.toolkits();
+    const items: any[] = toolkits?.items ?? [];
+
+    const normalized = items
+      .map((t) => {
+        const slug = String(t?.slug ?? t?.name ?? "").toLowerCase();
+        const name = String(t?.name ?? t?.slug ?? "").toLowerCase();
+        const connected = Boolean(t?.connection?.connectedAccount?.id);
+        return { slug, name, connected };
+      })
+      .filter((x) => x.slug);
+
+    const match =
+      normalized.find((x) => x.slug === wanted) ||
+      normalized.find((x) => x.name === wanted) ||
+      normalized.find((x) => x.slug.includes(wanted)) ||
+      normalized.find((x) => x.name.includes(wanted));
+
+    if (!match) {
+      const top = normalized.slice(0, 25).map((x) => x.slug).join(", ");
+      return {
+        ok: false,
+        error: `Toolkit "${input.toolkit}" not found.`,
+        hint: `Available toolkits include: ${top}`,
+      };
+    }
+
+    const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
+    const req: any = await userScoped.authorize(
+      match.slug,
+      callbackUrl ? { callbackUrl } : undefined
+    );
+
+    const link = String(req?.redirectUrl ?? req?.redirect_url ?? "");
+
+    return {
+      ok: Boolean(link),
+      toolkit: match.slug,
+      link,
+      alreadyConnected: match.connected,
+    };
+  },
+});
+
 
   const listConnections = tool({
     description: "List which Composio toolkits are connected for this user.",
