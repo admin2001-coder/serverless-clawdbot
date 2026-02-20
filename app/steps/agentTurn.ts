@@ -634,7 +634,62 @@ function filterComposioTools(tools: ToolSet): ToolSet {
   }
   return out as ToolSet;
 }
+async function composioConnectToolkitByName(userId: string, toolkitInput: string) {
+  const wanted = toolkitInput.trim().toLowerCase();
+  const wantedNorm = wanted.replace(/\s+/g, "");
 
+  const alias = (s: string) => {
+    const t = s.trim().toLowerCase();
+    if (t === "x") return "twitter";
+    if (t === "twitter/x") return "twitter";
+    if (t === "docs") return "google docs";
+    if (t === "drive") return "google drive";
+    if (t === "sheets") return "google sheets";
+    return t;
+  };
+
+  const w = alias(wanted);
+  const wNorm = alias(wantedNorm);
+
+  const userScoped = await composio.create(userId, { manageConnections: false } as any);
+  const toolkits: any = await userScoped.toolkits();
+  const items: any[] = toolkits?.items ?? [];
+
+  const normalized = items
+    .map((t) => {
+      const slug = String(t?.slug ?? t?.name ?? "").toLowerCase();
+      const name = String(t?.name ?? t?.slug ?? "").toLowerCase();
+      const slugNorm = slug.replace(/\s+/g, "");
+      const nameNorm = name.replace(/\s+/g, "");
+      const connected = Boolean(t?.connection?.connectedAccount?.id);
+      return { slug, name, slugNorm, nameNorm, connected };
+    })
+    .filter((x) => x.slug);
+
+  const match =
+    normalized.find((x) => x.slug === w || x.name === w) ||
+    normalized.find((x) => x.slugNorm === wNorm || x.nameNorm === wNorm) ||
+    normalized.find((x) => x.slug.includes(w) || x.name.includes(w)) ||
+    normalized.find((x) => x.slugNorm.includes(wNorm) || x.nameNorm.includes(wNorm));
+
+  if (!match) {
+    const top = normalized
+      .slice(0, 30)
+      .map((x) => `${x.slug}${x.connected ? " (connected)" : ""}`)
+      .join(", ");
+    return {
+      ok: false,
+      error: `Toolkit "${toolkitInput}" not found in Composio toolkits list.`,
+      hint: `Try one of: ${top}`,
+    };
+  }
+
+  const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
+  const req: any = await userScoped.authorize(match.slug, callbackUrl ? { callbackUrl } : undefined);
+  const link = String(req?.redirectUrl ?? req?.redirect_url ?? "");
+
+  return { ok: Boolean(link), toolkit: match.slug, link, alreadyConnected: match.connected };
+}
 async function getComposioToolsForUser(userId: string): Promise<ToolSet> {
   if (!env("COMPOSIO_API_KEY")) return {};
 
