@@ -387,6 +387,13 @@ export async function POST(req: Request) {
       return new Response("Unauthorized", { status: 401 });
     }
     const update = await req.json().catch(() => null);
+    const updateId = (update as any)?.update_id;
+if (typeof updateId === "number") {
+  const store = getStore();
+  const key = `dedupe:telegram:update:${updateId}`;
+  const inserted = await store.set(key, "1", { exSeconds: 600, nx: true });
+  if (!inserted) return jsonOk({ deduped: true });
+}
     if (!update) return new Response("Bad JSON", { status: 400 });
     const msg = await normalizeTelegram(update);
     if (msg) await handleInbound(msg);
