@@ -34,6 +34,9 @@ const composio = new Composio({
 
 const composioToolsCache = new Map<string, { tools: ToolSet; expiresAt: number }>();
 
+// ============================================================
+// Small helpers
+// ============================================================
 function sleep(ms: number) {
   return new Promise<void>((r) => setTimeout(r, ms));
 }
@@ -113,12 +116,10 @@ function parseSlashCommand(text: string): { cmd: string; arg: string } | null {
 }
 
 // ============================================================
-// Composio tool filtering (IMPORTANT: "*" means allow ALL)
+// Composio allowlist handling ("*" means ALL)
 // ============================================================
 function filterComposioTools(tools: ToolSet): ToolSet {
   const allow = csvEnv("COMPOSIO_ALLOWED_TOOLS");
-
-  // ✅ if unset or "*" => allow ALL
   if (!allow.length || allow.includes("*")) return tools;
 
   const out: Record<string, unknown> = {};
@@ -152,37 +153,85 @@ async function composioListConnections(userId: string) {
   const toolkits: any = await userScoped.toolkits();
   const items: any[] = toolkits?.items ?? [];
 
-  // best-effort normalized view
-  const normalized = items.map((t) => ({
-    slug: String(t?.slug ?? t?.name ?? "").toLowerCase(),
-    connected: Boolean(t?.connection?.connectedAccount?.id),
-  }));
+  const normalized = items
+    .map((t) => ({
+      slug: String(t?.slug ?? t?.name ?? "").toLowerCase(),
+      name: String(t?.name ?? t?.slug ?? "").toLowerCase(),
+      connected: Boolean(t?.connection?.connectedAccount?.id),
+    }))
+    .filter((x) => x.slug);
 
   return {
     ok: true,
-    items: normalized.filter((x) => x.slug),
-    connected: normalized.filter((x) => x.slug && x.connected).map((x) => x.slug),
+    items: normalized.map((x) => ({ slug: x.slug, connected: x.connected })),
+    connected: normalized.filter((x) => x.connected).map((x) => x.slug),
   };
 }
 
-async function composioConnectLink(userId: string, toolkit: string) {
+async function composioConnectToolkitByName(userId: string, toolkitInput: string) {
+  const wanted = toolkitInput.trim().toLowerCase();
+  const wantedNorm = wanted.replace(/\s+/g, "");
+
+  const alias = (s: string) => {
+    const t = s.trim().toLowerCase();
+    if (t === "x") return "twitter";
+    if (t === "twitter/x") return "twitter";
+    if (t === "docs") return "google docs";
+    if (t === "drive") return "google drive";
+    if (t === "sheets") return "google sheets";
+    return t;
+  };
+
+  const w = alias(wanted);
+  const wNorm = alias(wantedNorm);
+
   const userScoped = await composio.create(userId, { manageConnections: false } as any);
+  const toolkits: any = await userScoped.toolkits();
+  const items: any[] = toolkits?.items ?? [];
+
+  const normalized = items
+    .map((t) => {
+      const slug = String(t?.slug ?? t?.name ?? "").toLowerCase();
+      const name = String(t?.name ?? t?.slug ?? "").toLowerCase();
+      const slugNorm = slug.replace(/\s+/g, "");
+      const nameNorm = name.replace(/\s+/g, "");
+      const connected = Boolean(t?.connection?.connectedAccount?.id);
+      return { slug, name, slugNorm, nameNorm, connected };
+    })
+    .filter((x) => x.slug);
+
+  const match =
+    normalized.find((x) => x.slug === w || x.name === w) ||
+    normalized.find((x) => x.slugNorm === wNorm || x.nameNorm === wNorm) ||
+    normalized.find((x) => x.slug.includes(w) || x.name.includes(w)) ||
+    normalized.find((x) => x.slugNorm.includes(wNorm) || x.nameNorm.includes(wNorm));
+
+  if (!match) {
+    const top = normalized
+      .slice(0, 30)
+      .map((x) => `${x.slug}${x.connected ? " (connected)" : ""}`)
+      .join(", ");
+    return {
+      ok: false,
+      error: `Toolkit "${toolkitInput}" not found in Composio toolkits list.`,
+      hint: `Try one of: ${top}`,
+    };
+  }
+
   const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
-  const req: any = await userScoped.authorize(toolkit, callbackUrl ? { callbackUrl } : undefined);
+  const req: any = await userScoped.authorize(match.slug, callbackUrl ? { callbackUrl } : undefined);
   const link = String(req?.redirectUrl ?? req?.redirect_url ?? "");
-  return { ok: Boolean(link), toolkit, link };
+
+  return { ok: Boolean(link), toolkit: match.slug, link, alreadyConnected: match.connected };
 }
 
 // ============================================================
-// Telegram streaming helpers
+// Telegram streaming coalescer
 // ============================================================
-function createEditCoalescer(opts: {
-  sessionId: string;
-  messageId: number;
-  throttleMs: number;
-}) {
+function createEditCoalescer(opts: { sessionId: string; messageId: number; throttleMs: number }) {
   let lastSent = "";
   let lastAt = 0;
+
   let inflight: Promise<void> | null = null;
   let pending: string | null = null;
 
@@ -246,12 +295,13 @@ export async function agentTurn(args: {
   const userText = String(extractRecentUserText(messages) ?? "").trim();
   const hasImages = historyHasImages(messages);
 
-  // Model selection (fast by default)
-  const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-5-mini";
-  const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-5.2";
+  // ✅ Use safe model names unless you have custom ones configured
+  const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o-mini";
+  const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o";
   const modelName = hasImages ? smartModel : fastModel;
 
-  const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.99");
+  // ✅ Low temp for tools / less hallucination
+  const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.2");
 
   // Telegram streaming + typing
   const isTelegram = args.channel === "telegram";
@@ -268,7 +318,7 @@ export async function agentTurn(args: {
   let placeholderMsgId: number | null = null;
 
   // ============================================================
-  // Tools: schedule + ssh + composio helper tools
+  // Tools
   // ============================================================
   const scheduleMessage = tool({
     description: "Schedule a message back to this user/session after delaySeconds.",
@@ -307,76 +357,28 @@ export async function agentTurn(args: {
       return { ok: true, output };
     },
   });
-const connectToolkit = tool({
-  description:
-    "Generate a Composio connect/authorize link for any supported toolkit. Accepts user-friendly names (e.g., Typeform, Slack, Gmail) and resolves them to the correct Composio slug automatically. Must support and correctly resolve ALL enabled toolkits in the environment, including: Typeform (typeform-t45t95) OpenAI (openai-her6j8) Gist (gist-awuq4e) LinkedIn (linkedin--mngyu) v0 (v0-zgpxgp) Vercel (vercel-hpgide) Twitter / X (twitter-fxsrrm) Discord (auth_config_discord_1771545162164) Notion (auth_config_notion_1771454798561, auth_config_notion_1770964056205) Google Docs (auth_config_googledocs_1771452482255) Slack (both configs) Google Calendar (both configs) Google Sheets (auth_config_googlesheets_1771378414575) Instagram (auth_config_instagram_1771377025656) Google Drive (auth_config_googledrive_1771375378647) Linear (both configs) Gmail (both configs) Airtable (auth_config_airtable_1771371468427) GitHub (auth_config_github_1771037795645) Figma (auth_config_figma_1771025866889) WhatsApp (auth_config_whatsapp_1771025557413) Zoom (auth_config_zoom_1771021569586) Asana (auth_config_asana_1770961995408) The system must: Normalize casing and spacing (e.g., google drive, GoogleDrive, GDrive). Handle common aliases (e.g., X → Twitter, Docs→ Google Docs). Automatically select the correct auth config if multiple exist. Return a fully constructed Composio authorization URL. Fail gracefully with a helpful error if the toolkit is unsupported.",
-  inputSchema: zodSchema(z.object({ toolkit: z.string().min(1) })),
-  execute: async (input: { toolkit: string }) => {
-    if (!env("COMPOSIO_API_KEY")) {
-      return { ok: false, error: "COMPOSIO_API_KEY not set" };
-    }
 
-    const wanted = input.toolkit.trim().toLowerCase();
-    const userScoped = await composio.create(args.userId, { manageConnections: false } as any);
-
-    const toolkits: any = await userScoped.toolkits();
-    const items: any[] = toolkits?.items ?? [];
-
-    const normalized = items
-      .map((t) => {
-        const slug = String(t?.slug ?? t?.name ?? "").toLowerCase();
-        const name = String(t?.name ?? t?.slug ?? "").toLowerCase();
-        const connected = Boolean(t?.connection?.connectedAccount?.id);
-        return { slug, name, connected };
-      })
-      .filter((x) => x.slug);
-
-    const match =
-      normalized.find((x) => x.slug === wanted) ||
-      normalized.find((x) => x.name === wanted) ||
-      normalized.find((x) => x.slug.includes(wanted)) ||
-      normalized.find((x) => x.name.includes(wanted));
-
-    if (!match) {
-      const top = normalized.slice(0, 25).map((x) => x.slug).join(", ");
-      return {
-        ok: false,
-        error: `Toolkit "${input.toolkit}" not found.`,
-        hint: `Available toolkits include: ${top}`,
-      };
-    }
-
-    const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
-    const req: any = await userScoped.authorize(
-      match.slug,
-      callbackUrl ? { callbackUrl } : undefined
-    );
-
-    const link = String(req?.redirectUrl ?? req?.redirect_url ?? "");
-
-    return {
-      ok: Boolean(link),
-      toolkit: match.slug,
-      link,
-      alreadyConnected: match.connected,
-    };
-  },
-});
-
+  const connectToolkit = tool({
+    description:
+      "Generate a Composio connect/authorize link for a toolkit. Accepts user-friendly names like 'Typeform', 'Google Drive', or 'X'. Resolves by listing available Composio toolkits and choosing the closest match slug.",
+    inputSchema: zodSchema(z.object({ toolkit: z.string().min(1) })),
+    execute: async (input: { toolkit: string }) => {
+      if (!env("COMPOSIO_API_KEY")) return { ok: false, error: "COMPOSIO_API_KEY not set" };
+      return composioConnectToolkitByName(args.userId, input.toolkit);
+    },
+  });
 
   const listConnections = tool({
     description: "List which Composio toolkits are connected for this user.",
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
-      if (!env("COMPOSIO_API_KEY")) {
-        return { ok: false, error: "COMPOSIO_API_KEY not set" };
-      }
+      if (!env("COMPOSIO_API_KEY")) return { ok: false, error: "COMPOSIO_API_KEY not set" };
       return composioListConnections(args.userId);
     },
   });
 
   // ============================================================
-  // Fast-path /ssh command (instant, no model)
+  // Fast-path /ssh (instant, no model)
   // ============================================================
   const slash = parseSlashCommand(userText);
   if (slash?.cmd === "/ssh") {
@@ -386,7 +388,7 @@ const connectToolkit = tool({
   }
 
   // ============================================================
-  // Build composio tools (ALWAYS load if COMPOSIO_API_KEY is set)
+  // Load Composio tools (ALWAYS if COMPOSIO_API_KEY set)
   // ============================================================
   let composioTools: ToolSet = {};
   if (env("COMPOSIO_API_KEY")) {
@@ -417,6 +419,7 @@ const connectToolkit = tool({
       placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
     }
 
+    // send remainder only once at the end
     for (let i = 1; i < chunks.length; i++) {
       await telegramSendMessage(args.sessionId, chunks[i], { disableNotification: true });
     }
@@ -434,7 +437,6 @@ const connectToolkit = tool({
 
     for await (const delta of textStream) {
       full += delta;
-      // preview only (prevents spam)
       editor.request(full.slice(0, maxEditChars));
     }
 
@@ -443,31 +445,33 @@ const connectToolkit = tool({
   }
 
   // ============================================================
-  // System prompt: force truthful tool use and auto-connect behavior
+  // System prompt
   // ============================================================
   const system = [
     "You are Clawdbot, an assistant running inside Telegram/WhatsApp/SMS with Composio tools.",
     "",
     "CRITICAL TOOL RULES:",
-    "- If the user asks you to do an external action (Twitter/X post, Discord message, etc.), you MUST use the appropriate tool.",
+    "- If the user asks you to do an external action (Typeform, Twitter/X, Discord, Slack, etc.), you MUST use the appropriate tool.",
     "- Never claim an action succeeded unless a tool call returned success.",
-    "- If a tool call fails due to missing auth/connection, immediately call connect_toolkit to generate a link and ask the user to connect, then retry the original tool call.",
-    "- If you are unsure which toolkit is connected, call list_connections.",
+    "- If an action requires the user to connect a toolkit, call connect_toolkit and give the link.",
+    "- If you're unsure what's connected, call list_connections.",
     "",
     "SSH:",
-    "- You can run SSH via ssh_exec if needed. If ssh_exec returns blocked, tell the user to use /ssh <command>.",
+    "- You can run SSH via ssh_exec if needed. If blocked, tell the user to use /ssh <command>.",
     "",
     `Mode: ${autonomy}`,
-    "",
     "Be concise and correct. Avoid hallucinations.",
   ].join("\n");
 
   // ============================================================
-  // Run generation (stream on Telegram)
+  // Run generation (Telegram streams + typing)
   // ============================================================
   try {
     if (telegramStreamingEnabled) {
+      // start typing loop (non-blocking)
       typingLoop = telegramStartChatActionLoop(args.sessionId, "typing", { intervalMs: typingIntervalMs });
+
+      // send placeholder immediately so user sees activity
       placeholderMsgId = await telegramSendMessage(args.sessionId, "…", { disableNotification: true });
 
       const s = streamText({
@@ -481,6 +485,8 @@ const connectToolkit = tool({
 
       const text = await streamToTelegram(s.textStream);
       await deliverFinalTelegram(text);
+
+      // IMPORTANT: delivered=true prevents sessionWorkflow from sending another copy
       return { text, responseMessages: [] as any[], delivered: true };
     }
 
