@@ -1,36 +1,31 @@
 // app/workflows/session.ts
-import { defineHook } from "workflow";
 import type { InboundMessage } from "@/app/lib/normalize";
+import type { ModelMessage } from "ai";
+
 import { agentTurn } from "@/app/steps/agentTurn";
 import { sendOutbound } from "@/app/steps/sendOutbound";
 import { loadHistoryStep, saveHistoryStep } from "@/app/steps/sessionStateSteps";
-import type { ModelMessage } from "ai";
 
-export const inboundHook = defineHook<InboundMessage>();
-
+// -----------------------------
+// Helpers: multimodal user msg
+// -----------------------------
 type ImageInput =
   | { kind: "url"; value: string }
   | { kind: "base64"; value: string };
 
-// Try to extract images from many possible InboundMessage shapes without hard-coding your schema.
-// This compiles cleanly (no `never[]` concat typing issue).
 function extractImages(msg: InboundMessage): ImageInput[] {
   const m: any = msg as any;
   const out: ImageInput[] = [];
 
-  // 1) Direct single fields
+  // direct fields
   if (typeof m.imageUrl === "string" && m.imageUrl) out.push({ kind: "url", value: m.imageUrl });
   if (typeof m.image_url === "string" && m.image_url) out.push({ kind: "url", value: m.image_url });
 
-  // 2) Arrays of urls
-  if (Array.isArray(m.imageUrls)) {
-    for (const u of m.imageUrls) if (typeof u === "string" && u) out.push({ kind: "url", value: u });
-  }
-  if (Array.isArray(m.image_urls)) {
-    for (const u of m.image_urls) if (typeof u === "string" && u) out.push({ kind: "url", value: u });
-  }
+  // arrays of urls
+  if (Array.isArray(m.imageUrls)) for (const u of m.imageUrls) if (typeof u === "string" && u) out.push({ kind: "url", value: u });
+  if (Array.isArray(m.image_urls)) for (const u of m.image_urls) if (typeof u === "string" && u) out.push({ kind: "url", value: u });
 
-  // 3) Attachments/media/files arrays
+  // attachments/media/files
   const arrays: any[][] = [];
   if (Array.isArray(m.attachments)) arrays.push(m.attachments);
   if (Array.isArray(m.media)) arrays.push(m.media);
@@ -45,8 +40,6 @@ function extractImages(msg: InboundMessage): ImageInput[] {
         (typeof a.href === "string" && a.href) ||
         (typeof a.downloadUrl === "string" && a.downloadUrl) ||
         (typeof a.download_url === "string" && a.download_url) ||
-        (typeof a.publicUrl === "string" && a.publicUrl) ||
-        (typeof a.public_url === "string" && a.public_url) ||
         "";
 
       const mime =
@@ -71,11 +64,11 @@ function extractImages(msg: InboundMessage): ImageInput[] {
     }
   }
 
-  // 4) Raw base64 fields
+  // raw base64 fields
   if (typeof m.imageBase64 === "string" && m.imageBase64) out.push({ kind: "base64", value: m.imageBase64 });
   if (typeof m.image_base64 === "string" && m.image_base64) out.push({ kind: "base64", value: m.image_base64 });
 
-  // De-dupe
+  // dedupe
   const seen = new Set<string>();
   return out.filter((x) => {
     const k = `${x.kind}:${x.value}`;
@@ -88,61 +81,57 @@ function extractImages(msg: InboundMessage): ImageInput[] {
 function buildUserModelMessage(msg: InboundMessage): ModelMessage {
   const images = extractImages(msg);
 
-  // No images: keep it simple
   if (!images.length) {
     return { role: "user", content: msg.text ?? "" };
   }
 
-  // With images: use multimodal parts
   const parts: any[] = [];
   if (msg.text && msg.text.trim()) parts.push({ type: "text", text: msg.text });
 
   for (const img of images) {
-    if (img.kind === "url") {
-      // URL must be fetchable by the model (public or signed/proxied).
-      parts.push({ type: "image", image: new URL(img.value) });
-    } else {
-      // base64 string (AI SDK accepts directly)
-      parts.push({ type: "image", image: img.value });
-    }
+    if (img.kind === "url") parts.push({ type: "image", image: new URL(img.value) });
+    else parts.push({ type: "image", image: img.value });
   }
 
   return { role: "user", content: parts } as any;
 }
 
-export async function sessionWorkflow(sessionId: string, first?: InboundMessage) {
+function trimHistory(history: ModelMessage[], maxMessages: number): ModelMessage[] {
+  const m = Math.max(6, Math.min(200, maxMessages));
+  return history.length <= m ? history : history.slice(history.length - m);
+}
+
+// -----------------------------
+// The workflow (NO HOOKS)
+// -----------------------------
+export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
   "use workflow";
 
   let history = (await loadHistoryStep(sessionId)) as ModelMessage[];
+  history = Array.isArray(history) ? history : [];
 
-  async function handle(msg: InboundMessage) {
-    // ✅ Push multimodal user message when images exist
-    history.push(buildUserModelMessage(msg));
+  const max = Number(process.env.HISTORY_MAX_MESSAGES ?? "30");
+  history = trimHistory(history, Number.isFinite(max) ? max : 30);
 
-    const result = await agentTurn({
-      sessionId,
-      userId: `${msg.channel}:${msg.senderId}`,
-      channel: msg.channel,
-      history,
-    });
-// ✅ if Telegram streaming delivered, skip sendOutbound
+  history.push(buildUserModelMessage(msg));
 
-    history.push({ role: "assistant", content: result.text });
-
-if (!(result as any).delivered) {
-  await sendOutbound({
+  const result = await agentTurn({
+    sessionId,
+    userId: `${msg.channel}:${msg.senderId}`,
     channel: msg.channel,
-    sessionId: msg.sessionId,
-    text: result.text,
+    history,
+    showTyping: msg.channel === "telegram",
   });
-}
-    await saveHistoryStep(sessionId, history);
-  }
 
-  if (first) await handle(first);
+  history.push({ role: "assistant", content: result.text });
+  await saveHistoryStep(sessionId, history);
 
-  const hook = inboundHook.create({ token: `sess:${sessionId}` });
-  for await (const msg of hook) {
-    await handle(msg);
+  // ✅ Avoid duplicates: if Telegram streaming already delivered, do not send again
+  if (!(result as any).delivered) {
+    await sendOutbound({
+      channel: msg.channel,
+      sessionId: msg.sessionId,
+      text: result.text,
+    });
   }
 }
