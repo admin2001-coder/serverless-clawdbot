@@ -6,7 +6,34 @@ export async function telegramValidateWebhook(req: Request): Promise<boolean> {
   const got = req.headers.get("x-telegram-bot-api-secret-token");
   return got === secret;
 }
+export async function telegramSendChatAction(sessionId: string, action: "typing") {
+  const { chatId, threadId } = telegramSessionToChatAndThread(sessionId);
+  const payload: any = { chat_id: chatId, action };
+  if (threadId) payload.message_thread_id = threadId;
+  await telegramApiCall("sendChatAction", payload);
+}
 
+export function telegramStartChatActionLoop(
+  sessionId: string,
+  action: "typing",
+  opts?: { intervalMs?: number }
+): { stop: () => void } {
+  const intervalMs = Math.max(1000, Number(opts?.intervalMs ?? 4000));
+  let stopped = false;
+
+  (async () => {
+    while (!stopped) {
+      try {
+        await telegramSendChatAction(sessionId, action);
+      } catch {
+        // best-effort only
+      }
+      await new Promise<void>((r) => setTimeout(r, intervalMs));
+    }
+  })();
+
+  return { stop: () => (stopped = true) };
+}
 export function telegramSessionToChatAndThread(sessionId: string): { chatId: string; threadId?: number } {
   // sessionId examples:
   // telegram:<chatId> or telegram:<chatId>:<threadId>
