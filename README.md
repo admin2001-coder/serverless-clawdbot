@@ -1,4 +1,4 @@
-# ZeroClaw/OpenClaw → Vercel Workflow conversion (Gateway + Autonomous Daemon)
+# Agentic OS→ Vercel Workflow conversion (Gateway + Autonomous Daemon)
 
 This repo is a **serverless-friendly** “1:1 conversion” starter that keeps the same UI conventions
 (**Telegram**, **WhatsApp Cloud API**, **Textbelt SMS**) while replacing the always-on daemon with:
