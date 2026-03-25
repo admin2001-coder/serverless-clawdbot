@@ -1,5 +1,3 @@
-"use client"
-// page.tsx
 import { headers } from "next/headers";
 import Link from "next/link";
 import { requireUiAuthPage } from "@/app/lib/uiRequire";
