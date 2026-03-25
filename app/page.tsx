@@ -8,10 +8,10 @@ export default function Home() {
         padding: "40px 20px",
         maxWidth: "1100px",
         margin: "0 auto",
-        color: "#fff",
+        color: "#000",
         fontFamily:
           '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-        background: "radial-gradient(circle at top, #111 0%, #000 100%)",
+        background: "radial-gradient(circle at top, #fff 0%, #f5f5f5 100%)",
       }}
     >
       <div
@@ -19,8 +19,8 @@ export default function Home() {
           display: "inline-block",
           padding: "6px 12px",
           borderRadius: "999px",
-          background: "rgba(255,255,255,0.05)",
-          border: "1px solid rgba(255,255,255,0.1)",
+          background: "rgba(0,0,0,0.05)",
+          border: "1px solid rgba(0,0,0,0.1)",
           fontSize: "13px",
           marginBottom: "20px",
         }}
@@ -42,6 +42,7 @@ export default function Home() {
               fontSize: "48px",
               marginBottom: "16px",
               letterSpacing: "-1px",
+              color: "#000",
             }}
           >
             Admin Dashboard
@@ -49,7 +50,7 @@ export default function Home() {
 
           <p
             style={{
-              color: "#bbb",
+              color: "#444",
               lineHeight: 1.6,
               fontSize: "16px",
             }}
@@ -81,8 +82,8 @@ export default function Home() {
           style={{
             padding: "20px",
             borderRadius: "20px",
-            background: "rgba(255,255,255,0.05)",
-            border: "1px solid rgba(255,255,255,0.1)",
+            background: "rgba(0,0,0,0.05)",
+            border: "1px solid rgba(0,0,0,0.1)",
             backdropFilter: "blur(10px)",
           }}
         >
@@ -94,11 +95,11 @@ export default function Home() {
               marginBottom: "16px",
             }}
           >
-            <h2 style={{ margin: 0 }}>Quick Access</h2>
+            <h2 style={{ margin: 0, color: "#000" }}>Quick Access</h2>
             <span
               style={{
-                background: "rgba(0,255,150,0.15)",
-                color: "#4ade80",
+                background: "rgba(0,200,100,0.15)",
+                color: "#16a34a",
                 padding: "4px 10px",
                 borderRadius: "999px",
                 fontSize: "12px",
@@ -131,7 +132,7 @@ export default function Home() {
             <p
               style={{
                 fontSize: "13px",
-                color: "#888",
+                color: "#666",
                 marginBottom: "8px",
               }}
             >
@@ -149,10 +150,11 @@ export default function Home() {
                 <span
                   key={route}
                   style={{
-                    background: "rgba(255,255,255,0.1)",
+                    background: "rgba(0,0,0,0.1)",
                     padding: "6px 10px",
                     borderRadius: "8px",
                     fontSize: "12px",
+                    color: "#000",
                   }}
                 >
                   {route}
@@ -167,10 +169,10 @@ export default function Home() {
 }
 
 const codeStyle: React.CSSProperties = {
-  background: "rgba(255,255,255,0.1)",
+  background: "rgba(0,0,0,0.1)",
   padding: "2px 6px",
   borderRadius: "6px",
-  color: "#fff",
+  color: "#000",
 };
 
 const btnStyle: React.CSSProperties = {
@@ -182,14 +184,14 @@ const btnStyle: React.CSSProperties = {
 };
 
 const primaryBtnStyle: React.CSSProperties = {
-  background: "#fff",
-  color: "#000",
+  background: "#000",
+  color: "#fff",
 };
 
 const secondaryBtnStyle: React.CSSProperties = {
-  background: "rgba(255,255,255,0.05)",
-  border: "1px solid rgba(255,255,255,0.1)",
-  color: "#fff",
+  background: "rgba(0,0,0,0.05)",
+  border: "1px solid rgba(0,0,0,0.1)",
+  color: "#000",
 };
 
 const linkStyle: React.CSSProperties = {
@@ -197,7 +199,7 @@ const linkStyle: React.CSSProperties = {
   padding: "10px 14px",
   borderRadius: "12px",
   textDecoration: "none",
-  color: "#ccc",
-  background: "rgba(0,0,0,0.3)",
-  border: "1px solid rgba(255,255,255,0.05)",
+  color: "#333",
+  background: "rgba(255,255,255,0.8)",
+  border: "1px solid rgba(0,0,0,0.05)",
 };
