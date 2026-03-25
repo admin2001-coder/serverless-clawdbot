@@ -5,7 +5,7 @@ import Link from "next/link";
 import { requireUiAuthPage } from "@/app/lib/uiRequire";
 import { env } from "@/app/lib/env";
 import { getGatewayAuthStatus, ensurePairingCode } from "@/app/lib/gatewayAuth";
-//import { getTextbeltReplyWebhookUrl } from "@/app/lib/providers/textbelt";
+// import { getTextbeltReplyWebhookUrl } from "@/app/lib/providers/textbelt";
 import { getLastSession } from "@/app/lib/sessionMeta";
 import { getPrimary, getIntervalSeconds, isAutopilotEnabled } from "@/app/lib/autopilotState";
 
@@ -22,7 +22,7 @@ type SearchParams = {
 
 type TabKey =
   | "overview"
-  | "projects"
+  | "skills-deployments"
   | "integrations"
   | "activity"
   | "domains"
@@ -132,10 +132,8 @@ function toolkitLogo(slug: string): string | null {
   };
 
   if (explicit[key]) return explicit[key]!;
-
   const normalized = key.replace(/[^a-z0-9]/g, "");
   if (explicit[normalized]) return explicit[normalized]!;
-
   return null;
 }
 
@@ -193,7 +191,7 @@ export default async function UiPage({
     const raw = sp.tab;
     if (
       raw === "overview" ||
-      raw === "projects" ||
+      raw === "skills-deployments" ||
       raw === "integrations" ||
       raw === "activity" ||
       raw === "domains" ||
@@ -264,7 +262,7 @@ export default async function UiPage({
 
   const topTabs: TabKey[] = [
     "overview",
-    "projects",
+    "skills-deployments",
     "integrations",
     "activity",
     "domains",
@@ -278,7 +276,7 @@ export default async function UiPage({
         <header style={styles.topbar}>
           <div style={styles.topbarLeft}>
             <div style={styles.brandMark} aria-hidden="true">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
                 <path
                   d="M7.5 4.5c1.7 0 3.1 1 4.5 3.1 1.4-2.1 2.8-3.1 4.5-3.1a3 3 0 0 1 2.9 3c0 1.7-1 3.1-3.1 4.5 2.1 1.4 3.1 2.8 3.1 4.5a3 3 0 0 1-3 3c-1.7 0-3.1-1-4.4-3.1-1.4 2.1-2.8 3.1-4.5 3.1a3 3 0 0 1-3-3c0-1.7 1-3.1 3.1-4.5-2.1-1.4-3.1-2.8-3.1-4.5a3 3 0 0 1 3-3Z"
                   stroke="#111"
@@ -310,7 +308,10 @@ export default async function UiPage({
 
         <div style={styles.tabbar}>
           {topTabs.map((tab) => {
-            const label = tab[0]!.toUpperCase() + tab.slice(1);
+            const label =
+              tab === "skills-deployments"
+                ? "Skills Deployments"
+                : tab[0]!.toUpperCase() + tab.slice(1);
             const isActive = activeTab === tab;
             return (
               <Link
@@ -329,12 +330,11 @@ export default async function UiPage({
             <div style={styles.heroLeft}>
               <div style={styles.bigAvatar}>{firstLetter(profileName)}</div>
               <div>
-                <h1 style={styles.pageTitle}>{profileName}&apos;s Integrations</h1>
+                <h1 style={styles.pageTitle}>{profileName}&apos;s Skills Deployments</h1>
                 <div style={styles.subline}>
                   <span style={styles.gitIcon}>⌘</span>
                   <span>
-                    Connected to Composio{" "}
-                    <span style={styles.slashInline}>/</span>{" "}
+                    Connected to Composio <span style={styles.slashInline}>/</span>{" "}
                     <Link href={navHref("settings", userId, searchQuery)} style={styles.inlineBlue}>
                       Settings
                     </Link>
@@ -345,7 +345,7 @@ export default async function UiPage({
 
             <div>
               <details>
-                <summary style={styles.primaryAction}>New Project ▾</summary>
+                <summary style={styles.primaryAction}>New Skill ▾</summary>
                 <div style={styles.menuPopover}>
                   <Link href={navHref("integrations", userId, searchQuery)} style={styles.menuItem}>
                     View integrations
@@ -372,7 +372,7 @@ export default async function UiPage({
                 />
               </div>
               <button type="submit" style={styles.newProjectButton}>
-                New Project
+                New Skill
               </button>
               <Link href={navHref("settings", userId, searchQuery)} style={styles.iconButton}>
                 ⍟
@@ -397,13 +397,11 @@ export default async function UiPage({
                           <div style={styles.cardIdentity}>
                             <div style={styles.logoBadge}>
                               {logo ? (
-                                <img
-                                  src={logo}
-                                  alt={displayName}
-                                  style={styles.logoImage}
-                                />
+                                <img src={logo} alt={displayName} style={styles.logoImage} />
                               ) : (
-                                <span style={styles.logoFallback}>{initialsFromSlug(toolkit.slug)}</span>
+                                <span style={styles.logoFallback}>
+                                  {initialsFromSlug(toolkit.slug)}
+                                </span>
                               )}
                             </div>
 
@@ -469,13 +467,86 @@ export default async function UiPage({
             </div>
           )}
 
-          {activeTab === "projects" && (
-            <section style={styles.panelCard}>
-              <h2 style={styles.sectionTitle}>Projects</h2>
-              <p style={styles.sectionText}>
-                The main overview already presents integrations in the project-card layout. Use the
-                Overview tab as the primary dashboard surface.
-              </p>
+          {activeTab === "skills-deployments" && (
+            <section>
+              {composioError ? (
+                <div style={styles.errorCard}>{composioError}</div>
+              ) : filteredToolkits.length === 0 ? (
+                <div style={styles.errorCard}>No integrations matched your search.</div>
+              ) : (
+                <div style={styles.cardsArea}>
+                  {filteredToolkits.map((toolkit, index) => {
+                    const logo = toolkitLogo(toolkit.slug);
+                    const displayName = formatToolkitName(toolkit.slug, toolkit.name);
+
+                    return (
+                      <article key={toolkit.slug} style={styles.projectCard}>
+                        <div style={styles.cardHead}>
+                          <div style={styles.cardIdentity}>
+                            <div style={styles.logoBadge}>
+                              {logo ? (
+                                <img src={logo} alt={displayName} style={styles.logoImage} />
+                              ) : (
+                                <span style={styles.logoFallback}>
+                                  {initialsFromSlug(toolkit.slug)}
+                                </span>
+                              )}
+                            </div>
+
+                            <div>
+                              <div style={styles.cardTitleRow}>
+                                <div style={styles.cardTitle}>{displayName}</div>
+                                {toolkit.connected ? (
+                                  <span style={styles.healthPill}>100</span>
+                                ) : (
+                                  <span style={styles.healthPillMuted}>—</span>
+                                )}
+                              </div>
+                              <div style={styles.cardDomain}>
+                                {toolkit.connected
+                                  ? `${toolkit.slug}.connected`
+                                  : `${toolkit.slug}.not-connected`}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        <p style={styles.cardDescription}>
+                          {toolkit.connected
+                            ? `${displayName} is authorized and ready for agent use through Composio.`
+                            : `${displayName} is available but still needs authorization before the agent can use it.`}
+                        </p>
+
+                        <div
+                          style={{
+                            marginTop: "auto",
+                            paddingTop: 14,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 9,
+                          }}
+                        >
+                          <div style={styles.cardFooter}>
+                            {toolkit.connected
+                              ? `${humanTimeAgo(index)} ago via Composio`
+                              : `pending via Composio`}
+                          </div>
+
+                          <Link
+                            href={`/api/ui/composio/authorize?userId=${encodeURIComponent(
+                              userId
+                            )}&toolkit=${encodeURIComponent(toolkit.slug)}`}
+                            style={styles.cardActionLink}
+                          >
+                            {toolkit.connected ? "Reconnect" : "Connect"}
+                          </Link>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
             </section>
           )}
 
@@ -512,7 +583,9 @@ export default async function UiPage({
                                   {logo ? (
                                     <img src={logo} alt={name} style={styles.smallLogoImage} />
                                   ) : (
-                                    <span style={styles.smallLogoFallback}>{initialsFromSlug(t.slug)}</span>
+                                    <span style={styles.smallLogoFallback}>
+                                      {initialsFromSlug(t.slug)}
+                                    </span>
                                   )}
                                 </div>
                                 <span>{name}</span>
@@ -686,7 +759,7 @@ export default async function UiPage({
                     </button>
                   </form>
                 </div>
-                <div style={{ ...styles.actionRow, marginTop: 10 }}>
+                <div style={{ ...styles.actionRow, marginTop: 8 }}>
                   <form action="/api/ui/autopilot/start" method="post">
                     <button type="submit" style={styles.submitButton}>
                       Start Autopilot
@@ -698,7 +771,7 @@ export default async function UiPage({
                     </button>
                   </form>
                 </div>
-                <p style={{ ...styles.sectionText, marginTop: 14 }}>
+                <p style={{ ...styles.sectionText, marginTop: 11 }}>
                   Primary destination:{" "}
                   <code>{primary ? `${primary.channel} / ${primary.sessionId}` : "(not set yet)"}</code>
                 </p>
@@ -725,43 +798,42 @@ const styles: Record<string, CSSProperties> = {
   app: {
     minHeight: "100vh",
     background: "#fff",
-    borderLeft: "4px solid #0a63b0",
   },
 
   topbar: {
-    height: 82,
+    height: 62,
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
-    padding: "0 30px 0 124px",
+    padding: "0 23px 0 93px",
     borderBottom: "1px solid #e6e6e6",
-    gap: 16,
+    gap: 12,
     flexWrap: "wrap",
   },
 
   topbarLeft: {
     display: "flex",
     alignItems: "center",
-    gap: 16,
+    gap: 12,
   },
 
   brandMark: {
-    width: 24,
-    height: 24,
+    width: 18,
+    height: 18,
     display: "grid",
     placeItems: "center",
   },
 
   slash: {
     color: "#777",
-    fontSize: 40,
+    fontSize: 30,
     lineHeight: 1,
     fontWeight: 200,
-    marginTop: -4,
+    marginTop: -3,
   },
 
   workspaceName: {
-    fontSize: 33,
+    fontSize: 25,
     fontWeight: 500,
     lineHeight: 1,
     letterSpacing: "-0.02em",
@@ -770,7 +842,7 @@ const styles: Record<string, CSSProperties> = {
   topbarRight: {
     display: "flex",
     alignItems: "center",
-    gap: 18,
+    gap: 14,
     marginLeft: "auto",
   },
 
@@ -778,9 +850,9 @@ const styles: Record<string, CSSProperties> = {
     textDecoration: "none",
     color: "#111",
     border: "1px solid #d7d7d7",
-    borderRadius: 12,
-    padding: "12px 18px",
-    fontSize: 14,
+    borderRadius: 9,
+    padding: "9px 14px",
+    fontSize: 11,
     fontWeight: 500,
     background: "#fff",
   },
@@ -788,35 +860,35 @@ const styles: Record<string, CSSProperties> = {
   toplink: {
     textDecoration: "none",
     color: "#111",
-    fontSize: 14,
+    fontSize: 11,
     fontWeight: 500,
   },
 
   topDots: {
     color: "#111",
-    fontSize: 18,
+    fontSize: 14,
     lineHeight: 1,
     letterSpacing: 1,
   },
 
   avatarCircle: {
-    width: 38,
-    height: 38,
+    width: 29,
+    height: 29,
     borderRadius: 999,
     background: "#005fa9",
     color: "#fff",
     display: "grid",
     placeItems: "center",
-    fontSize: 20,
+    fontSize: 15,
     fontWeight: 500,
   },
 
   tabbar: {
-    height: 72,
+    height: 54,
     display: "flex",
     alignItems: "flex-end",
-    gap: 28,
-    padding: "0 30px 0 124px",
+    gap: 21,
+    padding: "0 23px 0 93px",
     borderBottom: "1px solid #e6e6e6",
     overflowX: "auto",
   },
@@ -824,57 +896,57 @@ const styles: Record<string, CSSProperties> = {
   mainTab: {
     textDecoration: "none",
     color: "#666",
-    fontSize: 16,
+    fontSize: 12,
     fontWeight: 500,
-    paddingBottom: 18,
-    borderBottom: "3px solid transparent",
+    paddingBottom: 14,
+    borderBottom: "2px solid transparent",
     whiteSpace: "nowrap",
   },
 
   mainTabActive: {
     textDecoration: "none",
     color: "#111",
-    fontSize: 16,
+    fontSize: 12,
     fontWeight: 600,
-    paddingBottom: 18,
-    borderBottom: "3px solid #111",
+    paddingBottom: 14,
+    borderBottom: "2px solid #111",
     whiteSpace: "nowrap",
   },
 
   content: {
-    padding: "38px 152px 60px 152px",
+    padding: "29px 114px 45px 114px",
   },
 
   heroRow: {
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 20,
-    marginBottom: 34,
+    gap: 15,
+    marginBottom: 26,
     flexWrap: "wrap",
   },
 
   heroLeft: {
     display: "flex",
     alignItems: "center",
-    gap: 20,
+    gap: 15,
   },
 
   bigAvatar: {
-    width: 76,
-    height: 76,
+    width: 57,
+    height: 57,
     borderRadius: 999,
     background: "#005fa9",
     color: "#fff",
     display: "grid",
     placeItems: "center",
-    fontSize: 48,
+    fontSize: 36,
     fontWeight: 400,
   },
 
   pageTitle: {
     margin: 0,
-    fontSize: 30,
+    fontSize: 23,
     lineHeight: 1.15,
     letterSpacing: "-0.03em",
     fontWeight: 650,
@@ -883,20 +955,20 @@ const styles: Record<string, CSSProperties> = {
   subline: {
     display: "flex",
     alignItems: "center",
-    gap: 10,
-    marginTop: 8,
+    gap: 8,
+    marginTop: 6,
     color: "#6a6a6a",
-    fontSize: 15,
+    fontSize: 11,
   },
 
   gitIcon: {
-    fontSize: 16,
+    fontSize: 12,
     opacity: 0.8,
   },
 
   slashInline: {
     color: "#b4b4b4",
-    margin: "0 4px",
+    margin: "0 3px",
   },
 
   inlineBlue: {
@@ -910,22 +982,22 @@ const styles: Record<string, CSSProperties> = {
     cursor: "pointer",
     background: "#111",
     color: "#fff",
-    borderRadius: 12,
-    padding: "16px 18px",
-    fontSize: 14,
+    borderRadius: 9,
+    padding: "12px 14px",
+    fontSize: 11,
     fontWeight: 600,
-    minWidth: 160,
+    minWidth: 120,
     textAlign: "center",
     userSelect: "none",
   },
 
   menuPopover: {
     position: "absolute",
-    marginTop: 8,
-    minWidth: 180,
+    marginTop: 6,
+    minWidth: 135,
     background: "#fff",
     border: "1px solid #e5e5e5",
-    borderRadius: 12,
+    borderRadius: 9,
     boxShadow: "0 10px 25px rgba(0,0,0,0.08)",
     overflow: "hidden",
     zIndex: 20,
@@ -933,20 +1005,20 @@ const styles: Record<string, CSSProperties> = {
 
   menuItem: {
     display: "block",
-    padding: "12px 14px",
+    padding: "9px 11px",
     textDecoration: "none",
     color: "#111",
-    fontSize: 14,
+    fontSize: 11,
   },
 
   searchRow: {
-    marginBottom: 28,
+    marginBottom: 21,
   },
 
   searchForm: {
     display: "grid",
-    gridTemplateColumns: "1fr 150px 58px",
-    gap: 18,
+    gridTemplateColumns: "1fr 113px 44px",
+    gap: 14,
     alignItems: "center",
   },
 
@@ -954,17 +1026,17 @@ const styles: Record<string, CSSProperties> = {
     display: "flex",
     alignItems: "center",
     border: "1px solid #dddddd",
-    borderRadius: 14,
-    height: 58,
-    padding: "0 16px",
+    borderRadius: 11,
+    height: 44,
+    padding: "0 12px",
     background: "#fff",
     boxShadow: "0 1px 2px rgba(0,0,0,0.03)",
   },
 
   searchIcon: {
     color: "#8b8b8b",
-    marginRight: 10,
-    fontSize: 22,
+    marginRight: 8,
+    fontSize: 17,
     lineHeight: 1,
   },
 
@@ -973,72 +1045,72 @@ const styles: Record<string, CSSProperties> = {
     height: "100%",
     border: 0,
     outline: "none",
-    fontSize: 17,
+    fontSize: 13,
     color: "#111",
     background: "transparent",
   },
 
   newProjectButton: {
-    height: 58,
+    height: 44,
     border: 0,
-    borderRadius: 14,
+    borderRadius: 11,
     background: "#111",
     color: "#fff",
-    fontSize: 16,
+    fontSize: 12,
     fontWeight: 500,
     cursor: "pointer",
   },
 
   iconButton: {
-    height: 58,
-    borderRadius: 14,
+    height: 44,
+    borderRadius: 11,
     border: "1px solid #dddddd",
     display: "grid",
     placeItems: "center",
     textDecoration: "none",
     color: "#111",
-    fontSize: 22,
+    fontSize: 17,
     background: "#fff",
     boxShadow: "0 1px 2px rgba(0,0,0,0.03)",
   },
 
   mainGrid: {
     display: "grid",
-    gridTemplateColumns: "minmax(0, 1fr) 376px",
-    gap: 34,
+    gridTemplateColumns: "minmax(0, 1fr) 282px",
+    gap: 26,
     alignItems: "start",
   },
 
   cardsArea: {
     display: "grid",
     gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-    gap: 20,
+    gap: 15,
   },
 
   projectCard: {
-    minHeight: 260,
-    borderRadius: 18,
+    minHeight: 195,
+    borderRadius: 14,
     border: "1px solid #dddddd",
     background: "#fff",
     boxShadow: "0 2px 6px rgba(0,0,0,0.04)",
-    padding: "32px 26px 26px 26px",
+    padding: "24px 20px 20px 20px",
     display: "flex",
     flexDirection: "column",
   },
 
   cardHead: {
-    marginBottom: 22,
+    marginBottom: 17,
   },
 
   cardIdentity: {
     display: "flex",
     alignItems: "center",
-    gap: 18,
+    gap: 14,
   },
 
   logoBadge: {
-    width: 44,
-    height: 44,
+    width: 33,
+    height: 33,
     borderRadius: 999,
     background: "#fff",
     border: "1px solid #e8e8e8",
@@ -1049,14 +1121,14 @@ const styles: Record<string, CSSProperties> = {
   },
 
   logoImage: {
-    width: 24,
-    height: 24,
+    width: 18,
+    height: 18,
     objectFit: "contain",
     display: "block",
   },
 
   logoFallback: {
-    fontSize: 12,
+    fontSize: 9,
     fontWeight: 700,
     color: "#111",
     letterSpacing: "0.04em",
@@ -1065,13 +1137,13 @@ const styles: Record<string, CSSProperties> = {
   cardTitleRow: {
     display: "flex",
     alignItems: "center",
-    gap: 10,
+    gap: 8,
     marginBottom: 2,
     flexWrap: "wrap",
   },
 
   cardTitle: {
-    fontSize: 18,
+    fontSize: 14,
     fontWeight: 700,
     lineHeight: 1.15,
     color: "#111",
@@ -1081,14 +1153,14 @@ const styles: Record<string, CSSProperties> = {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    minWidth: 36,
-    height: 30,
-    padding: "0 8px",
+    minWidth: 27,
+    height: 23,
+    padding: "0 6px",
     borderRadius: 999,
-    border: "3px solid #10b94d",
+    border: "2px solid #10b94d",
     color: "#10b94d",
     fontWeight: 700,
-    fontSize: 14,
+    fontSize: 11,
     lineHeight: 1,
   },
 
@@ -1096,36 +1168,44 @@ const styles: Record<string, CSSProperties> = {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    minWidth: 36,
-    height: 30,
-    padding: "0 8px",
+    minWidth: 27,
+    height: 23,
+    padding: "0 6px",
     borderRadius: 999,
-    border: "3px solid #cfcfcf",
+    border: "2px solid #cfcfcf",
     color: "#8a8a8a",
     fontWeight: 700,
-    fontSize: 14,
+    fontSize: 11,
     lineHeight: 1,
   },
 
   cardDomain: {
-    fontSize: 14,
+    fontSize: 11,
     color: "#6d6d6d",
     lineHeight: 1.2,
   },
 
   cardDescription: {
-    margin: "8px 0 0 0",
+    margin: "6px 0 0 0",
     color: "#606060",
-    fontSize: 17,
+    fontSize: 13,
     lineHeight: 1.4,
     maxWidth: 500,
   },
 
   cardFooter: {
     marginTop: "auto",
-    paddingTop: 18,
+    paddingTop: 14,
     color: "#6d6d6d",
-    fontSize: 14,
+    fontSize: 11,
+  },
+
+  cardActionLink: {
+    textDecoration: "none",
+    color: "#111",
+    fontSize: 11,
+    fontWeight: 600,
+    whiteSpace: "nowrap",
   },
 
   activityPanel: {
@@ -1133,8 +1213,8 @@ const styles: Record<string, CSSProperties> = {
   },
 
   activityTitle: {
-    margin: "0 0 18px 0",
-    fontSize: 22,
+    margin: "0 0 14px 0",
+    fontSize: 17,
     lineHeight: 1.2,
     fontWeight: 700,
     color: "#111",
@@ -1143,19 +1223,19 @@ const styles: Record<string, CSSProperties> = {
   activityList: {
     display: "flex",
     flexDirection: "column",
-    gap: 18,
+    gap: 14,
   },
 
   activityItem: {
     display: "grid",
-    gridTemplateColumns: "50px 1fr auto",
-    gap: 12,
+    gridTemplateColumns: "38px 1fr auto",
+    gap: 9,
     alignItems: "start",
   },
 
   activityIconWrap: {
-    width: 48,
-    height: 48,
+    width: 36,
+    height: 36,
     borderRadius: 999,
     background: "#fafafa",
     border: "1px solid #e3e3e3",
@@ -1166,51 +1246,51 @@ const styles: Record<string, CSSProperties> = {
 
   activityIcon: {
     color: "#888",
-    fontSize: 14,
+    fontSize: 11,
     lineHeight: 1,
   },
 
   activityBody: {
     minWidth: 0,
-    paddingTop: 4,
+    paddingTop: 3,
   },
 
   activityText: {
     color: "#3a3a3a",
-    fontSize: 15,
+    fontSize: 11,
     lineHeight: 1.35,
   },
 
   activitySub: {
     color: "#7a7a7a",
-    fontSize: 14,
+    fontSize: 11,
     marginTop: 2,
     lineHeight: 1.3,
   },
 
   activityTime: {
     color: "#787878",
-    fontSize: 14,
+    fontSize: 11,
     whiteSpace: "nowrap",
-    paddingTop: 4,
+    paddingTop: 3,
   },
 
   activityEmpty: {
     color: "#777",
-    fontSize: 15,
+    fontSize: 11,
   },
 
   panelCard: {
     border: "1px solid #dddddd",
-    borderRadius: 18,
+    borderRadius: 14,
     background: "#fff",
     boxShadow: "0 2px 6px rgba(0,0,0,0.04)",
-    padding: 24,
+    padding: 18,
   },
 
   sectionTitle: {
-    margin: "0 0 14px 0",
-    fontSize: 22,
+    margin: "0 0 11px 0",
+    fontSize: 17,
     fontWeight: 700,
     color: "#111",
   },
@@ -1218,7 +1298,7 @@ const styles: Record<string, CSSProperties> = {
   sectionText: {
     margin: 0,
     color: "#555",
-    fontSize: 15,
+    fontSize: 11,
     lineHeight: 1.6,
   },
 
@@ -1233,8 +1313,8 @@ const styles: Record<string, CSSProperties> = {
 
   th: {
     textAlign: "left",
-    padding: "12px 12px",
-    fontSize: 12,
+    padding: "9px 9px",
+    fontSize: 9,
     color: "#777",
     fontWeight: 600,
     borderBottom: "1px solid #ececec",
@@ -1242,8 +1322,8 @@ const styles: Record<string, CSSProperties> = {
   },
 
   td: {
-    padding: "14px 12px",
-    fontSize: 14,
+    padding: "11px 9px",
+    fontSize: 11,
     color: "#444",
     borderBottom: "1px solid #f1f1f1",
     whiteSpace: "nowrap",
@@ -1251,8 +1331,8 @@ const styles: Record<string, CSSProperties> = {
   },
 
   tdStrong: {
-    padding: "14px 12px",
-    fontSize: 14,
+    padding: "11px 9px",
+    fontSize: 11,
     color: "#111",
     borderBottom: "1px solid #f1f1f1",
     whiteSpace: "nowrap",
@@ -1269,12 +1349,12 @@ const styles: Record<string, CSSProperties> = {
   integrationCell: {
     display: "flex",
     alignItems: "center",
-    gap: 10,
+    gap: 8,
   },
 
   smallLogoBadge: {
-    width: 28,
-    height: 28,
+    width: 21,
+    height: 21,
     borderRadius: 999,
     background: "#fff",
     border: "1px solid #ececec",
@@ -1285,14 +1365,14 @@ const styles: Record<string, CSSProperties> = {
   },
 
   smallLogoImage: {
-    width: 16,
-    height: 16,
+    width: 12,
+    height: 12,
     objectFit: "contain",
     display: "block",
   },
 
   smallLogoFallback: {
-    fontSize: 10,
+    fontSize: 8,
     fontWeight: 700,
     color: "#111",
     letterSpacing: "0.04em",
@@ -1301,15 +1381,15 @@ const styles: Record<string, CSSProperties> = {
   activityListLarge: {
     display: "flex",
     flexDirection: "column",
-    gap: 16,
+    gap: 12,
   },
 
   activityItemLarge: {
     display: "grid",
-    gridTemplateColumns: "50px 1fr auto",
-    gap: 12,
+    gridTemplateColumns: "38px 1fr auto",
+    gap: 9,
     alignItems: "start",
-    paddingBottom: 12,
+    paddingBottom: 9,
     borderBottom: "1px solid #f0f0f0",
   },
 
@@ -1319,41 +1399,41 @@ const styles: Record<string, CSSProperties> = {
 
   infoList: {
     margin: 0,
-    paddingLeft: 18,
+    paddingLeft: 14,
     color: "#444",
-    fontSize: 15,
+    fontSize: 11,
     lineHeight: 1.8,
   },
 
   usageGrid: {
     display: "grid",
     gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-    gap: 18,
+    gap: 14,
   },
 
   metricCard: {
     border: "1px solid #e6e6e6",
-    borderRadius: 16,
-    padding: 20,
+    borderRadius: 12,
+    padding: 15,
     background: "#fff",
   },
 
   metricLabel: {
     color: "#777",
-    fontSize: 13,
-    marginBottom: 10,
+    fontSize: 10,
+    marginBottom: 8,
   },
 
   metricValue: {
     color: "#111",
-    fontSize: 34,
+    fontSize: 26,
     fontWeight: 700,
     lineHeight: 1,
   },
 
   metricValueSmall: {
     color: "#111",
-    fontSize: 22,
+    fontSize: 17,
     fontWeight: 700,
     lineHeight: 1.1,
   },
@@ -1361,72 +1441,72 @@ const styles: Record<string, CSSProperties> = {
   settingsGrid: {
     display: "grid",
     gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-    gap: 20,
+    gap: 15,
   },
 
   formStack: {
     display: "grid",
-    gap: 12,
+    gap: 9,
   },
 
   label: {
     display: "grid",
-    gap: 6,
+    gap: 5,
     color: "#444",
-    fontSize: 13,
+    fontSize: 10,
   },
 
   input: {
     width: "100%",
-    height: 44,
-    borderRadius: 12,
+    height: 33,
+    borderRadius: 9,
     border: "1px solid #dddddd",
-    padding: "0 12px",
+    padding: "0 9px",
     outline: "none",
-    fontSize: 15,
+    fontSize: 11,
     color: "#111",
     background: "#fff",
   },
 
   submitButton: {
-    height: 44,
-    borderRadius: 12,
+    height: 33,
+    borderRadius: 9,
     border: 0,
     background: "#111",
     color: "#fff",
-    fontSize: 14,
+    fontSize: 11,
     fontWeight: 600,
     cursor: "pointer",
-    padding: "0 14px",
+    padding: "0 11px",
   },
 
   submitButtonAlt: {
-    height: 44,
-    borderRadius: 12,
+    height: 33,
+    borderRadius: 9,
     border: "1px solid #dddddd",
     background: "#fff",
     color: "#111",
-    fontSize: 14,
+    fontSize: 11,
     fontWeight: 600,
     cursor: "pointer",
-    padding: "0 14px",
+    padding: "0 11px",
   },
 
   actionRow: {
     display: "flex",
-    gap: 10,
+    gap: 8,
     flexWrap: "wrap",
   },
 
   errorCard: {
     gridColumn: "1 / -1",
-    minHeight: 180,
-    borderRadius: 18,
+    minHeight: 135,
+    borderRadius: 14,
     border: "1px solid #ead0d0",
     background: "#fff7f7",
     color: "#9f1d1d",
-    padding: 24,
-    fontSize: 15,
+    padding: 18,
+    fontSize: 11,
     lineHeight: 1.5,
   },
 };
