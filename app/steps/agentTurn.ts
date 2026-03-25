@@ -36,6 +36,68 @@ const composio = new Composio({
 const composioToolsCache = new Map<string, { tools: ToolSet; expiresAt: number }>();
 
 // ============================================================
+// Upstash Redis-backed VFS
+// ============================================================
+type RedisClient = any;
+
+type VfsNode =
+  | {
+      type: "file";
+      path: string;
+      content: string;
+      createdAt: string;
+      updatedAt: string;
+    }
+  | {
+      type: "dir";
+      path: string;
+      createdAt: string;
+      updatedAt: string;
+    };
+
+type VirtualRuntime = {
+  cwd: string;
+  sessionId: string;
+  userId: string;
+  channel: Channel;
+  redis: RedisClient;
+};
+
+let redisClientPromise: Promise<RedisClient | null> | null = null;
+
+async function getRedisClient(): Promise<RedisClient | null> {
+  if (!redisClientPromise) {
+    redisClientPromise = (async () => {
+      const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
+      const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
+
+      if (!url || !token) return null;
+
+      const { Redis } = await import("@upstash/redis");
+      return new Redis({ url, token });
+    })().catch(() => null);
+  }
+
+  return redisClientPromise;
+}
+
+function vfsNamespace(userId: string, sessionId: string): string {
+  return `vfs:${userId}:${sessionId}`;
+}
+
+function vfsPathsKey(userId: string, sessionId: string): string {
+  return `${vfsNamespace(userId, sessionId)}:paths`;
+}
+
+function vfsNodeKey(userId: string, sessionId: string, path: string): string {
+  return `${vfsNamespace(userId, sessionId)}:node:${sanitizePath(path)}`;
+}
+
+function vfsMetaKey(userId: string, sessionId: string): string {
+  return `${vfsNamespace(userId, sessionId)}:meta`;
+}
+
+// ============================================================
 // Small helpers
 // ============================================================
 function sleep(ms: number) {
@@ -246,23 +308,16 @@ const INLINE_SKILLS: Record<string, InlineSkill> = {
   },
   filesystem: {
     name: "filesystem",
-    whenToUse: "Use for scratch files, reports, prompt staging, payload generation, and safe in-memory transforms.",
+    whenToUse: "Use for scratch files, reports, prompt staging, payload generation, and safe transforms.",
     guidance: [
       "Use read_virtual_file for exact file reads.",
       "Use write_virtual_file for drafts, JSON, markdown, scripts, configs, and reports.",
-      "Use virtual_shell for listing/searching/moving/copying/deleting files in memory.",
+      "Use virtual_shell for listing/searching/moving/copying/deleting files.",
+      "Filesystem is persisted in Upstash Redis and scoped to the current user + session.",
       "Prefer keeping work under /workspace.",
     ],
   },
-  telegram: {
-    name: "telegram",
-    whenToUse: "Use to optimize final responses for Telegram delivery behavior.",
-    guidance: [
-      "Be concise.",
-      "Avoid giant walls of text when a summarized answer is enough.",
-      "Long outputs can be staged in files and summarized.",
-    ],
-  },
+  
 };
 
 function renderAllSkillsForPrompt(): string {
@@ -291,84 +346,291 @@ function renderSingleSkill(skill: InlineSkill): string {
 }
 
 // ============================================================
-// Pure TypeScript virtual filesystem + shell-like runtime
+// Redis VFS primitives
 // ============================================================
-type VfsNode =
-  | {
-      type: "file";
-      path: string;
-      content: string;
-      createdAt: string;
-      updatedAt: string;
+async function vfsAllPaths(rt: VirtualRuntime): Promise<string[]> {
+  const raw = (await rt.redis.smembers(vfsPathsKey(rt.userId, rt.sessionId))) ?? [];
+  return (Array.isArray(raw) ? raw : [])
+    .map((x) => sanitizePath(String(x)))
+    .sort();
+}
+
+async function vfsGetNode(rt: VirtualRuntime, path: string): Promise<VfsNode | undefined> {
+  const p = sanitizePath(path);
+  const node = await rt.redis.get(vfsNodeKey(rt.userId, rt.sessionId, p));
+  if (!node) return undefined;
+  return node as VfsNode;
+}
+
+async function vfsPutNode(rt: VirtualRuntime, node: VfsNode): Promise<void> {
+  const p = sanitizePath(node.path);
+  await rt.redis.set(vfsNodeKey(rt.userId, rt.sessionId, p), { ...node, path: p });
+  await rt.redis.sadd(vfsPathsKey(rt.userId, rt.sessionId), p);
+}
+
+async function vfsRemoveNode(rt: VirtualRuntime, path: string): Promise<void> {
+  const p = sanitizePath(path);
+  await rt.redis.del(vfsNodeKey(rt.userId, rt.sessionId, p));
+  await rt.redis.srem(vfsPathsKey(rt.userId, rt.sessionId), p);
+}
+
+async function vfsEnsureDir(rt: VirtualRuntime, path: string): Promise<void> {
+  const p = sanitizePath(path);
+  const existing = await vfsGetNode(rt, p);
+
+  if (existing) {
+    if (existing.type !== "dir") throw new Error(`Path exists and is not a directory: ${p}`);
+    return;
+  }
+
+  for (const dir of parentDirs(p)) {
+    const parent = await vfsGetNode(rt, dir);
+    if (!parent) {
+      await vfsPutNode(rt, {
+        type: "dir",
+        path: dir,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      });
+    } else if (parent.type !== "dir") {
+      throw new Error(`Path exists and is not a directory: ${dir}`);
     }
-  | {
-      type: "dir";
-      path: string;
-      createdAt: string;
-      updatedAt: string;
-    };
+  }
 
-type VirtualRuntime = {
-  cwd: string;
-  nodes: Map<string, VfsNode>;
-};
+  await vfsPutNode(rt, {
+    type: "dir",
+    path: p,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  });
+}
 
-function createVirtualRuntime(args: {
+async function vfsWriteFile(rt: VirtualRuntime, path: string, content: string): Promise<void> {
+  const p = sanitizePath(path);
+
+  for (const dir of parentDirs(p)) {
+    await vfsEnsureDir(rt, dir);
+  }
+
+  const existing = await vfsGetNode(rt, p);
+  if (existing && existing.type === "dir") {
+    throw new Error(`Cannot write file over directory: ${p}`);
+  }
+
+  await vfsPutNode(rt, {
+    type: "file",
+    path: p,
+    content,
+    createdAt: existing?.type === "file" ? existing.createdAt : nowIso(),
+    updatedAt: nowIso(),
+  });
+}
+
+async function vfsReadFile(rt: VirtualRuntime, path: string): Promise<string> {
+  const p = sanitizePath(path);
+  const node = await vfsGetNode(rt, p);
+  if (!node) throw new Error(`No such file: ${p}`);
+  if (node.type !== "file") throw new Error(`Not a file: ${p}`);
+  return node.content;
+}
+
+async function vfsList(rt: VirtualRuntime, path: string, recursive = false): Promise<string[]> {
+  const p = sanitizePath(path);
+  const node = await vfsGetNode(rt, p);
+  if (!node) throw new Error(`No such path: ${p}`);
+
+  const keys = await vfsAllPaths(rt);
+
+  if (node.type === "file") return [p];
+
+  if (!recursive) {
+    return keys.filter((k) => dirname(k) === p && k !== p).sort();
+  }
+
+  return keys.filter((k) => k === p || k.startsWith(p === "/" ? "/" : `${p}/`)).sort();
+}
+
+async function vfsDelete(rt: VirtualRuntime, path: string, recursive = false): Promise<void> {
+  const p = sanitizePath(path);
+  const node = await vfsGetNode(rt, p);
+  if (!node) throw new Error(`No such path: ${p}`);
+
+  if (node.type === "file") {
+    await vfsRemoveNode(rt, p);
+    return;
+  }
+
+  const keys = await vfsAllPaths(rt);
+  const children = keys.filter((k) => k !== p && k.startsWith(`${p}/`));
+
+  if (children.length && !recursive) {
+    throw new Error(`Directory not empty: ${p}`);
+  }
+
+  for (const child of children.sort((a, b) => b.length - a.length)) {
+    await vfsRemoveNode(rt, child);
+  }
+
+  await vfsRemoveNode(rt, p);
+}
+
+async function vfsMove(rt: VirtualRuntime, fromPath: string, toPath: string): Promise<void> {
+  const from = sanitizePath(fromPath);
+  const to = sanitizePath(toPath);
+
+  const node = await vfsGetNode(rt, from);
+  if (!node) throw new Error(`No such path: ${from}`);
+  if (from === "/" || from === "/workspace") throw new Error(`Refusing to move protected path: ${from}`);
+  if (to.startsWith(`${from}/`)) throw new Error(`Cannot move a path into itself: ${from} -> ${to}`);
+
+  const keys = await vfsAllPaths(rt);
+  const entries = keys
+    .filter((p) => p === from || p.startsWith(`${from}/`))
+    .sort((a, b) => a.length - b.length);
+
+  if (node.type === "file") {
+    await vfsWriteFile(rt, to, node.content);
+    await vfsRemoveNode(rt, from);
+    return;
+  }
+
+  for (const oldPath of entries) {
+    const oldNode = await vfsGetNode(rt, oldPath);
+    if (!oldNode) continue;
+
+    const suffix = oldPath === from ? "" : oldPath.slice(from.length);
+    const newPath = sanitizePath(`${to}${suffix}`);
+
+    if (oldNode.type === "dir") {
+      await vfsEnsureDir(rt, newPath);
+    } else {
+      await vfsWriteFile(rt, newPath, oldNode.content);
+    }
+  }
+
+  for (const oldPath of entries.sort((a, b) => b.length - a.length)) {
+    await vfsRemoveNode(rt, oldPath);
+  }
+}
+
+async function vfsCopy(rt: VirtualRuntime, fromPath: string, toPath: string): Promise<void> {
+  const from = sanitizePath(fromPath);
+  const to = sanitizePath(toPath);
+
+  const node = await vfsGetNode(rt, from);
+  if (!node) throw new Error(`No such path: ${from}`);
+  if (to.startsWith(`${from}/`)) throw new Error(`Cannot copy a path into itself: ${from} -> ${to}`);
+
+  const keys = await vfsAllPaths(rt);
+  const entries = keys
+    .filter((p) => p === from || p.startsWith(`${from}/`))
+    .sort((a, b) => a.length - b.length);
+
+  if (node.type === "file") {
+    await vfsWriteFile(rt, to, node.content);
+    return;
+  }
+
+  for (const oldPath of entries) {
+    const oldNode = await vfsGetNode(rt, oldPath);
+    if (!oldNode) continue;
+
+    const suffix = oldPath === from ? "" : oldPath.slice(from.length);
+    const newPath = sanitizePath(`${to}${suffix}`);
+
+    if (oldNode.type === "dir") {
+      await vfsEnsureDir(rt, newPath);
+    } else {
+      await vfsWriteFile(rt, newPath, oldNode.content);
+    }
+  }
+}
+
+async function vfsFind(rt: VirtualRuntime, path: string, needle: string): Promise<string[]> {
+  const base = sanitizePath(path);
+  const all = await vfsList(rt, base, true);
+  const q = needle.toLowerCase();
+  return all.filter((p) => p.toLowerCase().includes(q));
+}
+
+async function vfsGrep(
+  rt: VirtualRuntime,
+  path: string,
+  query: string
+): Promise<Array<{ path: string; line: number; text: string }>> {
+  const base = sanitizePath(path);
+  const all = await vfsList(rt, base, true);
+  const q = query.toLowerCase();
+  const out: Array<{ path: string; line: number; text: string }> = [];
+
+  for (const p of all) {
+    const node = await vfsGetNode(rt, p);
+    if (!node || node.type !== "file") continue;
+
+    const lines = node.content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].toLowerCase().includes(q)) {
+        out.push({ path: p, line: i + 1, text: lines[i] });
+      }
+    }
+  }
+
+  return out;
+}
+
+async function createVirtualRuntime(args: {
   sessionId: string;
   userId: string;
   channel: Channel;
   userText: string;
   history: ModelMessage[];
-}): VirtualRuntime {
+}): Promise<VirtualRuntime> {
+  const redis = await getRedisClient();
+  if (!redis) {
+    throw new Error(
+      "Upstash Redis is not configured. Set KV_REST_API_URL/KV_REST_API_TOKEN or UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN."
+    );
+  }
+
   const rt: VirtualRuntime = {
     cwd: "/workspace",
-    nodes: new Map<string, VfsNode>(),
+    sessionId: args.sessionId,
+    userId: args.userId,
+    channel: args.channel,
+    redis,
   };
 
-  function ensureDir(path: string) {
-    const p = sanitizePath(path);
-    if (rt.nodes.has(p)) return;
-    rt.nodes.set(p, {
-      type: "dir",
-      path: p,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-    });
-  }
+  await vfsEnsureDir(rt, "/");
+  await vfsEnsureDir(rt, "/workspace");
+  await vfsEnsureDir(rt, "/workspace/context");
+  await vfsEnsureDir(rt, "/workspace/skills");
 
-  function writeFile(path: string, content: string) {
-    const p = sanitizePath(path);
-    for (const dir of parentDirs(p)) ensureDir(dir);
-    const existing = rt.nodes.get(p);
-    rt.nodes.set(p, {
-      type: "file",
-      path: p,
-      content,
-      createdAt: existing?.type === "file" ? existing.createdAt : nowIso(),
-      updatedAt: nowIso(),
-    });
-  }
+  await rt.redis.set(vfsMetaKey(args.userId, args.sessionId), {
+    sessionId: args.sessionId,
+    userId: args.userId,
+    channel: args.channel,
+    cwd: "/workspace",
+    updatedAt: nowIso(),
+  });
 
-  ensureDir("/");
-  ensureDir("/workspace");
-  ensureDir("/workspace/context");
-  ensureDir("/workspace/skills");
-
-  writeFile(
+  await vfsWriteFile(
+    rt,
     "/workspace/README.agent.txt",
     [
       "Virtual agent workspace.",
       "",
-      "This filesystem is ephemeral for the current turn.",
+      "This filesystem is persisted in Upstash Redis and scoped to the current user + session.",
       "Use it for scratch files, reports, payloads, drafts, and analysis artifacts.",
       "",
       `sessionId=${args.sessionId}`,
       `userId=${args.userId}`,
       `channel=${args.channel}`,
+      `updatedAt=${nowIso()}`,
     ].join("\n")
   );
 
-  writeFile(
+  await vfsWriteFile(
+    rt,
     "/workspace/context/request.json",
     toSafeJson({
       sessionId: args.sessionId,
@@ -380,7 +642,8 @@ function createVirtualRuntime(args: {
     })
   );
 
-  writeFile(
+  await vfsWriteFile(
+    rt,
     "/workspace/context/skills.index.json",
     toSafeJson({
       skills: Object.keys(INLINE_SKILLS),
@@ -388,177 +651,10 @@ function createVirtualRuntime(args: {
   );
 
   for (const skill of Object.values(INLINE_SKILLS)) {
-    writeFile(`/workspace/skills/${skill.name}.md`, renderSingleSkill(skill));
+    await vfsWriteFile(rt, `/workspace/skills/${skill.name}.md`, renderSingleSkill(skill));
   }
 
   return rt;
-}
-
-function vfsGetNode(rt: VirtualRuntime, path: string): VfsNode | undefined {
-  return rt.nodes.get(sanitizePath(path));
-}
-
-function vfsEnsureDir(rt: VirtualRuntime, path: string) {
-  const p = sanitizePath(path);
-  if (rt.nodes.has(p)) {
-    const node = rt.nodes.get(p)!;
-    if (node.type !== "dir") throw new Error(`Path exists and is not a directory: ${p}`);
-    return;
-  }
-  for (const dir of parentDirs(p)) {
-    if (!rt.nodes.has(dir)) {
-      rt.nodes.set(dir, {
-        type: "dir",
-        path: dir,
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
-      });
-    }
-  }
-  rt.nodes.set(p, {
-    type: "dir",
-    path: p,
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-  });
-}
-
-function vfsWriteFile(rt: VirtualRuntime, path: string, content: string) {
-  const p = sanitizePath(path);
-  for (const dir of parentDirs(p)) vfsEnsureDir(rt, dir);
-  const existing = rt.nodes.get(p);
-  rt.nodes.set(p, {
-    type: "file",
-    path: p,
-    content,
-    createdAt: existing?.type === "file" ? existing.createdAt : nowIso(),
-    updatedAt: nowIso(),
-  });
-}
-
-function vfsReadFile(rt: VirtualRuntime, path: string): string {
-  const p = sanitizePath(path);
-  const node = rt.nodes.get(p);
-  if (!node) throw new Error(`No such file: ${p}`);
-  if (node.type !== "file") throw new Error(`Not a file: ${p}`);
-  return node.content;
-}
-
-function vfsList(rt: VirtualRuntime, path: string, recursive = false): string[] {
-  const p = sanitizePath(path);
-  const node = rt.nodes.get(p);
-  if (!node) throw new Error(`No such path: ${p}`);
-
-  const keys = [...rt.nodes.keys()].sort();
-  if (node.type === "file") return [p];
-
-  if (!recursive) {
-    return keys.filter((k) => dirname(k) === p && k !== p).sort();
-  }
-
-  return keys.filter((k) => k === p || k.startsWith(p === "/" ? "/" : `${p}/`)).sort();
-}
-
-function vfsDelete(rt: VirtualRuntime, path: string, recursive = false) {
-  const p = sanitizePath(path);
-  const node = rt.nodes.get(p);
-  if (!node) throw new Error(`No such path: ${p}`);
-
-  if (node.type === "file") {
-    rt.nodes.delete(p);
-    return;
-  }
-
-  const children = [...rt.nodes.keys()].filter((k) => k !== p && k.startsWith(`${p}/`));
-  if (children.length && !recursive) {
-    throw new Error(`Directory not empty: ${p}`);
-  }
-  for (const child of children) rt.nodes.delete(child);
-  rt.nodes.delete(p);
-}
-
-function vfsMove(rt: VirtualRuntime, fromPath: string, toPath: string) {
-  const from = sanitizePath(fromPath);
-  const to = sanitizePath(toPath);
-  const node = rt.nodes.get(from);
-  if (!node) throw new Error(`No such path: ${from}`);
-
-  if (node.type === "file") {
-    vfsWriteFile(rt, to, node.content);
-    rt.nodes.delete(from);
-    return;
-  }
-
-  const entries = [...rt.nodes.entries()]
-    .filter(([p]) => p === from || p.startsWith(`${from}/`))
-    .sort((a, b) => a[0].length - b[0].length);
-
-  for (const [oldPath, oldNode] of entries) {
-    const suffix = oldPath === from ? "" : oldPath.slice(from.length);
-    const newPath = sanitizePath(`${to}${suffix}`);
-    if (oldNode.type === "dir") {
-      vfsEnsureDir(rt, newPath);
-    } else {
-      vfsWriteFile(rt, newPath, oldNode.content);
-    }
-  }
-
-  for (const [oldPath] of entries.reverse()) {
-    rt.nodes.delete(oldPath);
-  }
-}
-
-function vfsCopy(rt: VirtualRuntime, fromPath: string, toPath: string) {
-  const from = sanitizePath(fromPath);
-  const to = sanitizePath(toPath);
-  const node = rt.nodes.get(from);
-  if (!node) throw new Error(`No such path: ${from}`);
-
-  if (node.type === "file") {
-    vfsWriteFile(rt, to, node.content);
-    return;
-  }
-
-  const entries = [...rt.nodes.entries()]
-    .filter(([p]) => p === from || p.startsWith(`${from}/`))
-    .sort((a, b) => a[0].length - b[0].length);
-
-  for (const [oldPath, oldNode] of entries) {
-    const suffix = oldPath === from ? "" : oldPath.slice(from.length);
-    const newPath = sanitizePath(`${to}${suffix}`);
-    if (oldNode.type === "dir") {
-      vfsEnsureDir(rt, newPath);
-    } else {
-      vfsWriteFile(rt, newPath, oldNode.content);
-    }
-  }
-}
-
-function vfsFind(rt: VirtualRuntime, path: string, needle: string): string[] {
-  const base = sanitizePath(path);
-  const all = vfsList(rt, base, true);
-  const q = needle.toLowerCase();
-  return all.filter((p) => p.toLowerCase().includes(q));
-}
-
-function vfsGrep(rt: VirtualRuntime, path: string, query: string): Array<{ path: string; line: number; text: string }> {
-  const base = sanitizePath(path);
-  const all = vfsList(rt, base, true);
-  const q = query.toLowerCase();
-  const out: Array<{ path: string; line: number; text: string }> = [];
-
-  for (const p of all) {
-    const node = rt.nodes.get(p);
-    if (!node || node.type !== "file") continue;
-    const lines = node.content.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].toLowerCase().includes(q)) {
-        out.push({ path: p, line: i + 1, text: lines[i] });
-      }
-    }
-  }
-
-  return out;
 }
 
 function virtualShellHelp() {
@@ -578,7 +674,7 @@ function virtualShellHelp() {
     "- grep <path> <needle>",
     "",
     "Notes:",
-    "- This is an in-memory virtual filesystem only.",
+    "- This shell operates on the persisted Redis-backed virtual filesystem only.",
     "- Paths default under /workspace when relative.",
     "- For exact file writes/reads, prefer write_virtual_file/read_virtual_file.",
   ].join("\n");
@@ -617,7 +713,7 @@ function parseVirtualShell(input: string): { ok: true; result: any } | { ok: fal
   };
 }
 
-function execVirtualShell(rt: VirtualRuntime, input: string) {
+async function execVirtualShell(rt: VirtualRuntime, input: string) {
   const parsed = parseVirtualShell(input);
   if (!parsed.ok) {
     return {
@@ -641,7 +737,7 @@ function execVirtualShell(rt: VirtualRuntime, input: string) {
     }
 
     if (spec.command === "write") {
-      vfsWriteFile(rt, spec.path, spec.content);
+      await vfsWriteFile(rt, spec.path, spec.content);
       return {
         ok: true,
         stdout: `Wrote ${sanitizePath(spec.path)}`,
@@ -658,25 +754,25 @@ function execVirtualShell(rt: VirtualRuntime, input: string) {
 
       case "ls": {
         const target = args[0] ?? rt.cwd;
-        const items = vfsList(rt, target, false);
+        const items = await vfsList(rt, target, false);
         return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
       }
 
       case "tree": {
         const target = args[0] ?? rt.cwd;
-        const items = vfsList(rt, target, true);
+        const items = await vfsList(rt, target, true);
         return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
       }
 
       case "cat": {
         if (!args[0]) throw new Error("cat requires a path");
-        const content = vfsReadFile(rt, args[0]);
+        const content = await vfsReadFile(rt, args[0]);
         return { ok: true, stdout: content, stderr: "", exitCode: 0 };
       }
 
       case "mkdir": {
         if (!args[0]) throw new Error("mkdir requires a path");
-        vfsEnsureDir(rt, args[0]);
+        await vfsEnsureDir(rt, args[0]);
         return { ok: true, stdout: `Created ${sanitizePath(args[0])}`, stderr: "", exitCode: 0 };
       }
 
@@ -685,13 +781,13 @@ function execVirtualShell(rt: VirtualRuntime, input: string) {
         const recursive = args[0] === "-r";
         const target = recursive ? args[1] : args[0];
         if (!target) throw new Error("rm requires a path");
-        vfsDelete(rt, target, recursive);
+        await vfsDelete(rt, target, recursive);
         return { ok: true, stdout: `Removed ${sanitizePath(target)}`, stderr: "", exitCode: 0 };
       }
 
       case "mv": {
         if (args.length < 2) throw new Error("mv requires <from> <to>");
-        vfsMove(rt, args[0], args[1]);
+        await vfsMove(rt, args[0], args[1]);
         return {
           ok: true,
           stdout: `Moved ${sanitizePath(args[0])} -> ${sanitizePath(args[1])}`,
@@ -702,7 +798,7 @@ function execVirtualShell(rt: VirtualRuntime, input: string) {
 
       case "cp": {
         if (args.length < 2) throw new Error("cp requires <from> <to>");
-        vfsCopy(rt, args[0], args[1]);
+        await vfsCopy(rt, args[0], args[1]);
         return {
           ok: true,
           stdout: `Copied ${sanitizePath(args[0])} -> ${sanitizePath(args[1])}`,
@@ -713,13 +809,13 @@ function execVirtualShell(rt: VirtualRuntime, input: string) {
 
       case "find": {
         if (args.length < 2) throw new Error("find requires <path> <needle>");
-        const items = vfsFind(rt, args[0], args.slice(1).join(" "));
+        const items = await vfsFind(rt, args[0], args.slice(1).join(" "));
         return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
       }
 
       case "grep": {
         if (args.length < 2) throw new Error("grep requires <path> <needle>");
-        const items = vfsGrep(rt, args[0], args.slice(1).join(" "));
+        const items = await vfsGrep(rt, args[0], args.slice(1).join(" "));
         return {
           ok: true,
           stdout: items.map((x) => `${x.path}:${x.line}:${x.text}`).join("\n"),
@@ -823,10 +919,7 @@ function resolveConfiguredAuthConfigId(toolkitSlug: string): string | undefined 
   if (mapRaw) {
     try {
       const parsed = JSON.parse(mapRaw) as Record<string, string>;
-      const exact =
-        parsed[toolkitSlug] ??
-        parsed[toolkitSlug.toLowerCase()] ??
-        parsed[slugKey];
+      const exact = parsed[toolkitSlug] ?? parsed[toolkitSlug.toLowerCase()] ?? parsed[slugKey];
       if (exact) return String(exact);
     } catch {
       // ignore invalid JSON, fallback below
@@ -866,10 +959,7 @@ async function composioResolveToolkitAndAuthConfig(userId: string, toolkitInput:
       const connected = Boolean(t?.connection?.connectedAccount?.id);
 
       const discoveredAuthConfigId =
-        t?.connection?.authConfig?.id ??
-        t?.authConfig?.id ??
-        t?.defaultAuthConfig?.id ??
-        null;
+        t?.connection?.authConfig?.id ?? t?.authConfig?.id ?? t?.defaultAuthConfig?.id ?? null;
 
       return {
         slug,
@@ -955,13 +1045,7 @@ async function composioConnectToolkitByName(userId: string, toolkitInput: string
     }
   }
 
-  const link = String(
-    req?.redirectUrl ??
-      req?.redirect_url ??
-      req?.url ??
-      req?.link ??
-      ""
-  );
+  const link = String(req?.redirectUrl ?? req?.redirect_url ?? req?.url ?? req?.link ?? "");
 
   if (!link) {
     return {
@@ -1056,7 +1140,7 @@ export async function agentTurn(args: {
   const userText = String(extractRecentUserText(messages) ?? "").trim();
   const hasImages = historyHasImages(messages);
 
-  const virtualRuntime = createVirtualRuntime({
+  const virtualRuntime = await createVirtualRuntime({
     sessionId: args.sessionId,
     userId: args.userId,
     channel: args.channel,
@@ -1201,7 +1285,7 @@ export async function agentTurn(args: {
   });
 
   const readVirtualFile = tool({
-    description: "Read a file from the virtual in-memory filesystem. Prefer paths under /workspace.",
+    description: "Read a file from the Redis-backed virtual filesystem. Prefer paths under /workspace.",
     inputSchema: zodSchema(
       z.object({
         path: z.string().min(1).max(4000),
@@ -1209,7 +1293,7 @@ export async function agentTurn(args: {
     ),
     execute: async (input: { path: string }) => {
       try {
-        const content = vfsReadFile(virtualRuntime, input.path);
+        const content = await vfsReadFile(virtualRuntime, input.path);
         return {
           ok: true,
           path: sanitizePath(input.path),
@@ -1226,7 +1310,7 @@ export async function agentTurn(args: {
   });
 
   const writeVirtualFile = tool({
-    description: "Write content to a file in the virtual in-memory filesystem. Prefer /workspace paths.",
+    description: "Write content to a file in the Redis-backed virtual filesystem. Prefer /workspace paths.",
     inputSchema: zodSchema(
       z.object({
         path: z.string().min(1).max(4000),
@@ -1235,7 +1319,7 @@ export async function agentTurn(args: {
     ),
     execute: async (input: { path: string; content: string }) => {
       try {
-        vfsWriteFile(virtualRuntime, input.path, input.content);
+        await vfsWriteFile(virtualRuntime, input.path, input.content);
         return {
           ok: true,
           path: sanitizePath(input.path),
@@ -1253,14 +1337,14 @@ export async function agentTurn(args: {
 
   const virtualShell = tool({
     description:
-      "Run shell-like commands against the in-memory virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep. This does not touch the host OS.",
+      "Run shell-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep. This does not touch the host OS.",
     inputSchema: zodSchema(
       z.object({
-        command: z.string().min(1).max(12000),
+        command: z.string().min(1).max(120000),
       })
     ),
     execute: async (input: { command: string }) => {
-      const result = execVirtualShell(virtualRuntime, input.command);
+      const result = await execVirtualShell(virtualRuntime, input.command);
       return {
         ok: result.ok,
         command: input.command,
@@ -1347,7 +1431,7 @@ export async function agentTurn(args: {
   // System prompt
   // ============================================================
   const system = [
-    "You are an Agentic Operating System and assistant running inside Telegram/WhatsApp/SMS connected to Composio tools via auth configs.",
+    "You are an Agentic Operating System similar to Open Claw and assistant running inside Telegram/WhatsApp/SMS connected to Composio tools via auth configs.",
     "",
     "CRITICAL TOOL RULES:",
     "- If the user asks you to do an external action (Typeform, Twitter/X, Discord, Slack, etc.), you MUST use the appropriate tool.",
@@ -1361,10 +1445,10 @@ export async function agentTurn(args: {
     "- All auth links and connected accounts should be treated as belonging to that namespace.",
     "",
     "VIRTUAL FILESYSTEM:",
-    "- You have read_virtual_file and write_virtual_file for a safe in-memory filesystem.",
+    "- You have read_virtual_file and write_virtual_file for a Redis-backed virtual filesystem.",
     "- You also have virtual_shell for shell-like operations against that virtual filesystem only.",
     "- Prefer virtual filesystem tools for drafting, staging, payload prep, notes, reports, JSON, and scratch work.",
-    "- The virtual filesystem is ephemeral for the current turn.",
+    "- The virtual filesystem persists in Upstash Redis and is scoped to the current user + session.",
     "",
     "SSH:",
     "- You can run SSH via ssh_exec if needed.",
@@ -1397,7 +1481,7 @@ export async function agentTurn(args: {
         messages,
         tools,
         temperature,
-        stopWhen: stepCountIs(10),
+        stopWhen: stepCountIs(11),
       });
 
       const text = await streamToTelegram(s.textStream);
@@ -1412,7 +1496,7 @@ export async function agentTurn(args: {
       messages,
       tools,
       temperature,
-      stopWhen: stepCountIs(10),
+      stopWhen: stepCountIs(11),
     });
 
     return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
