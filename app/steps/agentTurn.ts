@@ -12,7 +12,6 @@ import {
 import { openai } from "@ai-sdk/openai";
 import { Composio } from "@composio/core";
 import { VercelProvider } from "@composio/vercel";
-import { Bash } from "just-bash";
 import { z } from "zod/v4";
 
 import { env, csvEnv } from "@/app/lib/env";
@@ -138,8 +137,65 @@ function normalizeSkillName(raw: string): string {
     .replace(/[^a-z0-9_-]/g, "");
 }
 
+function normalizeToolkitKey(raw: string): string {
+  return String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function sanitizePath(inputPath: string): string {
+  let p = String(inputPath ?? "").trim();
+  if (!p) p = "/workspace";
+  if (!p.startsWith("/")) p = `/workspace/${p}`;
+  p = p.replace(/\/+/g, "/");
+
+  const parts = p.split("/");
+  const out: string[] = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (out.length > 0) out.pop();
+      continue;
+    }
+    out.push(part);
+  }
+
+  return `/${out.join("/")}`;
+}
+
+function dirname(p: string): string {
+  const s = sanitizePath(p);
+  const idx = s.lastIndexOf("/");
+  if (idx <= 0) return "/";
+  return s.slice(0, idx);
+}
+
+function basename(p: string): string {
+  const s = sanitizePath(p);
+  const idx = s.lastIndexOf("/");
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
+function parentDirs(p: string): string[] {
+  const s = sanitizePath(p);
+  const parts = s.split("/").filter(Boolean);
+  const out = ["/"];
+  let acc = "";
+  for (let i = 0; i < parts.length - 1; i++) {
+    acc += `/${parts[i]}`;
+    out.push(acc);
+  }
+  return out;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
 // ============================================================
-// Inline skill system (static, one-file, no external skill dirs)
+// Inline skill system
 // ============================================================
 type InlineSkill = {
   name: string;
@@ -151,87 +207,67 @@ type InlineSkill = {
 const INLINE_SKILLS: Record<string, InlineSkill> = {
   routing: {
     name: "routing",
-    whenToUse: "Use first when deciding whether to answer directly, use virtual bash/files, SSH, scheduling, or Composio tools.",
+    whenToUse: "Use first when deciding whether to answer directly, use virtual files, SSH, scheduling, or Composio tools.",
     guidance: [
       "Prefer direct answer if no tool is required.",
-      "Prefer virtual bash/files for analysis, transformation, scratch files, report generation, grep/jq/sed/awk, and dry-runs.",
-      "Prefer ssh_exec only for real host-side execution the user actually wants.",
-      "Prefer Composio tools for external apps/services.",
+      "Prefer virtual filesystem tools for drafting, transforming, analyzing, and staging content.",
+      "Prefer ssh_exec only for real host-side execution the user explicitly wants.",
+      "Prefer Composio tools for external apps/services and auth flows.",
       "Never claim success for a tool-backed action unless the tool returned success.",
-    ],
-    examples: [
-      "Draft shell script in virtual bash, then optionally run via ssh_exec.",
-      "Summarize logs with bash/read_virtual_file.",
-      "Use Composio if the user wants Slack/Gmail/Drive/etc actions.",
     ],
   },
   composio: {
     name: "composio",
-    whenToUse: "Use when the user wants to act on external services via Composio.",
+    whenToUse: "Use when the user wants to act on external services through Composio or connect a toolkit.",
     guidance: [
+      "Namespace all Composio actions to the user ID passed into this agent turn.",
       "If connectivity is uncertain, call list_connections.",
       "If the toolkit is not connected, call connect_toolkit.",
+      "Use auth config resolution when generating auth links.",
       "Do not fabricate external side effects.",
-      "You can prepare payloads/content in virtual files before using external tools.",
-    ],
-    examples: [
-      "Post to Discord, send Gmail, create a Typeform response flow, search Drive.",
     ],
   },
   ssh: {
     name: "ssh",
-    whenToUse: "Use when the user explicitly wants execution on a real host or to inspect the actual remote environment.",
+    whenToUse: "Use when the user explicitly wants a real host command or remote inspection.",
     guidance: [
-      "Prefer virtual bash first for planning, linting commands, and dry-runs.",
+      "Prefer virtual files/tools first for planning and preparation.",
       "Only use ssh_exec for real host actions.",
-      "If blocked by policy, instruct the user to use /ssh <command>.",
-      "Never say the host command worked unless ssh_exec returned success.",
-    ],
-    examples: [
-      "Prepare a script in /workspace, inspect it, then run final host command via ssh_exec.",
+      "If blocked, instruct the user to use /ssh <command>.",
     ],
   },
   scheduling: {
     name: "scheduling",
-    whenToUse: "Use when the user explicitly asks for a delayed follow-up or reminder.",
+    whenToUse: "Use when the user explicitly asks for a delayed reminder or follow-up.",
     guidance: [
       "Use schedule_message only for explicit delayed messaging.",
       "Keep scheduled text concise and action-oriented.",
-      "Confirm the delay implicitly by returning the task details.",
     ],
   },
   filesystem: {
     name: "filesystem",
-    whenToUse: "Use for scratch files, text transforms, project inspection, and temporary artifacts.",
+    whenToUse: "Use for scratch files, reports, prompt staging, payload generation, and safe in-memory transforms.",
     guidance: [
-      "Use write_virtual_file for reports, drafts, configs, JSON, and scripts.",
-      "Use read_virtual_file when exact content is needed.",
-      "Use just_bash for multi-step shell analysis.",
-      "Keep work under /workspace.",
-      "Prefer saving long outputs to files and summarizing them.",
-    ],
-    examples: [
-      "Write /workspace/notes.md",
-      "Read /workspace/context/request.json",
-      "Run find/grep/sed/awk/jq in virtual bash",
+      "Use read_virtual_file for exact file reads.",
+      "Use write_virtual_file for drafts, JSON, markdown, scripts, configs, and reports.",
+      "Use virtual_shell for listing/searching/moving/copying/deleting files in memory.",
+      "Prefer keeping work under /workspace.",
     ],
   },
   telegram: {
     name: "telegram",
-    whenToUse: "Use to shape responses for Telegram delivery constraints and user experience.",
+    whenToUse: "Use to optimize final responses for Telegram delivery behavior.",
     guidance: [
       "Be concise.",
-      "Avoid huge walls of text when a file or summary is better.",
-      "Streaming edits should be brief and stable.",
-      "Long final responses can be chunked automatically by the transport layer.",
+      "Avoid giant walls of text when a summarized answer is enough.",
+      "Long outputs can be staged in files and summarized.",
     ],
   },
 };
 
 function renderAllSkillsForPrompt(): string {
-  const parts: string[] = [];
-  for (const skill of Object.values(INLINE_SKILLS)) {
-    parts.push(
+  return Object.values(INLINE_SKILLS)
+    .map((skill) =>
       [
         `## Skill: ${skill.name}`,
         `When to use: ${skill.whenToUse}`,
@@ -239,9 +275,8 @@ function renderAllSkillsForPrompt(): string {
         ...skill.guidance.map((g) => `- ${g}`),
         ...(skill.examples?.length ? ["Examples:", ...skill.examples.map((e) => `- ${e}`)] : []),
       ].join("\n")
-    );
-  }
-  return parts.join("\n\n");
+    )
+    .join("\n\n");
 }
 
 function renderSingleSkill(skill: InlineSkill): string {
@@ -256,82 +291,459 @@ function renderSingleSkill(skill: InlineSkill): string {
 }
 
 // ============================================================
-// just-bash virtual runtime (per turn, sandboxed, in-memory)
+// Pure TypeScript virtual filesystem + shell-like runtime
 // ============================================================
+type VfsNode =
+  | {
+      type: "file";
+      path: string;
+      content: string;
+      createdAt: string;
+      updatedAt: string;
+    }
+  | {
+      type: "dir";
+      path: string;
+      createdAt: string;
+      updatedAt: string;
+    };
+
 type VirtualRuntime = {
-  bash: Bash;
-  seededFiles: string[];
+  cwd: string;
+  nodes: Map<string, VfsNode>;
 };
 
-async function createVirtualRuntime(args: {
+function createVirtualRuntime(args: {
   sessionId: string;
   userId: string;
   channel: Channel;
   userText: string;
   history: ModelMessage[];
-}): Promise<VirtualRuntime> {
-  const skillsFiles: Record<string, string> = {};
-  for (const skill of Object.values(INLINE_SKILLS)) {
-    skillsFiles[`/workspace/skills/${skill.name}.md`] = renderSingleSkill(skill);
+}): VirtualRuntime {
+  const rt: VirtualRuntime = {
+    cwd: "/workspace",
+    nodes: new Map<string, VfsNode>(),
+  };
+
+  function ensureDir(path: string) {
+    const p = sanitizePath(path);
+    if (rt.nodes.has(p)) return;
+    rt.nodes.set(p, {
+      type: "dir",
+      path: p,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
   }
 
-  const files: Record<string, string> = {
-    "/workspace/README.agent.txt": [
+  function writeFile(path: string, content: string) {
+    const p = sanitizePath(path);
+    for (const dir of parentDirs(p)) ensureDir(dir);
+    const existing = rt.nodes.get(p);
+    rt.nodes.set(p, {
+      type: "file",
+      path: p,
+      content,
+      createdAt: existing?.type === "file" ? existing.createdAt : nowIso(),
+      updatedAt: nowIso(),
+    });
+  }
+
+  ensureDir("/");
+  ensureDir("/workspace");
+  ensureDir("/workspace/context");
+  ensureDir("/workspace/skills");
+
+  writeFile(
+    "/workspace/README.agent.txt",
+    [
       "Virtual agent workspace.",
       "",
       "This filesystem is ephemeral for the current turn.",
-      "Use it for scratch files, reports, transformations, generated code, and analysis.",
+      "Use it for scratch files, reports, payloads, drafts, and analysis artifacts.",
       "",
       `sessionId=${args.sessionId}`,
       `userId=${args.userId}`,
       `channel=${args.channel}`,
-    ].join("\n"),
+    ].join("\n")
+  );
 
-    "/workspace/context/request.json": toSafeJson({
+  writeFile(
+    "/workspace/context/request.json",
+    toSafeJson({
       sessionId: args.sessionId,
       userId: args.userId,
       channel: args.channel,
       userText: args.userText,
       historyCount: args.history.length,
-      createdAt: new Date().toISOString(),
-    }),
+      createdAt: nowIso(),
+    })
+  );
 
-    "/workspace/context/skills.index.json": toSafeJson({
+  writeFile(
+    "/workspace/context/skills.index.json",
+    toSafeJson({
       skills: Object.keys(INLINE_SKILLS),
-    }),
+    })
+  );
 
-    ...skillsFiles,
-  };
+  for (const skill of Object.values(INLINE_SKILLS)) {
+    writeFile(`/workspace/skills/${skill.name}.md`, renderSingleSkill(skill));
+  }
 
-  const bash = new Bash({
-    cwd: "/workspace",
-    files,
-  } as any);
-
-  return { bash, seededFiles: Object.keys(files) };
+  return rt;
 }
 
-async function virtualWriteFile(runtime: VirtualRuntime, path: string, content: string) {
-  const p = path.startsWith("/") ? path : `/workspace/${path}`;
-  // just-bash exposes shell commands; write via heredoc to stay generic
-  const marker = "__AGENT_EOF__";
-  const cmd = [
-    `mkdir -p "$(dirname '${p.replace(/'/g, `'\\''`)}')"`,
-    `cat > '${p.replace(/'/g, `'\\''`)}' <<'${marker}'`,
+function vfsGetNode(rt: VirtualRuntime, path: string): VfsNode | undefined {
+  return rt.nodes.get(sanitizePath(path));
+}
+
+function vfsEnsureDir(rt: VirtualRuntime, path: string) {
+  const p = sanitizePath(path);
+  if (rt.nodes.has(p)) {
+    const node = rt.nodes.get(p)!;
+    if (node.type !== "dir") throw new Error(`Path exists and is not a directory: ${p}`);
+    return;
+  }
+  for (const dir of parentDirs(p)) {
+    if (!rt.nodes.has(dir)) {
+      rt.nodes.set(dir, {
+        type: "dir",
+        path: dir,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      });
+    }
+  }
+  rt.nodes.set(p, {
+    type: "dir",
+    path: p,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  });
+}
+
+function vfsWriteFile(rt: VirtualRuntime, path: string, content: string) {
+  const p = sanitizePath(path);
+  for (const dir of parentDirs(p)) vfsEnsureDir(rt, dir);
+  const existing = rt.nodes.get(p);
+  rt.nodes.set(p, {
+    type: "file",
+    path: p,
     content,
-    marker,
+    createdAt: existing?.type === "file" ? existing.createdAt : nowIso(),
+    updatedAt: nowIso(),
+  });
+}
+
+function vfsReadFile(rt: VirtualRuntime, path: string): string {
+  const p = sanitizePath(path);
+  const node = rt.nodes.get(p);
+  if (!node) throw new Error(`No such file: ${p}`);
+  if (node.type !== "file") throw new Error(`Not a file: ${p}`);
+  return node.content;
+}
+
+function vfsList(rt: VirtualRuntime, path: string, recursive = false): string[] {
+  const p = sanitizePath(path);
+  const node = rt.nodes.get(p);
+  if (!node) throw new Error(`No such path: ${p}`);
+
+  const keys = [...rt.nodes.keys()].sort();
+  if (node.type === "file") return [p];
+
+  if (!recursive) {
+    return keys.filter((k) => dirname(k) === p && k !== p).sort();
+  }
+
+  return keys.filter((k) => k === p || k.startsWith(p === "/" ? "/" : `${p}/`)).sort();
+}
+
+function vfsDelete(rt: VirtualRuntime, path: string, recursive = false) {
+  const p = sanitizePath(path);
+  const node = rt.nodes.get(p);
+  if (!node) throw new Error(`No such path: ${p}`);
+
+  if (node.type === "file") {
+    rt.nodes.delete(p);
+    return;
+  }
+
+  const children = [...rt.nodes.keys()].filter((k) => k !== p && k.startsWith(`${p}/`));
+  if (children.length && !recursive) {
+    throw new Error(`Directory not empty: ${p}`);
+  }
+  for (const child of children) rt.nodes.delete(child);
+  rt.nodes.delete(p);
+}
+
+function vfsMove(rt: VirtualRuntime, fromPath: string, toPath: string) {
+  const from = sanitizePath(fromPath);
+  const to = sanitizePath(toPath);
+  const node = rt.nodes.get(from);
+  if (!node) throw new Error(`No such path: ${from}`);
+
+  if (node.type === "file") {
+    vfsWriteFile(rt, to, node.content);
+    rt.nodes.delete(from);
+    return;
+  }
+
+  const entries = [...rt.nodes.entries()]
+    .filter(([p]) => p === from || p.startsWith(`${from}/`))
+    .sort((a, b) => a[0].length - b[0].length);
+
+  for (const [oldPath, oldNode] of entries) {
+    const suffix = oldPath === from ? "" : oldPath.slice(from.length);
+    const newPath = sanitizePath(`${to}${suffix}`);
+    if (oldNode.type === "dir") {
+      vfsEnsureDir(rt, newPath);
+    } else {
+      vfsWriteFile(rt, newPath, oldNode.content);
+    }
+  }
+
+  for (const [oldPath] of entries.reverse()) {
+    rt.nodes.delete(oldPath);
+  }
+}
+
+function vfsCopy(rt: VirtualRuntime, fromPath: string, toPath: string) {
+  const from = sanitizePath(fromPath);
+  const to = sanitizePath(toPath);
+  const node = rt.nodes.get(from);
+  if (!node) throw new Error(`No such path: ${from}`);
+
+  if (node.type === "file") {
+    vfsWriteFile(rt, to, node.content);
+    return;
+  }
+
+  const entries = [...rt.nodes.entries()]
+    .filter(([p]) => p === from || p.startsWith(`${from}/`))
+    .sort((a, b) => a[0].length - b[0].length);
+
+  for (const [oldPath, oldNode] of entries) {
+    const suffix = oldPath === from ? "" : oldPath.slice(from.length);
+    const newPath = sanitizePath(`${to}${suffix}`);
+    if (oldNode.type === "dir") {
+      vfsEnsureDir(rt, newPath);
+    } else {
+      vfsWriteFile(rt, newPath, oldNode.content);
+    }
+  }
+}
+
+function vfsFind(rt: VirtualRuntime, path: string, needle: string): string[] {
+  const base = sanitizePath(path);
+  const all = vfsList(rt, base, true);
+  const q = needle.toLowerCase();
+  return all.filter((p) => p.toLowerCase().includes(q));
+}
+
+function vfsGrep(rt: VirtualRuntime, path: string, query: string): Array<{ path: string; line: number; text: string }> {
+  const base = sanitizePath(path);
+  const all = vfsList(rt, base, true);
+  const q = query.toLowerCase();
+  const out: Array<{ path: string; line: number; text: string }> = [];
+
+  for (const p of all) {
+    const node = rt.nodes.get(p);
+    if (!node || node.type !== "file") continue;
+    const lines = node.content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].toLowerCase().includes(q)) {
+        out.push({ path: p, line: i + 1, text: lines[i] });
+      }
+    }
+  }
+
+  return out;
+}
+
+function virtualShellHelp() {
+  return [
+    "Supported commands:",
+    "- pwd",
+    "- ls [path]",
+    "- tree [path]",
+    "- cat <path>",
+    "- mkdir <path>",
+    "- write <path> <<<TEXT>>>",
+    "- rm <path>",
+    "- rm -r <path>",
+    "- mv <from> <to>",
+    "- cp <from> <to>",
+    "- find <path> <needle>",
+    "- grep <path> <needle>",
+    "",
+    "Notes:",
+    "- This is an in-memory virtual filesystem only.",
+    "- Paths default under /workspace when relative.",
+    "- For exact file writes/reads, prefer write_virtual_file/read_virtual_file.",
   ].join("\n");
-
-  return runtime.bash.exec(cmd);
 }
 
-async function virtualReadFile(runtime: VirtualRuntime, path: string) {
-  const p = path.startsWith("/") ? path : `/workspace/${path}`;
-  return runtime.bash.exec(`cat '${p.replace(/'/g, `'\\''`)}'`);
+function parseVirtualShell(input: string): { ok: true; result: any } | { ok: false; error: string } {
+  const raw = String(input ?? "").trim();
+  if (!raw) return { ok: false, error: "Empty command" };
+
+  if (raw === "help" || raw === "--help") {
+    return { ok: true, result: { command: raw, mode: "help" } };
+  }
+
+  const writeMatch = raw.match(/^write\s+(\S+)\s+<<<([\s\S]*)>>>$/);
+  if (writeMatch) {
+    return {
+      ok: true,
+      result: {
+        command: "write",
+        path: writeMatch[1],
+        content: writeMatch[2],
+      },
+    };
+  }
+
+  const parts = raw.match(/"[^"]*"|'[^']*'|\S+/g)?.map((s) => s.replace(/^['"]|['"]$/g, "")) ?? [];
+  if (!parts.length) return { ok: false, error: "Unable to parse command" };
+
+  const [command, ...rest] = parts;
+  return {
+    ok: true,
+    result: {
+      command,
+      args: rest,
+    },
+  };
 }
 
-async function virtualExec(runtime: VirtualRuntime, command: string) {
-  return runtime.bash.exec(command);
+function execVirtualShell(rt: VirtualRuntime, input: string) {
+  const parsed = parseVirtualShell(input);
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: parsed.error,
+      exitCode: 2,
+    };
+  }
+
+  const spec = parsed.result;
+
+  try {
+    if (spec.mode === "help") {
+      return {
+        ok: true,
+        stdout: virtualShellHelp(),
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+
+    if (spec.command === "write") {
+      vfsWriteFile(rt, spec.path, spec.content);
+      return {
+        ok: true,
+        stdout: `Wrote ${sanitizePath(spec.path)}`,
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+
+    const args = spec.args ?? [];
+
+    switch (spec.command) {
+      case "pwd":
+        return { ok: true, stdout: rt.cwd, stderr: "", exitCode: 0 };
+
+      case "ls": {
+        const target = args[0] ?? rt.cwd;
+        const items = vfsList(rt, target, false);
+        return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
+      }
+
+      case "tree": {
+        const target = args[0] ?? rt.cwd;
+        const items = vfsList(rt, target, true);
+        return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
+      }
+
+      case "cat": {
+        if (!args[0]) throw new Error("cat requires a path");
+        const content = vfsReadFile(rt, args[0]);
+        return { ok: true, stdout: content, stderr: "", exitCode: 0 };
+      }
+
+      case "mkdir": {
+        if (!args[0]) throw new Error("mkdir requires a path");
+        vfsEnsureDir(rt, args[0]);
+        return { ok: true, stdout: `Created ${sanitizePath(args[0])}`, stderr: "", exitCode: 0 };
+      }
+
+      case "rm": {
+        if (!args.length) throw new Error("rm requires a path");
+        const recursive = args[0] === "-r";
+        const target = recursive ? args[1] : args[0];
+        if (!target) throw new Error("rm requires a path");
+        vfsDelete(rt, target, recursive);
+        return { ok: true, stdout: `Removed ${sanitizePath(target)}`, stderr: "", exitCode: 0 };
+      }
+
+      case "mv": {
+        if (args.length < 2) throw new Error("mv requires <from> <to>");
+        vfsMove(rt, args[0], args[1]);
+        return {
+          ok: true,
+          stdout: `Moved ${sanitizePath(args[0])} -> ${sanitizePath(args[1])}`,
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+
+      case "cp": {
+        if (args.length < 2) throw new Error("cp requires <from> <to>");
+        vfsCopy(rt, args[0], args[1]);
+        return {
+          ok: true,
+          stdout: `Copied ${sanitizePath(args[0])} -> ${sanitizePath(args[1])}`,
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+
+      case "find": {
+        if (args.length < 2) throw new Error("find requires <path> <needle>");
+        const items = vfsFind(rt, args[0], args.slice(1).join(" "));
+        return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
+      }
+
+      case "grep": {
+        if (args.length < 2) throw new Error("grep requires <path> <needle>");
+        const items = vfsGrep(rt, args[0], args.slice(1).join(" "));
+        return {
+          ok: true,
+          stdout: items.map((x) => `${x.path}:${x.line}:${x.text}`).join("\n"),
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+
+      default:
+        return {
+          ok: false,
+          stdout: "",
+          stderr: `Unsupported virtual command "${spec.command}".\n\n${virtualShellHelp()}`,
+          exitCode: 2,
+        };
+    }
+  } catch (error: any) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: String(error?.message ?? error ?? "Virtual shell error"),
+      exitCode: 1,
+    };
+  }
 }
 
 // ============================================================
@@ -377,17 +789,54 @@ async function composioListConnections(userId: string) {
       slug: String(t?.slug ?? t?.name ?? "").toLowerCase(),
       name: String(t?.name ?? t?.slug ?? "").toLowerCase(),
       connected: Boolean(t?.connection?.connectedAccount?.id),
+      authConfigId:
+        t?.connection?.authConfig?.id ??
+        t?.authConfig?.id ??
+        t?.defaultAuthConfig?.id ??
+        null,
     }))
     .filter((x) => x.slug);
 
   return {
     ok: true,
-    items: normalized.map((x) => ({ slug: x.slug, connected: x.connected })),
+    namespace: userId,
+    items: normalized.map((x) => ({
+      slug: x.slug,
+      connected: x.connected,
+      authConfigId: x.authConfigId,
+    })),
     connected: normalized.filter((x) => x.connected).map((x) => x.slug),
   };
 }
 
-async function composioConnectToolkitByName(userId: string, toolkitInput: string) {
+function resolveConfiguredAuthConfigId(toolkitSlug: string): string | undefined {
+  const slugKey = normalizeToolkitKey(toolkitSlug);
+  const directEnvKey = `COMPOSIO_AUTH_CONFIG_${slugKey.toUpperCase()}`;
+  const direct = env(directEnvKey);
+  if (direct) return direct;
+
+  const legacyEnvKey = `COMPOSIO_AUTHCONFIG_${slugKey.toUpperCase()}`;
+  const legacy = env(legacyEnvKey);
+  if (legacy) return legacy;
+
+  const mapRaw = env("COMPOSIO_AUTH_CONFIG_MAP") || env("COMPOSIO_AUTHCONFIG_MAP");
+  if (mapRaw) {
+    try {
+      const parsed = JSON.parse(mapRaw) as Record<string, string>;
+      const exact =
+        parsed[toolkitSlug] ??
+        parsed[toolkitSlug.toLowerCase()] ??
+        parsed[slugKey];
+      if (exact) return String(exact);
+    } catch {
+      // ignore invalid JSON, fallback below
+    }
+  }
+
+  return env("COMPOSIO_DEFAULT_AUTH_CONFIG_ID") || env("COMPOSIO_DEFAULT_AUTHCONFIG_ID") || undefined;
+}
+
+async function composioResolveToolkitAndAuthConfig(userId: string, toolkitInput: string) {
   const wanted = toolkitInput.trim().toLowerCase();
   const wantedNorm = wanted.replace(/\s+/g, "");
 
@@ -415,7 +864,21 @@ async function composioConnectToolkitByName(userId: string, toolkitInput: string
       const slugNorm = slug.replace(/\s+/g, "");
       const nameNorm = name.replace(/\s+/g, "");
       const connected = Boolean(t?.connection?.connectedAccount?.id);
-      return { slug, name, slugNorm, nameNorm, connected };
+
+      const discoveredAuthConfigId =
+        t?.connection?.authConfig?.id ??
+        t?.authConfig?.id ??
+        t?.defaultAuthConfig?.id ??
+        null;
+
+      return {
+        slug,
+        name,
+        slugNorm,
+        nameNorm,
+        connected,
+        discoveredAuthConfigId,
+      };
     })
     .filter((x) => x.slug);
 
@@ -430,18 +893,97 @@ async function composioConnectToolkitByName(userId: string, toolkitInput: string
       .slice(0, 30)
       .map((x) => `${x.slug}${x.connected ? " (connected)" : ""}`)
       .join(", ");
+
     return {
-      ok: false,
+      ok: false as const,
       error: `Toolkit "${toolkitInput}" not found in Composio toolkits list.`,
       hint: `Try one of: ${top}`,
     };
   }
 
-  const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
-  const req: any = await userScoped.authorize(match.slug, callbackUrl ? { callbackUrl } : undefined);
-  const link = String(req?.redirectUrl ?? req?.redirect_url ?? "");
+  const configuredAuthConfigId = resolveConfiguredAuthConfigId(match.slug);
+  const resolvedAuthConfigId = configuredAuthConfigId ?? match.discoveredAuthConfigId ?? undefined;
 
-  return { ok: Boolean(link), toolkit: match.slug, link, alreadyConnected: match.connected };
+  return {
+    ok: true as const,
+    toolkit: match.slug,
+    connected: match.connected,
+    authConfigId: resolvedAuthConfigId,
+    authConfigSource: configuredAuthConfigId ? "env" : match.discoveredAuthConfigId ? "discovered" : "none",
+  };
+}
+
+async function composioConnectToolkitByName(userId: string, toolkitInput: string) {
+  const resolved = await composioResolveToolkitAndAuthConfig(userId, toolkitInput);
+  if (!resolved.ok) return resolved;
+
+  const userScoped = await composio.create(userId, {
+    manageConnections: false,
+  } as any);
+
+  const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
+
+  const authorizeOptionsVariants = [
+    {
+      callbackUrl,
+      authConfigId: resolved.authConfigId,
+    },
+    {
+      callbackUrl,
+      auth_config_id: resolved.authConfigId,
+    },
+    {
+      callback_url: callbackUrl,
+      authConfigId: resolved.authConfigId,
+    },
+    {
+      callback_url: callbackUrl,
+      auth_config_id: resolved.authConfigId,
+    },
+    callbackUrl ? { callbackUrl } : {},
+  ].filter(Boolean) as any[];
+
+  let lastError: unknown = null;
+  let req: any = null;
+
+  for (const opts of authorizeOptionsVariants) {
+    try {
+      req = await userScoped.authorize(resolved.toolkit, opts);
+      if (req) break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const link = String(
+    req?.redirectUrl ??
+      req?.redirect_url ??
+      req?.url ??
+      req?.link ??
+      ""
+  );
+
+  if (!link) {
+    return {
+      ok: false,
+      namespace: userId,
+      toolkit: resolved.toolkit,
+      authConfigId: resolved.authConfigId ?? null,
+      authConfigSource: resolved.authConfigSource,
+      error: `Failed to generate auth link for toolkit "${resolved.toolkit}" under namespace "${userId}".`,
+      details: lastError ? String((lastError as any)?.message ?? lastError) : "No redirect URL returned by Composio authorize()",
+    };
+  }
+
+  return {
+    ok: true,
+    namespace: userId,
+    toolkit: resolved.toolkit,
+    link,
+    alreadyConnected: resolved.connected,
+    authConfigId: resolved.authConfigId ?? null,
+    authConfigSource: resolved.authConfigSource,
+  };
 }
 
 // ============================================================
@@ -514,8 +1056,7 @@ export async function agentTurn(args: {
   const userText = String(extractRecentUserText(messages) ?? "").trim();
   const hasImages = historyHasImages(messages);
 
-  // Create per-turn virtual runtime with inline skills loaded as files
-  const virtualRuntime = await createVirtualRuntime({
+  const virtualRuntime = createVirtualRuntime({
     sessionId: args.sessionId,
     userId: args.userId,
     channel: args.channel,
@@ -523,15 +1064,12 @@ export async function agentTurn(args: {
     history: messages,
   });
 
-  // ✅ Use safe model names unless you have custom ones configured
   const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o-mini";
   const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o";
   const modelName = hasImages ? smartModel : fastModel;
 
-  // ✅ Low temp for tools / less hallucination
   const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.2");
 
-  // Telegram streaming + typing
   const isTelegram = args.channel === "telegram";
   const telegramStreamingEnabled =
     isTelegram &&
@@ -588,8 +1126,12 @@ export async function agentTurn(args: {
 
   const connectToolkit = tool({
     description:
-      "Generate a Composio connect/authorize link for a toolkit. Accepts user-friendly names like 'Typeform', 'Google Drive', or 'X'. Resolves by listing available Composio toolkits and choosing the closest match slug.",
-    inputSchema: zodSchema(z.object({ toolkit: z.string().min(1) })),
+      "Generate a Composio connect/authorize link for a toolkit using the current user's namespace. Accepts user-friendly names like 'Typeform', 'Google Drive', or 'X'. Resolves toolkit slug and auth config before creating the auth link.",
+    inputSchema: zodSchema(
+      z.object({
+        toolkit: z.string().min(1),
+      })
+    ),
     execute: async (input: { toolkit: string }) => {
       if (!env("COMPOSIO_API_KEY")) return { ok: false, error: "COMPOSIO_API_KEY not set" };
       return composioConnectToolkitByName(args.userId, input.toolkit);
@@ -597,11 +1139,25 @@ export async function agentTurn(args: {
   });
 
   const listConnections = tool({
-    description: "List which Composio toolkits are connected for this user.",
+    description: "List which Composio toolkits are connected for this user namespace.",
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
       if (!env("COMPOSIO_API_KEY")) return { ok: false, error: "COMPOSIO_API_KEY not set" };
       return composioListConnections(args.userId);
+    },
+  });
+
+  const resolveToolkitConnection = tool({
+    description:
+      "Resolve the best Composio toolkit slug and auth config for a requested toolkit name, under this user's namespace.",
+    inputSchema: zodSchema(
+      z.object({
+        toolkit: z.string().min(1),
+      })
+    ),
+    execute: async (input: { toolkit: string }) => {
+      if (!env("COMPOSIO_API_KEY")) return { ok: false, error: "COMPOSIO_API_KEY not set" };
+      return composioResolveToolkitAndAuthConfig(args.userId, input.toolkit);
     },
   });
 
@@ -644,49 +1200,6 @@ export async function agentTurn(args: {
     },
   });
 
-  const justBash = tool({
-    description:
-      "Run commands in a sandboxed virtual bash environment with an in-memory filesystem rooted at /workspace. Prefer this over SSH for safe analysis, dry-runs, parsing, grep/find/jq/sed/awk, and temporary artifacts.",
-    inputSchema: zodSchema(
-      z.object({
-        command: z.string().min(1).max(12000),
-      })
-    ),
-    execute: async (input: { command: string }) => {
-      const cmd = String(input.command ?? "").trim();
-      const blocked = [
-        /\brm\s+-rf\s+\/\b/i,
-        /\bshutdown\b/i,
-        /\breboot\b/i,
-        /\bpoweroff\b/i,
-      ];
-      if (blocked.some((re) => re.test(cmd))) {
-        return {
-          ok: false,
-          blocked: true,
-          message: "Blocked dangerous command in virtual bash environment.",
-        };
-      }
-
-      try {
-        const result: any = await virtualExec(virtualRuntime, cmd);
-        return {
-          ok: true,
-          command: cmd,
-          stdout: truncateText(result?.stdout ?? "", 20_000),
-          stderr: truncateText(result?.stderr ?? "", 12_000),
-          exitCode: result?.exitCode ?? result?.code ?? 0,
-        };
-      } catch (error: any) {
-        return {
-          ok: false,
-          command: cmd,
-          error: String(error?.message ?? error ?? "Unknown just_bash error"),
-        };
-      }
-    },
-  });
-
   const readVirtualFile = tool({
     description: "Read a file from the virtual in-memory filesystem. Prefer paths under /workspace.",
     inputSchema: zodSchema(
@@ -696,27 +1209,16 @@ export async function agentTurn(args: {
     ),
     execute: async (input: { path: string }) => {
       try {
-        const result: any = await virtualReadFile(virtualRuntime, input.path);
-        const stdout = String(result?.stdout ?? "");
-        const stderr = String(result?.stderr ?? "");
-        const exitCode = result?.exitCode ?? result?.code ?? 0;
-        if (exitCode !== 0) {
-          return {
-            ok: false,
-            path: input.path,
-            exitCode,
-            error: truncateText(stderr || "File read failed", 12_000),
-          };
-        }
+        const content = vfsReadFile(virtualRuntime, input.path);
         return {
           ok: true,
-          path: input.path,
-          content: truncateText(stdout, 60_000),
+          path: sanitizePath(input.path),
+          content: truncateText(content, 60_000),
         };
       } catch (error: any) {
         return {
           ok: false,
-          path: input.path,
+          path: sanitizePath(input.path),
           error: String(error?.message ?? error ?? "Unknown read_virtual_file error"),
         };
       }
@@ -733,29 +1235,39 @@ export async function agentTurn(args: {
     ),
     execute: async (input: { path: string; content: string }) => {
       try {
-        const result: any = await virtualWriteFile(virtualRuntime, input.path, input.content);
-        const exitCode = result?.exitCode ?? result?.code ?? 0;
-        const stderr = String(result?.stderr ?? "");
-        if (exitCode !== 0) {
-          return {
-            ok: false,
-            path: input.path,
-            exitCode,
-            error: truncateText(stderr || "File write failed", 12_000),
-          };
-        }
+        vfsWriteFile(virtualRuntime, input.path, input.content);
         return {
           ok: true,
-          path: input.path,
+          path: sanitizePath(input.path),
           bytes: Buffer.byteLength(input.content, "utf8"),
         };
       } catch (error: any) {
         return {
           ok: false,
-          path: input.path,
+          path: sanitizePath(input.path),
           error: String(error?.message ?? error ?? "Unknown write_virtual_file error"),
         };
       }
+    },
+  });
+
+  const virtualShell = tool({
+    description:
+      "Run shell-like commands against the in-memory virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep. This does not touch the host OS.",
+    inputSchema: zodSchema(
+      z.object({
+        command: z.string().min(1).max(12000),
+      })
+    ),
+    execute: async (input: { command: string }) => {
+      const result = execVirtualShell(virtualRuntime, input.command);
+      return {
+        ok: result.ok,
+        command: input.command,
+        stdout: truncateText(result.stdout, 20_000),
+        stderr: truncateText(result.stderr, 12_000),
+        exitCode: result.exitCode,
+      };
     },
   });
 
@@ -770,7 +1282,7 @@ export async function agentTurn(args: {
   }
 
   // ============================================================
-  // Load Composio tools (ALWAYS if COMPOSIO_API_KEY set)
+  // Load Composio tools
   // ============================================================
   let composioTools: ToolSet = {};
   if (env("COMPOSIO_API_KEY")) {
@@ -783,11 +1295,12 @@ export async function agentTurn(args: {
     ssh_exec: sshTool,
     connect_toolkit: connectToolkit,
     list_connections: listConnections,
+    resolve_toolkit_connection: resolveToolkitConnection,
     list_skills: listSkills,
     read_skill: readSkill,
-    just_bash: justBash,
     read_virtual_file: readVirtualFile,
     write_virtual_file: writeVirtualFile,
+    virtual_shell: virtualShell,
   };
 
   // ============================================================
@@ -839,13 +1352,18 @@ export async function agentTurn(args: {
     "CRITICAL TOOL RULES:",
     "- If the user asks you to do an external action (Typeform, Twitter/X, Discord, Slack, etc.), you MUST use the appropriate tool.",
     "- Never claim an action succeeded unless a tool call returned success.",
-    "- If an action requires the user to connect a toolkit, call connect_toolkit and give the link unless the user is already connected with their telegram userid.",
+    "- If an action requires the user to connect a toolkit, call connect_toolkit and provide the link.",
     "- If you're unsure what's connected, call list_connections.",
+    "- If you need to know which auth config and toolkit slug will be used, call resolve_toolkit_connection.",
     "",
-    "VIRTUAL BASH / FILESYSTEM:",
-    "- You have just_bash, a sandboxed virtual bash environment with an in-memory filesystem rooted at /workspace.",
-    "- You also have read_virtual_file and write_virtual_file for exact file IO in that virtual workspace.",
-    "- Prefer just_bash over SSH for analysis, report generation, grep/find/jq/sed/awk, scratch files, and dry-runs.",
+    "COMPOSIO NAMESPACE:",
+    `- The active Composio namespace for this turn is the user's ID: ${args.userId}`,
+    "- All auth links and connected accounts should be treated as belonging to that namespace.",
+    "",
+    "VIRTUAL FILESYSTEM:",
+    "- You have read_virtual_file and write_virtual_file for a safe in-memory filesystem.",
+    "- You also have virtual_shell for shell-like operations against that virtual filesystem only.",
+    "- Prefer virtual filesystem tools for drafting, staging, payload prep, notes, reports, JSON, and scratch work.",
     "- The virtual filesystem is ephemeral for the current turn.",
     "",
     "SSH:",
@@ -854,9 +1372,8 @@ export async function agentTurn(args: {
     "- If blocked, tell the user to use /ssh <command>.",
     "",
     "SKILLS:",
-    "- Agent skills are statically inlined in this file and also mounted into /workspace/skills/*.md.",
-    "- You can use list_skills to discover them and read_skill to inspect one in detail.",
-    "- Use these skills to choose the safest and most appropriate tool path.",
+    "- Agent skills are statically inlined in this file and also mounted into virtual files under /workspace/skills/*.md.",
+    "- You can use list_skills and read_skill when useful.",
     "",
     `Mode: ${autonomy}`,
     "Be concise and correct. Avoid hallucinations.",
@@ -866,7 +1383,7 @@ export async function agentTurn(args: {
   ].join("\n");
 
   // ============================================================
-  // Run generation (Telegram streams + typing)
+  // Run generation
   // ============================================================
   try {
     if (telegramStreamingEnabled) {
