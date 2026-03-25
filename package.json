@@ -27,6 +27,7 @@
   "devDependencies": {
     "@types/node": "latest",
     "@types/react": "latest",
+    "just-bash": "latest",
     "@types/ssh2": "^1.15.5",
     "eslint": "latest",
     "eslint-config-next": "latest",
