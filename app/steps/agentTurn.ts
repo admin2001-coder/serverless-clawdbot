@@ -13,6 +13,10 @@ import { openai } from "@ai-sdk/openai";
 import { Composio } from "@composio/core";
 import { VercelProvider } from "@composio/vercel";
 import { z } from "zod/v4";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import nodePath from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { env, csvEnv } from "@/app/lib/env";
 import type { Channel } from "@/app/lib/identity";
@@ -63,7 +67,18 @@ type VirtualRuntime = {
   redis: RedisClient;
 };
 
+type StagedVirtualFile = {
+  id: string;
+  sourcePath: string;
+  tempPath: string;
+  filename: string;
+  mimeType: string;
+  bytes: number;
+  createdAt: string;
+};
+
 let redisClientPromise: Promise<RedisClient | null> | null = null;
+const stagedFilesByTurn = new Map<string, StagedVirtualFile>();
 
 async function getRedisClient(): Promise<RedisClient | null> {
   if (!redisClientPromise) {
@@ -95,6 +110,10 @@ function vfsNodeKey(userId: string, sessionId: string, path: string): string {
 
 function vfsMetaKey(userId: string, sessionId: string): string {
   return `${vfsNamespace(userId, sessionId)}:meta`;
+}
+
+function stagedFileKey(sessionId: string, userId: string, stagedId: string): string {
+  return `${sessionId}:${userId}:${stagedId}`;
 }
 
 // ============================================================
@@ -256,6 +275,77 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function sanitizeFilename(input: string): string {
+  const raw = String(input ?? "").trim();
+  const base = raw || "file.bin";
+  return base.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").slice(0, 180) || "file.bin";
+}
+
+function guessMimeType(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith(".txt")) return "text/plain";
+  if (lower.endsWith(".md")) return "text/markdown";
+  if (lower.endsWith(".json")) return "application/json";
+  if (lower.endsWith(".csv")) return "text/csv";
+  if (lower.endsWith(".html")) return "text/html";
+  if (lower.endsWith(".xml")) return "application/xml";
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".yaml") || lower.endsWith(".yml")) return "text/yaml";
+  if (lower.endsWith(".ts") || lower.endsWith(".tsx") || lower.endsWith(".js") || lower.endsWith(".jsx"))
+    return "text/plain";
+  return "application/octet-stream";
+}
+
+async function stageVirtualFileToTemp(args: {
+  rt: VirtualRuntime;
+  sessionId: string;
+  userId: string;
+  path: string;
+  fileName?: string;
+}): Promise<StagedVirtualFile> {
+  const sourcePath = sanitizePath(args.path);
+  const content = await vfsReadFile(args.rt, sourcePath);
+  const filename = sanitizeFilename(args.fileName || basename(sourcePath) || "file.bin");
+  const mimeType = guessMimeType(filename);
+
+  const dir = await fs.mkdtemp(nodePath.join(os.tmpdir(), "agent-vfs-stage-"));
+  const tempPath = nodePath.join(dir, filename);
+  await fs.writeFile(tempPath, content, "utf8");
+
+  const staged: StagedVirtualFile = {
+    id: randomUUID(),
+    sourcePath,
+    tempPath,
+    filename,
+    mimeType,
+    bytes: Buffer.byteLength(content, "utf8"),
+    createdAt: nowIso(),
+  };
+
+  stagedFilesByTurn.set(stagedFileKey(args.sessionId, args.userId, staged.id), staged);
+  return staged;
+}
+
+async function cleanupStagedVirtualFiles(sessionId: string, userId: string): Promise<void> {
+  const prefix = `${sessionId}:${userId}:`;
+
+  for (const [key, staged] of stagedFilesByTurn.entries()) {
+    if (!key.startsWith(prefix)) continue;
+
+    try {
+      await fs.rm(nodePath.dirname(staged.tempPath), { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+
+    stagedFilesByTurn.delete(key);
+  }
+}
+
 // ============================================================
 // Inline skill system
 // ============================================================
@@ -269,10 +359,12 @@ type InlineSkill = {
 const INLINE_SKILLS: Record<string, InlineSkill> = {
   routing: {
     name: "routing",
-    whenToUse: "Use first when deciding whether to answer directly, use virtual files, SSH, scheduling, or Composio tools.",
+    whenToUse:
+      "Use first when deciding whether to answer directly, use virtual files, stage a VFS file for external upload, SSH, scheduling, or Composio tools.",
     guidance: [
       "Prefer direct answer if no tool is required.",
       "Prefer virtual filesystem tools for drafting, transforming, analyzing, and staging content.",
+      "Prefer stage_virtual_file before calling a dynamic external upload/create-file tool when the source file lives in the VFS.",
       "Prefer ssh_exec only for real host-side execution the user explicitly wants.",
       "Prefer Composio tools for external apps/services and auth flows.",
       "Never claim success for a tool-backed action unless the tool returned success.",
@@ -313,11 +405,21 @@ const INLINE_SKILLS: Record<string, InlineSkill> = {
       "Use read_virtual_file for exact file reads.",
       "Use write_virtual_file for drafts, JSON, markdown, scripts, configs, and reports.",
       "Use virtual_shell for listing/searching/moving/copying/deleting files.",
+      "Use stage_virtual_file when a VFS file needs to be passed into an external upload tool.",
       "Filesystem is persisted in Upstash Redis and scoped to the current user + session.",
       "Prefer keeping work under /workspace.",
     ],
   },
-  
+  staging: {
+    name: "staging",
+    whenToUse: "Use when a file in the Redis-backed VFS must be handed off to a dynamic external tool.",
+    guidance: [
+      "Use stage_virtual_file to materialize a VFS file into a temporary local file.",
+      "Pass the returned tempPath into the relevant dynamic Composio upload/create-file action.",
+      "Do not hardcode one destination like Google Drive; keep the destination dynamic.",
+      "Only claim completion if the downstream external tool succeeds.",
+    ],
+  },
 };
 
 function renderAllSkillsForPrompt(): string {
@@ -1259,7 +1361,7 @@ export async function agentTurn(args: {
 
   const readSkill = tool({
     description:
-      "Read a specific inline skill by name, such as routing, composio, ssh, scheduling, filesystem, or telegram.",
+      "Read a specific inline skill by name, such as routing, composio, ssh, scheduling, filesystem, or staging.",
     inputSchema: zodSchema(
       z.object({
         name: z.string().min(1),
@@ -1335,6 +1437,46 @@ export async function agentTurn(args: {
     },
   });
 
+  const stageVirtualFile = tool({
+    description:
+      "Stage a file from the Redis-backed virtual filesystem into a temporary local file so it can be passed to dynamic external upload or create-file tools. Use this before calling Composio tools that need a file path.",
+    inputSchema: zodSchema(
+      z.object({
+        path: z.string().min(1).max(4000),
+        fileName: z.string().min(1).max(255).optional(),
+      })
+    ),
+    execute: async (input: { path: string; fileName?: string }) => {
+      try {
+        const staged = await stageVirtualFileToTemp({
+          rt: virtualRuntime,
+          sessionId: args.sessionId,
+          userId: args.userId,
+          path: input.path,
+          fileName: input.fileName,
+        });
+
+        return {
+          ok: true,
+          id: staged.id,
+          sourcePath: staged.sourcePath,
+          tempPath: staged.tempPath,
+          filename: staged.filename,
+          mimeType: staged.mimeType,
+          bytes: staged.bytes,
+          createdAt: staged.createdAt,
+          note: "Pass tempPath into the appropriate dynamic external tool input.",
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          path: sanitizePath(input.path),
+          error: String(error?.message ?? error ?? "Unknown stage_virtual_file error"),
+        };
+      }
+    },
+  });
+
   const virtualShell = tool({
     description:
       "Run shell-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep. This does not touch the host OS.",
@@ -1384,6 +1526,7 @@ export async function agentTurn(args: {
     read_skill: readSkill,
     read_virtual_file: readVirtualFile,
     write_virtual_file: writeVirtualFile,
+    stage_virtual_file: stageVirtualFile,
     virtual_shell: virtualShell,
   };
 
@@ -1434,11 +1577,12 @@ export async function agentTurn(args: {
     "You are an Agentic Operating System similar to Open Claw and assistant running inside Telegram/WhatsApp/SMS connected to Composio tools via auth configs.",
     "",
     "CRITICAL TOOL RULES:",
-    "- If the user asks you to do an external action (Typeform, Twitter/X, Discord, Slack, etc.), you MUST use the appropriate tool.",
+    "- If the user asks you to do an external action (Typeform, Twitter/X, Discord, Slack, Drive, Notion, etc.), you MUST use the appropriate tool.",
     "- Never claim an action succeeded unless a tool call returned success.",
     "- If an action requires the user to connect a toolkit, call connect_toolkit and provide the link.",
     "- If you're unsure what's connected, call list_connections.",
     "- If you need to know which auth config and toolkit slug will be used, call resolve_toolkit_connection.",
+    "- If the source content lives in the virtual filesystem and must be uploaded somewhere, first call stage_virtual_file, then call the appropriate dynamic external tool using the returned tempPath.",
     "",
     "COMPOSIO NAMESPACE:",
     `- The active Composio namespace for this turn is the user's ID: ${args.userId}`,
@@ -1446,6 +1590,7 @@ export async function agentTurn(args: {
     "",
     "VIRTUAL FILESYSTEM:",
     "- You have read_virtual_file and write_virtual_file for a Redis-backed virtual filesystem.",
+    "- You also have stage_virtual_file for turning a VFS file into a temporary local file path for dynamic external upload tools.",
     "- You also have virtual_shell for shell-like operations against that virtual filesystem only.",
     "- Prefer virtual filesystem tools for drafting, staging, payload prep, notes, reports, JSON, and scratch work.",
     "- The virtual filesystem persists in Upstash Redis and is scoped to the current user + session.",
@@ -1502,5 +1647,6 @@ export async function agentTurn(args: {
     return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
   } finally {
     typingLoop?.stop();
+    await cleanupStagedVirtualFiles(args.sessionId, args.userId);
   }
 }
