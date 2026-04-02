@@ -7,7 +7,7 @@ on:
     branches: ["main"]
 
 env:
-  REGISTRY: ccr.ccs.tencentyun.com
+  REGISTRY: dywongtinfoil.tencentcloudcr.com
   IMAGE_NAME: csig/dylanclaw
 
 jobs:
@@ -26,7 +26,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: dywongtinfoil.tencentcloudcr.com
           username: ${{ secrets.TCR_USERNAME }}
           password: ${{ secrets.TCR_PASSWORD }}
 
@@ -36,5 +36,5 @@ jobs:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            dywongtinfoil.tencentcloudcr.com/${{ env.IMAGE_NAME }}:latest
+            dywongtinfoil.tencentcloudcr.com/${{ env.IMAGE_NAME }}:${{ github.sha }}
