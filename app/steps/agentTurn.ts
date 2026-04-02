@@ -123,6 +123,12 @@ function utf8ToBytes(text: string): Uint8Array {
   return new TextEncoder().encode(String(text ?? ""));
 }
 
+function toWebCryptoBufferSource(bytes: Uint8Array): ArrayBuffer {
+  const out = new Uint8Array(bytes.byteLength);
+  out.set(bytes);
+  return out.buffer;
+}
+
 function bytesToUtf8(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes);
 }
@@ -187,13 +193,13 @@ async function hmacSha256Hex(secret: string, message: string): Promise<string> {
 
   const key = await subtle.importKey(
     "raw",
-    utf8ToBytes(secret),
+    toWebCryptoBufferSource(utf8ToBytes(secret)),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"]
   );
 
-  const sig = await subtle.sign("HMAC", key, utf8ToBytes(message));
+  const sig = await subtle.sign("HMAC", key, toWebCryptoBufferSource(utf8ToBytes(message)));
   return hexFromBytes(new Uint8Array(sig));
 }
 
