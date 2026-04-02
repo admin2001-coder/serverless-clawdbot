@@ -1,4 +1,3 @@
-
 /* agentTurn.ts */
 // app/steps/agentTurn.ts
 import {
@@ -115,10 +114,146 @@ function clampNonEmptyText(text: string): string {
   return t.length ? t : "…";
 }
 
+function truncateText(text: unknown, max: number): string {
+  const s = typeof text === "string" ? text : String(text ?? "");
+  return s.length > max ? `${s.slice(0, max)}\n...[truncated ${s.length - max} chars]` : s;
+}
+
+function truncateForModelContext(text: unknown, max: number): string {
+  const s = typeof text === "string" ? text : String(text ?? "");
+  if (s.length <= max) return s;
+  if (max <= 80) return s.slice(-max);
+
+  const head = Math.max(20, Math.floor(max * 0.6));
+  const tail = Math.max(20, max - head - 32);
+  const omitted = s.length - head - tail;
+
+  if (omitted <= 0) return s.slice(0, max);
+
+  return `${s.slice(0, head)}\n...[omitted ${omitted} chars]...\n${s.slice(-tail)}`;
+}
+
+function utf8ToBytes(text: string): Uint8Array {
+  return new TextEncoder().encode(String(text ?? ""));
+}
+
+function toWebCryptoBufferSource(bytes: Uint8Array): ArrayBuffer {
+  const out = new Uint8Array(bytes.byteLength);
+  out.set(bytes);
+  return out.buffer;
+}
+
+function createNamedUploadBlob(filename: string, mimeType: string, base64: string): Blob | File {
+  if (typeof Blob === "undefined") {
+    throw new Error("Blob is not available in this runtime");
+  }
+
+  const safeName = safeFilenameSegment(filename || "asset.bin");
+  const safeMime = String(mimeType || "application/octet-stream").trim() || "application/octet-stream";
+  const bytes = base64ToBytes(base64);
+  const blob = new Blob([toWebCryptoBufferSource(bytes)], { type: safeMime });
+
+  if (typeof File !== "undefined") {
+    try {
+      return new File([blob], safeName, { type: safeMime });
+    } catch {
+      // fall through to a named Blob
+    }
+  }
+
+  try {
+    Object.defineProperty(blob, "name", {
+      value: safeName,
+      enumerable: true,
+      configurable: true,
+    });
+  } catch {
+    // best effort only
+  }
+
+  return blob;
+}
+
+function bytesToUtf8(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes);
+}
+
+function utf8ByteLength(text: string): number {
+  return utf8ToBytes(text).byteLength;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("base64");
+  }
+
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    let chunkBinary = "";
+    for (let j = 0; j < chunk.length; j++) {
+      chunkBinary += String.fromCharCode(chunk[j]);
+    }
+    binary += chunkBinary;
+  }
+
+  return btoa(binary);
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+  const clean = String(base64 ?? "").replace(/\s+/g, "");
+
+  if (typeof Buffer !== "undefined") {
+    return new Uint8Array(Buffer.from(clean, "base64"));
+  }
+
+  const binary = atob(clean);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function utf8ToBase64(text: string): string {
+  return bytesToBase64(utf8ToBytes(text));
+}
+
+function base64ToUtf8(base64: string): string {
+  return bytesToUtf8(base64ToBytes(base64));
+}
+
+function hexFromBytes(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new Error("Web Crypto subtle API is not available in this runtime");
+  }
+
+  const key = await subtle.importKey(
+    "raw",
+    toWebCryptoBufferSource(utf8ToBytes(secret)),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const sig = await subtle.sign("HMAC", key, toWebCryptoBufferSource(utf8ToBytes(message)));
+  return hexFromBytes(new Uint8Array(sig));
+}
+
 function normalizeHistory(history: ModelMessage[]): ModelMessage[] {
   return (history ?? []).map((m) => {
     const c: any = (m as any).content;
-    if (typeof c === "string") return { ...m, content: [{ type: "text" as const, text: c }] } as any;
+    if (typeof c === "string") {
+      return { ...m, content: [{ type: "text" as const, text: c }] } as any;
+    }
     return m;
   });
 }
@@ -129,47 +264,10 @@ function extractRecentUserText(history: ModelMessage[]): string {
   const c: any = (lastUser as any).content;
   if (typeof c === "string") return c;
   if (Array.isArray(c)) {
-    const t = c.find((p) => p?.type === "text")?.text;
-    if (typeof t === "string") return t;
+    const textParts = c.filter((p) => p?.type === "text" && typeof p?.text === "string").map((p) => p.text);
+    return textParts.join("\n").trim();
   }
   return "";
-}
-
-function historyHasImages(history: ModelMessage[]): boolean {
-  for (const msg of history) {
-    const c: any = (msg as any).content;
-    if (!Array.isArray(c)) continue;
-    if (c.some((p) => p?.type === "image")) return true;
-  }
-  return false;
-}
-
-function splitForTelegram(text: string, maxChars: number): string[] {
-  const t = String(text ?? "");
-  const max = Math.max(500, Math.min(4096, Math.floor(maxChars)));
-  const out: string[] = [];
-  let i = 0;
-
-  while (i < t.length) {
-    let end = Math.min(t.length, i + max);
-
-    if (end < t.length) {
-      const windowStart = Math.max(i, end - 250);
-      const window = t.slice(windowStart, end);
-      const nl = window.lastIndexOf("\n");
-      const sp = window.lastIndexOf(" ");
-      const cut = Math.max(nl, sp);
-      if (cut > 0) end = windowStart + cut;
-    }
-
-    if (end <= i) end = Math.min(t.length, i + max);
-
-    const chunk = t.slice(i, end).trim();
-    if (chunk) out.push(chunk);
-    i = end;
-  }
-
-  return out.length ? out : ["…"];
 }
 
 function parseSlashCommand(text: string): { cmd: string; arg: string } | null {
@@ -185,11 +283,6 @@ function toSafeJson(value: unknown): string {
   } catch {
     return String(value ?? "");
   }
-}
-
-function truncateText(text: unknown, max: number): string {
-  const s = typeof text === "string" ? text : String(text ?? "");
-  return s.length > max ? `${s.slice(0, max)}\n...[truncated ${s.length - max} chars]` : s;
 }
 
 function normalizeSkillName(raw: string): string {
@@ -235,12 +328,6 @@ function dirname(p: string): string {
   return s.slice(0, idx);
 }
 
-function basename(p: string): string {
-  const s = sanitizePath(p);
-  const idx = s.lastIndexOf("/");
-  return idx >= 0 ? s.slice(idx + 1) : s;
-}
-
 function parentDirs(p: string): string[] {
   const s = sanitizePath(p);
   const parts = s.split("/").filter(Boolean);
@@ -255,6 +342,475 @@ function parentDirs(p: string): string[] {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isProbablyUrl(value: unknown): value is string {
+  return typeof value === "string" && /^https?:\/\//i.test(value.trim());
+}
+
+function isDataUrl(value: unknown): value is string {
+  return typeof value === "string" && /^data:/i.test(value.trim());
+}
+
+function safeFilenameSegment(value: string): string {
+  const s = String(value ?? "")
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return s || "asset";
+}
+
+function inferExtensionFromMime(mimeType: string): string {
+  const mime = String(mimeType ?? "").toLowerCase().split(";")[0].trim();
+  const map: Record<string, string> = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/heic": "heic",
+    "image/heif": "heif",
+    "image/svg+xml": "svg",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/ogg": "ogg",
+    "audio/webm": "webm",
+    "audio/mp4": "m4a",
+    "video/mp4": "mp4",
+    "video/quicktime": "mov",
+    "video/webm": "webm",
+    "video/x-msvideo": "avi",
+    "application/pdf": "pdf",
+    "application/json": "json",
+    "text/plain": "txt",
+    "text/markdown": "md",
+    "text/csv": "csv",
+    "application/zip": "zip",
+  };
+  return map[mime] ?? "bin";
+}
+
+function inferMimeFromFilename(name: string): string {
+  const ext = String(name ?? "").split(".").pop()?.toLowerCase() ?? "";
+  const map: Record<string, string> = {
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    webp: "image/webp",
+    gif: "image/gif",
+    heic: "image/heic",
+    heif: "image/heif",
+    svg: "image/svg+xml",
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    m4a: "audio/mp4",
+    webm: "video/webm",
+    mp4: "video/mp4",
+    mov: "video/quicktime",
+    avi: "video/x-msvideo",
+    pdf: "application/pdf",
+    json: "application/json",
+    txt: "text/plain",
+    md: "text/markdown",
+    csv: "text/csv",
+    zip: "application/zip",
+  };
+  return map[ext] ?? "application/octet-stream";
+}
+
+function guessMimeTypeFromKind(kind: SessionAssetKind): string {
+  switch (kind) {
+    case "image":
+      return "image/*";
+    case "audio":
+      return "audio/*";
+    case "video":
+      return "video/*";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function extractMimeTypeFromDataUrl(dataUrl: string): string {
+  const match = String(dataUrl ?? "").match(/^data:([^;,]+)(;base64)?,/i);
+  return match?.[1]?.toLowerCase() ?? "application/octet-stream";
+}
+
+function stripDataUrlPrefix(dataUrl: string): string {
+  return String(dataUrl ?? "").replace(/^data:[^,]*,/, "");
+}
+
+function estimateBase64Bytes(base64: string): number | null {
+  const s = String(base64 ?? "").trim();
+  if (!s) return 0;
+  const padding = s.endsWith("==") ? 2 : s.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((s.length * 3) / 4) - padding);
+}
+
+function tryUtf8FromBase64(base64: string): string | null {
+  try {
+    return base64ToUtf8(base64);
+  } catch {
+    return null;
+  }
+}
+
+function isTextualMimeType(mimeType: string): boolean {
+  const mime = String(mimeType ?? "").toLowerCase();
+  return (
+    mime.startsWith("text/") ||
+    mime.includes("json") ||
+    mime.includes("xml") ||
+    mime.includes("yaml") ||
+    mime.includes("javascript") ||
+    mime.includes("typescript") ||
+    mime.includes("csv")
+  );
+}
+
+function pickFirstDefined<T>(...values: Array<T | undefined | null>): T | undefined {
+  for (const value of values) {
+    if (value !== undefined && value !== null) return value;
+  }
+  return undefined;
+}
+
+// ============================================================
+// Session asset model
+// ============================================================
+type SessionAssetKind = "image" | "audio" | "video" | "file";
+type SessionAssetSource = "url" | "data_url" | "base64" | "text" | "unknown";
+
+type SessionAsset = {
+  id: string;
+  kind: SessionAssetKind;
+  role: string;
+  messageIndex: number;
+  partIndex: number;
+  partType: string;
+  filename: string;
+  mimeType: string;
+  extension: string;
+  source: SessionAssetSource;
+  url?: string;
+  dataUrl?: string;
+  base64?: string;
+  text?: string;
+  sizeBytes?: number | null;
+};
+
+type LoadedSessionAsset = {
+  base64: string;
+  mimeType: string;
+  filename: string;
+  sizeBytes: number | null;
+  source: SessionAssetSource | "fetched_url";
+  textPreview?: string | null;
+  dataUrl?: string;
+};
+
+function isRichMediaPartType(type: string): boolean {
+  return ["image", "audio", "video", "file"].includes(String(type ?? "").toLowerCase());
+}
+
+function historyHasRichMedia(history: ModelMessage[]): boolean {
+  for (const msg of history) {
+    const c: any = (msg as any).content;
+    if (!Array.isArray(c)) continue;
+    if (c.some((p) => isRichMediaPartType(String(p?.type ?? "")))) return true;
+  }
+  return false;
+}
+
+function assetKindFromPart(part: any): SessionAssetKind | null {
+  const type = String(part?.type ?? "").toLowerCase();
+  if (["image", "audio", "video", "file"].includes(type)) return type as SessionAssetKind;
+  if (part?.image || part?.image_url) return "image";
+  if (part?.audio || part?.input_audio) return "audio";
+  if (part?.video) return "video";
+  if (part?.file || part?.filename || part?.mimeType || part?.mediaType) return "file";
+  return null;
+}
+
+function rawAssetPayloadFromPart(part: any, kind: SessionAssetKind): unknown {
+  switch (kind) {
+    case "image":
+      return pickFirstDefined(part?.image, part?.image_url, part?.url, part?.uri, part?.data);
+    case "audio":
+      return pickFirstDefined(part?.audio, part?.input_audio?.data, part?.url, part?.uri, part?.data);
+    case "video":
+      return pickFirstDefined(part?.video, part?.url, part?.uri, part?.data);
+    default:
+      return pickFirstDefined(part?.file, part?.url, part?.uri, part?.data, part?.bytes, part?.content);
+  }
+}
+
+function coerceAssetSource(payload: unknown): {
+  source: SessionAssetSource;
+  url?: string;
+  dataUrl?: string;
+  base64?: string;
+  text?: string;
+  sizeBytes?: number | null;
+} {
+  if (payload == null) return { source: "unknown", sizeBytes: null };
+
+  if (typeof payload === "string") {
+    if (isProbablyUrl(payload)) return { source: "url", url: payload.trim(), sizeBytes: null };
+    if (isDataUrl(payload)) {
+      const base64 = stripDataUrlPrefix(payload);
+      return { source: "data_url", dataUrl: payload, base64, sizeBytes: estimateBase64Bytes(base64) };
+    }
+    return { source: "text", text: payload, sizeBytes: utf8ByteLength(payload) };
+  }
+
+  if (payload instanceof Uint8Array) {
+    const base64 = bytesToBase64(payload);
+    return { source: "base64", base64, sizeBytes: payload.byteLength };
+  }
+
+  if (Array.isArray(payload) && payload.every((x) => typeof x === "number")) {
+    const bytes = new Uint8Array(payload);
+    const base64 = bytesToBase64(bytes);
+    return { source: "base64", base64, sizeBytes: payload.length };
+  }
+
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(payload)) {
+    const bytes = new Uint8Array(payload);
+    const base64 = bytesToBase64(bytes);
+    return { source: "base64", base64, sizeBytes: bytes.byteLength };
+  }
+
+  if (typeof payload === "object") {
+    const obj: any = payload;
+    const nested = pickFirstDefined(obj?.url, obj?.uri, obj?.href, obj?.data, obj?.base64, obj?.content);
+    if (nested !== undefined) return coerceAssetSource(nested);
+  }
+
+  return { source: "unknown", text: truncateText(payload, 2000), sizeBytes: null };
+}
+
+function buildSessionAsset(part: any, role: string, messageIndex: number, partIndex: number): SessionAsset | null {
+  const kind = assetKindFromPart(part);
+  if (!kind) return null;
+
+  const partType = String(part?.type ?? kind).toLowerCase();
+  const payload = rawAssetPayloadFromPart(part, kind);
+  const sourceInfo = coerceAssetSource(payload);
+
+  let mimeType =
+    String(
+      pickFirstDefined(
+        part?.mimeType,
+        part?.mediaType,
+        part?.contentType,
+        part?.input_audio?.format ? `audio/${String(part.input_audio.format).toLowerCase()}` : undefined,
+        sourceInfo.dataUrl ? extractMimeTypeFromDataUrl(sourceInfo.dataUrl) : undefined
+      ) ?? ""
+    ).toLowerCase() || guessMimeTypeFromKind(kind);
+
+  const explicitFilename = String(
+    pickFirstDefined(part?.filename, part?.name, part?.fileName, part?.title, part?.metadata?.filename) ?? ""
+  ).trim();
+
+  const extension = explicitFilename.includes(".")
+    ? explicitFilename.split(".").pop()!.toLowerCase()
+    : inferExtensionFromMime(mimeType);
+
+  const filename = explicitFilename || `asset_${messageIndex + 1}_${partIndex + 1}.${extension}`;
+
+  if (!mimeType || mimeType === "application/octet-stream") {
+    mimeType = inferMimeFromFilename(filename) || mimeType;
+  }
+
+  return {
+    id: `asset_m${messageIndex + 1}_p${partIndex + 1}`,
+    kind,
+    role,
+    messageIndex,
+    partIndex,
+    partType,
+    filename: safeFilenameSegment(filename),
+    mimeType,
+    extension: extension || inferExtensionFromMime(mimeType),
+    source: sourceInfo.source,
+    url: sourceInfo.url,
+    dataUrl: sourceInfo.dataUrl,
+    base64: sourceInfo.base64,
+    text: sourceInfo.text,
+    sizeBytes: sourceInfo.sizeBytes ?? null,
+  };
+}
+
+function collectSessionAssets(history: ModelMessage[]): SessionAsset[] {
+  const assets: SessionAsset[] = [];
+  for (let messageIndex = 0; messageIndex < history.length; messageIndex++) {
+    const msg: any = history[messageIndex];
+    const content = msg?.content;
+    if (!Array.isArray(content)) continue;
+
+    for (let partIndex = 0; partIndex < content.length; partIndex++) {
+      const asset = buildSessionAsset(content[partIndex], String(msg?.role ?? "user"), messageIndex, partIndex);
+      if (asset) assets.push(asset);
+    }
+  }
+  return assets;
+}
+
+// ============================================================
+// Prompt-safe message sanitization
+// ============================================================
+function mediaPartToTextPlaceholder(part: any): { type: "text"; text: string } {
+  const type = String(part?.type ?? "file").toLowerCase();
+  const filename = String(part?.filename ?? part?.name ?? part?.fileName ?? "").trim();
+  const mimeType = String(part?.mimeType ?? part?.mediaType ?? part?.contentType ?? "").trim();
+
+  const label = [type, filename || undefined, mimeType || undefined].filter(Boolean).join(" | ");
+  return {
+    type: "text",
+    text: `[${label || "media attachment"} omitted from prompt context; use session asset tools]`,
+  };
+}
+
+type SanitizeHistoryOptions = {
+  maxMessages?: number;
+  maxTextChars?: number;
+  maxTotalChars?: number;
+  maxAssistantMessages?: number;
+};
+
+function approximateModelMessageChars(message: ModelMessage): number {
+  const content: any = (message as any).content;
+
+  if (typeof content === "string") return content.length;
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part?.text === "string") return part.text.length;
+        return JSON.stringify(part ?? "").length;
+      })
+      .reduce((sum, n) => sum + n, 0);
+  }
+
+  return 0;
+}
+
+function sanitizeMessagesForModel(history: ModelMessage[], opts?: SanitizeHistoryOptions): ModelMessage[] {
+  const maxMessages = Math.max(2, opts?.maxMessages ?? parseIntOr(env("AGENT_MAX_HISTORY_MESSAGES"), 8));
+  const maxTextChars = Math.max(500, opts?.maxTextChars ?? parseIntOr(env("AGENT_MAX_TEXT_PART_CHARS"), 4000));
+  const maxTotalChars = Math.max(
+    maxTextChars,
+    opts?.maxTotalChars ?? parseIntOr(env("AGENT_MAX_TOTAL_CONTEXT_CHARS"), 24000)
+  );
+  const maxAssistantMessages = Math.max(
+    0,
+    opts?.maxAssistantMessages ?? parseIntOr(env("AGENT_MAX_ASSISTANT_HISTORY_MESSAGES"), 3)
+  );
+
+  const trimmed = history.slice(-maxMessages);
+  const selected: ModelMessage[] = [];
+  let totalChars = 0;
+  let assistantCount = 0;
+
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    const msg = trimmed[i];
+    const role = String((msg as any).role ?? "");
+
+    if (role === "tool") continue;
+    if (role === "assistant" && assistantCount >= maxAssistantMessages) continue;
+
+    const content: any = (msg as any).content;
+    let candidate: ModelMessage | null = null;
+
+    if (typeof content === "string") {
+      if (role === "system" || role === "user" || role === "assistant") {
+        candidate = {
+          ...msg,
+          content: clampNonEmptyText(truncateForModelContext(content, maxTextChars)),
+        } as any;
+      }
+    } else if (Array.isArray(content)) {
+      const safeParts: any[] = [];
+      for (const part of content) {
+        const type = String(part?.type ?? "");
+
+        if (type === "text") {
+          safeParts.push({
+            type: "text",
+            text: clampNonEmptyText(truncateForModelContext(String(part?.text ?? ""), maxTextChars)),
+          });
+          continue;
+        }
+
+        if (type === "image" || type === "audio" || type === "video" || type === "file") {
+          safeParts.push(mediaPartToTextPlaceholder(part));
+          continue;
+        }
+      }
+
+      if (!safeParts.length) {
+        safeParts.push({ type: "text", text: "…" });
+      }
+
+      if (role === "user" || role === "assistant") {
+        candidate = { ...msg, content: safeParts } as any;
+      } else if (role === "system") {
+        candidate = {
+          role: "system",
+          content: clampNonEmptyText(
+            truncateForModelContext(
+              safeParts.map((part) => part.text).join("\n"),
+              maxTextChars
+            )
+          ),
+        } as any;
+      }
+    }
+
+    if (!candidate) continue;
+
+    const candidateChars = approximateModelMessageChars(candidate);
+    if (selected.length > 0 && totalChars + candidateChars > maxTotalChars) continue;
+
+    if (role === "assistant") assistantCount += 1;
+    totalChars += candidateChars;
+    selected.push(candidate);
+  }
+
+  return selected.reverse();
+}
+
+function splitForTelegram(text: string, maxChars: number): string[] {
+  const t = String(text ?? "");
+  const max = Math.max(500, Math.min(4096, Math.floor(maxChars)));
+  const out: string[] = [];
+  let i = 0;
+
+  while (i < t.length) {
+    let end = Math.min(t.length, i + max);
+
+    if (end < t.length) {
+      const windowStart = Math.max(i, end - 250);
+      const window = t.slice(windowStart, end);
+      const nl = window.lastIndexOf("\n");
+      const sp = window.lastIndexOf(" ");
+      const cut = Math.max(nl, sp);
+      if (cut > 0) end = windowStart + cut;
+    }
+
+    if (end <= i) end = Math.min(t.length, i + max);
+
+    const chunk = t.slice(i, end).trim();
+    if (chunk) out.push(chunk);
+    i = end;
+  }
+
+  return out.length ? out : ["…"];
 }
 
 // ============================================================
@@ -318,22 +874,18 @@ const INLINE_SKILLS: Record<string, InlineSkill> = {
       "Prefer keeping work under /workspace.",
     ],
   },
-  
+  modalities: {
+    name: "modalities",
+    whenToUse: "Use when the user message includes images, audio, video, or files that need staging or upload.",
+    guidance: [
+      "Use list_session_assets to inspect available assets.",
+      "Use prepare_session_asset first for metadata and upload hints.",
+      "Use asset references like asset://asset_m6_p2 when calling external tools.",
+      "The tool execution wrapper resolves asset references deterministically before the external tool runs.",
+      "Do not assume all Composio upload tools use the same schema.",
+    ],
+  },
 };
-
-function renderAllSkillsForPrompt(): string {
-  return Object.values(INLINE_SKILLS)
-    .map((skill) =>
-      [
-        `## Skill: ${skill.name}`,
-        `When to use: ${skill.whenToUse}`,
-        "Guidance:",
-        ...skill.guidance.map((g) => `- ${g}`),
-        ...(skill.examples?.length ? ["Examples:", ...skill.examples.map((e) => `- ${e}`)] : []),
-      ].join("\n")
-    )
-    .join("\n\n");
-}
 
 function renderSingleSkill(skill: InlineSkill): string {
   return [
@@ -351,9 +903,7 @@ function renderSingleSkill(skill: InlineSkill): string {
 // ============================================================
 async function vfsAllPaths(rt: VirtualRuntime): Promise<string[]> {
   const raw = (await rt.redis.smembers(vfsPathsKey(rt.userId, rt.sessionId))) ?? [];
-  return (Array.isArray(raw) ? raw : [])
-    .map((x) => sanitizePath(String(x)))
-    .sort();
+  return (Array.isArray(raw) ? raw : []).map((x) => sanitizePath(String(x))).sort();
 }
 
 async function vfsGetNode(rt: VirtualRuntime, path: string): Promise<VfsNode | undefined> {
@@ -485,9 +1035,7 @@ async function vfsMove(rt: VirtualRuntime, fromPath: string, toPath: string): Pr
   if (to.startsWith(`${from}/`)) throw new Error(`Cannot move a path into itself: ${from} -> ${to}`);
 
   const keys = await vfsAllPaths(rt);
-  const entries = keys
-    .filter((p) => p === from || p.startsWith(`${from}/`))
-    .sort((a, b) => a.length - b.length);
+  const entries = keys.filter((p) => p === from || p.startsWith(`${from}/`)).sort((a, b) => a.length - b.length);
 
   if (node.type === "file") {
     await vfsWriteFile(rt, to, node.content);
@@ -523,9 +1071,7 @@ async function vfsCopy(rt: VirtualRuntime, fromPath: string, toPath: string): Pr
   if (to.startsWith(`${from}/`)) throw new Error(`Cannot copy a path into itself: ${from} -> ${to}`);
 
   const keys = await vfsAllPaths(rt);
-  const entries = keys
-    .filter((p) => p === from || p.startsWith(`${from}/`))
-    .sort((a, b) => a.length - b.length);
+  const entries = keys.filter((p) => p === from || p.startsWith(`${from}/`)).sort((a, b) => a.length - b.length);
 
   if (node.type === "file") {
     await vfsWriteFile(rt, to, node.content);
@@ -585,6 +1131,7 @@ async function createVirtualRuntime(args: {
   channel: Channel;
   userText: string;
   history: ModelMessage[];
+  sessionAssets?: SessionAsset[];
 }): Promise<VirtualRuntime> {
   const redis = await getRedisClient();
   if (!redis) {
@@ -605,6 +1152,7 @@ async function createVirtualRuntime(args: {
   await vfsEnsureDir(rt, "/workspace");
   await vfsEnsureDir(rt, "/workspace/context");
   await vfsEnsureDir(rt, "/workspace/skills");
+  await vfsEnsureDir(rt, "/workspace/assets");
 
   await rt.redis.set(vfsMetaKey(args.userId, args.sessionId), {
     sessionId: args.sessionId,
@@ -637,8 +1185,9 @@ async function createVirtualRuntime(args: {
       sessionId: args.sessionId,
       userId: args.userId,
       channel: args.channel,
-      userText: args.userText,
+      userText: truncateText(args.userText, 4000),
       historyCount: args.history.length,
+      sessionAssetCount: args.sessionAssets?.length ?? 0,
       createdAt: nowIso(),
     })
   );
@@ -648,6 +1197,25 @@ async function createVirtualRuntime(args: {
     "/workspace/context/skills.index.json",
     toSafeJson({
       skills: Object.keys(INLINE_SKILLS),
+    })
+  );
+
+  await vfsWriteFile(
+    rt,
+    "/workspace/context/session_assets.index.json",
+    toSafeJson({
+      assets:
+        args.sessionAssets?.map((asset) => ({
+          id: asset.id,
+          kind: asset.kind,
+          role: asset.role,
+          filename: asset.filename,
+          mimeType: asset.mimeType,
+          source: asset.source,
+          sizeBytes: asset.sizeBytes ?? null,
+          hasUrl: Boolean(asset.url),
+          hasInlineData: Boolean(asset.base64 || asset.dataUrl || asset.text),
+        })) ?? [],
     })
   );
 
@@ -844,6 +1412,1333 @@ async function execVirtualShell(rt: VirtualRuntime, input: string) {
 }
 
 // ============================================================
+// Session asset preparation / materialization
+// ============================================================
+function describeSessionAsset(asset: SessionAsset) {
+  return {
+    id: asset.id,
+    kind: asset.kind,
+    role: asset.role,
+    messageIndex: asset.messageIndex,
+    partIndex: asset.partIndex,
+    partType: asset.partType,
+    filename: asset.filename,
+    mimeType: asset.mimeType,
+    extension: asset.extension,
+    source: asset.source,
+    sizeBytes: asset.sizeBytes ?? null,
+    hasUrl: Boolean(asset.url),
+    hasInlineData: Boolean(asset.base64 || asset.dataUrl || asset.text),
+    url: asset.url ?? null,
+  };
+}
+
+async function loadSessionAssetContent(
+  asset: SessionAsset,
+  opts?: { fetchRemote?: boolean; maxBytes?: number }
+): Promise<LoadedSessionAsset> {
+  const fetchRemote = opts?.fetchRemote ?? true;
+  const maxBytes = Math.max(1024, opts?.maxBytes ?? parseIntOr(env("SESSION_ASSET_MAX_BYTES"), 25 * 1024 * 1024));
+
+  if (asset.base64) {
+    const textPreview = isTextualMimeType(asset.mimeType) ? tryUtf8FromBase64(asset.base64) : null;
+    return {
+      base64: asset.base64,
+      mimeType: asset.mimeType,
+      filename: asset.filename,
+      sizeBytes: asset.sizeBytes ?? estimateBase64Bytes(asset.base64),
+      source: asset.source,
+      textPreview,
+      dataUrl: asset.dataUrl ?? `data:${asset.mimeType};base64,${asset.base64}`,
+    };
+  }
+
+  if (asset.dataUrl) {
+    const base64 = stripDataUrlPrefix(asset.dataUrl);
+    const textPreview = isTextualMimeType(asset.mimeType) ? tryUtf8FromBase64(base64) : null;
+    return {
+      base64,
+      mimeType: asset.mimeType,
+      filename: asset.filename,
+      sizeBytes: asset.sizeBytes ?? estimateBase64Bytes(base64),
+      source: asset.source,
+      textPreview,
+      dataUrl: asset.dataUrl,
+    };
+  }
+
+  if (asset.text != null) {
+    const base64 = utf8ToBase64(asset.text);
+    return {
+      base64,
+      mimeType: asset.mimeType || "text/plain",
+      filename: asset.filename,
+      sizeBytes: utf8ByteLength(asset.text),
+      source: asset.source,
+      textPreview: asset.text,
+      dataUrl: `data:${asset.mimeType || "text/plain"};base64,${base64}`,
+    };
+  }
+
+  if (asset.url && fetchRemote) {
+    const response = await fetch(asset.url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch asset URL (${response.status} ${response.statusText})`);
+    }
+
+    const arr = new Uint8Array(await response.arrayBuffer());
+    if (arr.byteLength > maxBytes) {
+      throw new Error(`Remote asset too large (${arr.byteLength} bytes > ${maxBytes} bytes)`);
+    }
+
+    const base64 = bytesToBase64(arr);
+    const contentType =
+      response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || asset.mimeType || "application/octet-stream";
+    const textPreview = isTextualMimeType(contentType) ? bytesToUtf8(arr) : null;
+
+    return {
+      base64,
+      mimeType: contentType,
+      filename: asset.filename,
+      sizeBytes: arr.byteLength,
+      source: "fetched_url",
+      textPreview,
+      dataUrl: `data:${contentType};base64,${base64}`,
+    };
+  }
+
+  throw new Error(`Asset ${asset.id} does not currently have retrievable inline data or an accessible URL`);
+}
+
+async function materializeSessionAssetToVfs(
+  rt: VirtualRuntime,
+  asset: SessionAsset,
+  opts?: { fetchRemote?: boolean; includeBase64?: boolean }
+) {
+  const includeBase64 = opts?.includeBase64 ?? false;
+  const loaded = await loadSessionAssetContent(asset, { fetchRemote: opts?.fetchRemote ?? true });
+  const assetRoot = sanitizePath(`/workspace/assets/${asset.id}`);
+  const metaPath = sanitizePath(`${assetRoot}/meta.json`);
+  const rawBase64Path = sanitizePath(`${assetRoot}/${asset.filename}.base64.txt`);
+  const textPath = sanitizePath(`${assetRoot}/${asset.filename}.txt`);
+  const infoPath = sanitizePath(`${assetRoot}/composio_payload.json`);
+
+  await vfsEnsureDir(rt, assetRoot);
+
+  await vfsWriteFile(
+    rt,
+    metaPath,
+    toSafeJson({
+      ...describeSessionAsset(asset),
+      loadedMimeType: loaded.mimeType,
+      loadedSizeBytes: loaded.sizeBytes,
+      loadedSource: loaded.source,
+      createdAt: nowIso(),
+    })
+  );
+
+  if (includeBase64) {
+    await vfsWriteFile(rt, rawBase64Path, loaded.base64);
+  }
+
+  if (loaded.textPreview != null) {
+    await vfsWriteFile(rt, textPath, loaded.textPreview);
+  }
+
+  await vfsWriteFile(
+    rt,
+    infoPath,
+    toSafeJson({
+      filename: loaded.filename,
+      mimeType: loaded.mimeType,
+      url: asset.url ?? null,
+      dataUrl: includeBase64 ? loaded.dataUrl ?? null : null,
+      base64Path: includeBase64 ? rawBase64Path : null,
+      textPath: loaded.textPreview != null ? textPath : null,
+      notes: [
+        "Prefer url when a target Composio tool accepts URL-based file ingestion.",
+        "Otherwise request inline content only when the target tool truly requires it.",
+        "Not all Composio tools share the same schema; adapt to the declared tool input schema.",
+      ],
+    })
+  );
+
+  return {
+    ok: true,
+    assetId: asset.id,
+    assetRoot,
+    metaPath,
+    base64Path: includeBase64 ? rawBase64Path : null,
+    textPath: loaded.textPreview != null ? textPath : null,
+    infoPath,
+    loaded,
+  };
+}
+
+function getPublicBaseUrl(): string | null {
+  const value =
+    env("ASSET_PUBLIC_BASE_URL") ||
+    env("APP_BASE_URL") ||
+    env("NEXT_PUBLIC_APP_URL") ||
+    env("PUBLIC_APP_URL") ||
+    "";
+  const trimmed = value.trim().replace(/\/+$/, "");
+  return trimmed ? trimmed : null;
+}
+
+function getAssetSigningSecret(): string | null {
+  const v = env("ASSET_URL_SIGNING_SECRET") || env("SESSION_ASSET_SIGNING_SECRET") || "";
+  return v.trim() || null;
+}
+
+async function buildSignedAssetUrl(asset: SessionAsset, ttlSeconds = 900): Promise<string | null> {
+  const baseUrl = getPublicBaseUrl();
+  const secret = getAssetSigningSecret();
+  const subtle = globalThis.crypto?.subtle;
+
+  if (!baseUrl || !secret || !subtle) return null;
+
+  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, ttlSeconds);
+  const payload = `${asset.id}.${expiresAt}.${asset.filename}.${asset.mimeType}`;
+  const sig = await hmacSha256Hex(secret, payload);
+
+  const url = new URL(`${baseUrl}/api/assets/${encodeURIComponent(asset.id)}`);
+  url.searchParams.set("expires", String(expiresAt));
+  url.searchParams.set("filename", asset.filename);
+  url.searchParams.set("mimeType", asset.mimeType);
+  url.searchParams.set("sig", sig);
+  return url.toString();
+}
+
+function buildPreparedAssetPayload(
+  asset: SessionAsset,
+  opts?: {
+    loaded?: LoadedSessionAsset | null;
+    materialized?: {
+      assetRoot: string;
+      metaPath: string;
+      base64Path: string | null;
+      textPath: string | null;
+      infoPath: string;
+    } | null;
+    includeInlineData?: boolean;
+    signedUrl?: string | null;
+  }
+) {
+  const loaded = opts?.loaded ?? null;
+  const materialized = opts?.materialized ?? null;
+  const includeInlineData = opts?.includeInlineData ?? false;
+  const signedUrl = opts?.signedUrl ?? null;
+
+  const mimeType = loaded?.mimeType ?? asset.mimeType;
+  const filename = loaded?.filename ?? asset.filename;
+  const sizeBytes = loaded?.sizeBytes ?? asset.sizeBytes ?? null;
+  const base64 = includeInlineData ? loaded?.base64 ?? asset.base64 ?? null : null;
+  const dataUrl =
+    includeInlineData
+      ? loaded?.dataUrl ?? asset.dataUrl ?? (base64 ? `data:${mimeType};base64,${base64}` : null)
+      : null;
+
+  return {
+    asset: describeSessionAsset(asset),
+    prepared: {
+      filename,
+      mimeType,
+      sizeBytes,
+      url: signedUrl ?? asset.url ?? null,
+      dataUrl,
+      base64,
+      textPreview: includeInlineData ? loaded?.textPreview ?? asset.text ?? null : null,
+    },
+    composioHints: {
+      commonCandidateFields: {
+        filename,
+        fileName: filename,
+        name: filename,
+        mimeType,
+        mediaType: mimeType,
+        contentType: mimeType,
+        fileMimeType: mimeType,
+        url: signedUrl ?? asset.url ?? null,
+        uri: signedUrl ?? asset.url ?? null,
+        dataUrl,
+        contentBase64: base64,
+        base64,
+      },
+      guidance: [
+        "Inspect the target Composio tool schema first.",
+        "For URL-style parameters, pass asset://<assetId> and let the execution wrapper resolve it. For upload-style Composio tools, the wrapper stages bytes and supplies the resulting s3key automatically.",
+        "For inline file parameters, use asset://<assetId> or an object with assetId and the wrapper will materialize data deterministically.",
+      ],
+    },
+    virtualPaths: materialized
+      ? {
+          assetRoot: materialized.assetRoot,
+          metaPath: materialized.metaPath,
+          base64Path: materialized.base64Path,
+          textPath: materialized.textPath,
+          infoPath: materialized.infoPath,
+        }
+      : null,
+  };
+}
+
+// ============================================================
+// Deterministic asset URL + tool input resolution
+// ============================================================
+
+type AssetResolutionMode = "url" | "dataUrl" | "base64" | "blob" | "file" | "s3key" | "composioFile" | "auto";
+
+type ComposioStagedAsset = {
+  s3key: string;
+  key: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number | null;
+  md5Hex: string;
+  toolkitSlug: string;
+  toolSlug: string;
+  uploadRequestType: string | null;
+  uploadRequestId: string | null;
+};
+
+const composioStagedAssetCache = new Map<string, Promise<ComposioStagedAsset>>();
+
+function isAssetRefString(value: string): boolean {
+  return /^asset:\/\/[A-Za-z0-9._:-]+$/.test(String(value ?? "").trim());
+}
+
+function assetIdFromRef(value: string): string {
+  return String(value ?? "").trim().replace(/^asset:\/\//, "");
+}
+
+function maybeAssetIdFromString(value: string, sessionAssets: SessionAsset[]): string | null {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return null;
+
+  if (isAssetRefString(trimmed)) {
+    return assetIdFromRef(trimmed);
+  }
+
+  if (sessionAssets.some((x) => x.id === trimmed)) {
+    return trimmed;
+  }
+
+  return null;
+}
+
+function isComposioUploadLikeResolutionKey(key: string | null | undefined): boolean {
+  const raw = String(key ?? "").trim().toLowerCase();
+  if (!raw) return false;
+
+  if (
+    /(^|_)(filename|filepath|file_path|fileid|file_id|mime|mimetype|mime_type|filetype|file_type|name|title)$/.test(
+      raw
+    )
+  ) {
+    return false;
+  }
+
+  const compact = raw.replace(/[^a-z0-9]+/g, "_");
+  return (
+    /(^|_)(file|files|attachment|attachments|document|documents|media|upload|uploads|image|images|audio|audios|video|videos)$/.test(
+      compact
+    ) ||
+    /(^|_)(inputfile|inputfiles|uploadfile|uploadfiles|fileupload|fileuploads)$/.test(compact)
+  );
+}
+
+function isExplicitBlobResolutionKey(key: string | null | undefined): boolean {
+  const compact = String(key ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_");
+  return /(^|_)(blob|blobs|binary|binarybody|binary_body)$/.test(compact);
+}
+
+function isLikelyComposioS3KeyTool(toolSlug: string | null | undefined): boolean {
+  const slug = String(toolSlug ?? "").trim().toUpperCase();
+  if (!slug) return false;
+  return (
+    slug.includes("UPLOAD") ||
+    slug.includes("ATTACH") ||
+    slug.includes("SEND_EMAIL") ||
+    slug.includes("SEND_DRAFT") ||
+    slug.includes("MEDIA")
+  );
+}
+
+function inferResolutionModeFromContext(args: {
+  key?: string | null;
+  toolSlug?: string | null;
+}): AssetResolutionMode {
+  const k = String(args.key ?? "").toLowerCase();
+
+  if (/(^|_)(url|uri|href|link|downloadurl|sourceurl|fileurl)$/.test(k)) return "url";
+  if (/(^|_)(dataurl)$/.test(k)) return "dataUrl";
+  if (/(^|_)(base64|contentbase64)$/.test(k)) return "base64";
+  if (/(^|_)(s3key|s3_key|storagekey|storage_key)$/.test(k)) return "s3key";
+  if (isExplicitBlobResolutionKey(k)) return "blob";
+  if (isComposioUploadLikeResolutionKey(k)) return "composioFile";
+  if (!k && isLikelyComposioS3KeyTool(args.toolSlug)) return "composioFile";
+
+  return "auto";
+}
+
+function resolveToolObjectAssetId(input: Record<string, any>): string | null {
+  const id = pickFirstDefined(
+    typeof input.assetId === "string" ? input.assetId : undefined,
+    typeof input.sessionAssetId === "string" ? input.sessionAssetId : undefined,
+    typeof input.sourceAssetId === "string" ? input.sourceAssetId : undefined
+  );
+  return id ? id.trim() : null;
+}
+
+function resolveDirectS3KeyAssetField(
+  input: Record<string, any>,
+  sessionAssets: SessionAsset[]
+): { fieldName: string; assetId: string } | null {
+  const candidates = ["s3key", "s3Key", "s3_key"];
+  for (const fieldName of candidates) {
+    const value = input[fieldName];
+    if (typeof value !== "string") continue;
+    const assetId = maybeAssetIdFromString(value, sessionAssets);
+    if (assetId) return { fieldName, assetId };
+  }
+  return null;
+}
+
+function normalizeComposioToolSlug(toolSlug: string): string {
+  return String(toolSlug ?? "").trim().toUpperCase();
+}
+
+function inferComposioToolkitSlugFromToolSlug(toolSlug: string): string {
+  const normalized = normalizeComposioToolSlug(toolSlug);
+  if (!normalized) {
+    throw new Error("Cannot infer Composio toolkit slug from empty tool slug");
+  }
+
+  const underscoreIndex = normalized.indexOf("_");
+  const prefix = underscoreIndex > 0 ? normalized.slice(0, underscoreIndex) : normalized;
+  return prefix.toLowerCase();
+}
+
+function getComposioApiBaseUrl(): string {
+  const raw = env("COMPOSIO_API_BASE_URL") || env("COMPOSIO_BASE_URL") || "https://backend.composio.dev";
+  const trimmed = String(raw ?? "").trim().replace(/\/+$/, "");
+  return /\/api\/v3$/i.test(trimmed) ? trimmed : `${trimmed}/api/v3`;
+}
+
+function buildComposioApiUrl(pathname: string): string {
+  const base = getComposioApiBaseUrl();
+  const path = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  return `${base}${path}`;
+}
+
+function extractComposioErrorMessage(payload: unknown): string {
+  const message =
+    (payload as any)?.error?.message ??
+    (payload as any)?.message ??
+    (payload as any)?.error ??
+    (payload as any)?.detail ??
+    null;
+
+  if (typeof message === "string" && message.trim()) return message.trim();
+
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return String(payload ?? "Unknown Composio API error");
+  }
+}
+
+function md5Add32(a: number, b: number): number {
+  return (a + b) >>> 0;
+}
+
+function md5RotateLeft(value: number, shift: number): number {
+  return ((value << shift) | (value >>> (32 - shift))) >>> 0;
+}
+
+function md5Cmn(q: number, a: number, b: number, x: number, s: number, t: number): number {
+  return md5Add32(md5RotateLeft(md5Add32(md5Add32(a, q), md5Add32(x, t)), s), b);
+}
+
+function md5Ff(a: number, b: number, c: number, d: number, x: number, s: number, t: number): number {
+  return md5Cmn((b & c) | (~b & d), a, b, x, s, t);
+}
+
+function md5Gg(a: number, b: number, c: number, d: number, x: number, s: number, t: number): number {
+  return md5Cmn((b & d) | (c & ~d), a, b, x, s, t);
+}
+
+function md5Hh(a: number, b: number, c: number, d: number, x: number, s: number, t: number): number {
+  return md5Cmn(b ^ c ^ d, a, b, x, s, t);
+}
+
+function md5Ii(a: number, b: number, c: number, d: number, x: number, s: number, t: number): number {
+  return md5Cmn(c ^ (b | ~d), a, b, x, s, t);
+}
+
+function setUint32LittleEndian(target: Uint8Array, offset: number, value: number) {
+  target[offset] = value & 0xff;
+  target[offset + 1] = (value >>> 8) & 0xff;
+  target[offset + 2] = (value >>> 16) & 0xff;
+  target[offset + 3] = (value >>> 24) & 0xff;
+}
+
+function md5HexFromBytes(input: Uint8Array): string {
+  const words = new Array<number>(((((input.length + 8) >>> 6) + 1) * 16)).fill(0);
+
+  let i = 0;
+  for (; i < input.length; i++) {
+    words[i >> 2] |= input[i] << ((i % 4) * 8);
+  }
+
+  words[i >> 2] |= 0x80 << ((i % 4) * 8);
+
+  const bitLength = input.length * 8;
+  words[words.length - 2] = bitLength >>> 0;
+  words[words.length - 1] = Math.floor(bitLength / 0x100000000) >>> 0;
+
+  let a = 0x67452301;
+  let b = 0xefcdab89;
+  let c = 0x98badcfe;
+  let d = 0x10325476;
+
+  for (let index = 0; index < words.length; index += 16) {
+    const oldA = a;
+    const oldB = b;
+    const oldC = c;
+    const oldD = d;
+
+    a = md5Ff(a, b, c, d, words[index + 0], 7, 0xd76aa478);
+    d = md5Ff(d, a, b, c, words[index + 1], 12, 0xe8c7b756);
+    c = md5Ff(c, d, a, b, words[index + 2], 17, 0x242070db);
+    b = md5Ff(b, c, d, a, words[index + 3], 22, 0xc1bdceee);
+    a = md5Ff(a, b, c, d, words[index + 4], 7, 0xf57c0faf);
+    d = md5Ff(d, a, b, c, words[index + 5], 12, 0x4787c62a);
+    c = md5Ff(c, d, a, b, words[index + 6], 17, 0xa8304613);
+    b = md5Ff(b, c, d, a, words[index + 7], 22, 0xfd469501);
+    a = md5Ff(a, b, c, d, words[index + 8], 7, 0x698098d8);
+    d = md5Ff(d, a, b, c, words[index + 9], 12, 0x8b44f7af);
+    c = md5Ff(c, d, a, b, words[index + 10], 17, 0xffff5bb1);
+    b = md5Ff(b, c, d, a, words[index + 11], 22, 0x895cd7be);
+    a = md5Ff(a, b, c, d, words[index + 12], 7, 0x6b901122);
+    d = md5Ff(d, a, b, c, words[index + 13], 12, 0xfd987193);
+    c = md5Ff(c, d, a, b, words[index + 14], 17, 0xa679438e);
+    b = md5Ff(b, c, d, a, words[index + 15], 22, 0x49b40821);
+
+    a = md5Gg(a, b, c, d, words[index + 1], 5, 0xf61e2562);
+    d = md5Gg(d, a, b, c, words[index + 6], 9, 0xc040b340);
+    c = md5Gg(c, d, a, b, words[index + 11], 14, 0x265e5a51);
+    b = md5Gg(b, c, d, a, words[index + 0], 20, 0xe9b6c7aa);
+    a = md5Gg(a, b, c, d, words[index + 5], 5, 0xd62f105d);
+    d = md5Gg(d, a, b, c, words[index + 10], 9, 0x02441453);
+    c = md5Gg(c, d, a, b, words[index + 15], 14, 0xd8a1e681);
+    b = md5Gg(b, c, d, a, words[index + 4], 20, 0xe7d3fbc8);
+    a = md5Gg(a, b, c, d, words[index + 9], 5, 0x21e1cde6);
+    d = md5Gg(d, a, b, c, words[index + 14], 9, 0xc33707d6);
+    c = md5Gg(c, d, a, b, words[index + 3], 14, 0xf4d50d87);
+    b = md5Gg(b, c, d, a, words[index + 8], 20, 0x455a14ed);
+    a = md5Gg(a, b, c, d, words[index + 13], 5, 0xa9e3e905);
+    d = md5Gg(d, a, b, c, words[index + 2], 9, 0xfcefa3f8);
+    c = md5Gg(c, d, a, b, words[index + 7], 14, 0x676f02d9);
+    b = md5Gg(b, c, d, a, words[index + 12], 20, 0x8d2a4c8a);
+
+    a = md5Hh(a, b, c, d, words[index + 5], 4, 0xfffa3942);
+    d = md5Hh(d, a, b, c, words[index + 8], 11, 0x8771f681);
+    c = md5Hh(c, d, a, b, words[index + 11], 16, 0x6d9d6122);
+    b = md5Hh(b, c, d, a, words[index + 14], 23, 0xfde5380c);
+    a = md5Hh(a, b, c, d, words[index + 1], 4, 0xa4beea44);
+    d = md5Hh(d, a, b, c, words[index + 4], 11, 0x4bdecfa9);
+    c = md5Hh(c, d, a, b, words[index + 7], 16, 0xf6bb4b60);
+    b = md5Hh(b, c, d, a, words[index + 10], 23, 0xbebfbc70);
+    a = md5Hh(a, b, c, d, words[index + 13], 4, 0x289b7ec6);
+    d = md5Hh(d, a, b, c, words[index + 0], 11, 0xeaa127fa);
+    c = md5Hh(c, d, a, b, words[index + 3], 16, 0xd4ef3085);
+    b = md5Hh(b, c, d, a, words[index + 6], 23, 0x04881d05);
+    a = md5Hh(a, b, c, d, words[index + 9], 4, 0xd9d4d039);
+    d = md5Hh(d, a, b, c, words[index + 12], 11, 0xe6db99e5);
+    c = md5Hh(c, d, a, b, words[index + 15], 16, 0x1fa27cf8);
+    b = md5Hh(b, c, d, a, words[index + 2], 23, 0xc4ac5665);
+
+    a = md5Ii(a, b, c, d, words[index + 0], 6, 0xf4292244);
+    d = md5Ii(d, a, b, c, words[index + 7], 10, 0x432aff97);
+    c = md5Ii(c, d, a, b, words[index + 14], 15, 0xab9423a7);
+    b = md5Ii(b, c, d, a, words[index + 5], 21, 0xfc93a039);
+    a = md5Ii(a, b, c, d, words[index + 12], 6, 0x655b59c3);
+    d = md5Ii(d, a, b, c, words[index + 3], 10, 0x8f0ccc92);
+    c = md5Ii(c, d, a, b, words[index + 10], 15, 0xffeff47d);
+    b = md5Ii(b, c, d, a, words[index + 1], 21, 0x85845dd1);
+    a = md5Ii(a, b, c, d, words[index + 8], 6, 0x6fa87e4f);
+    d = md5Ii(d, a, b, c, words[index + 15], 10, 0xfe2ce6e0);
+    c = md5Ii(c, d, a, b, words[index + 6], 15, 0xa3014314);
+    b = md5Ii(b, c, d, a, words[index + 13], 21, 0x4e0811a1);
+    a = md5Ii(a, b, c, d, words[index + 4], 6, 0xf7537e82);
+    d = md5Ii(d, a, b, c, words[index + 11], 10, 0xbd3af235);
+    c = md5Ii(c, d, a, b, words[index + 2], 15, 0x2ad7d2bb);
+    b = md5Ii(b, c, d, a, words[index + 9], 21, 0xeb86d391);
+
+    a = md5Add32(a, oldA);
+    b = md5Add32(b, oldB);
+    c = md5Add32(c, oldC);
+    d = md5Add32(d, oldD);
+  }
+
+  const out = new Uint8Array(16);
+  setUint32LittleEndian(out, 0, a);
+  setUint32LittleEndian(out, 4, b);
+  setUint32LittleEndian(out, 8, c);
+  setUint32LittleEndian(out, 12, d);
+  return hexFromBytes(out);
+}
+
+async function requestComposioStorageUpload(args: {
+  toolkitSlug: string;
+  toolSlug: string;
+  filename: string;
+  mimeType: string;
+  md5Hex: string;
+}) {
+  const apiKey = env("COMPOSIO_API_KEY") || "";
+  if (!apiKey) {
+    throw new Error("COMPOSIO_API_KEY is not set");
+  }
+
+  const response = await fetch(buildComposioApiUrl("/files/upload/request"), {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+    },
+    body: JSON.stringify({
+      toolkit_slug: args.toolkitSlug,
+      tool_slug: normalizeComposioToolSlug(args.toolSlug),
+      filename: args.filename,
+      mimetype: args.mimeType,
+      md5: args.md5Hex,
+    }),
+  });
+
+  const rawText = await response.text();
+  let payload: any = null;
+
+  try {
+    payload = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    payload = rawText;
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `Composio upload request failed (${response.status} ${response.statusText}): ${extractComposioErrorMessage(payload)}`
+    );
+  }
+
+  const key = String(payload?.key ?? payload?.s3key ?? "").trim();
+  if (!key) {
+    throw new Error("Composio upload request did not return a storage key");
+  }
+
+  return {
+    key,
+    requestId: payload?.id ? String(payload.id) : null,
+    uploadUrl: String(payload?.new_presigned_url ?? payload?.newPresignedUrl ?? "").trim() || null,
+    type: payload?.type ? String(payload.type) : null,
+    raw: payload,
+  };
+}
+
+async function uploadBytesToComposioPresignedUrl(args: {
+  uploadUrl: string;
+  bytes: Uint8Array;
+  mimeType: string;
+}) {
+  const headers: Record<string, string> = {};
+  if (args.mimeType) headers["content-type"] = args.mimeType;
+
+  const response = await fetch(args.uploadUrl, {
+    method: "PUT",
+    headers,
+    body: toWebCryptoBufferSource(args.bytes),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(
+      `Composio presigned upload failed (${response.status} ${response.statusText})${body ? `: ${truncateText(body, 1000)}` : ""}`
+    );
+  }
+}
+
+async function stageAssetToComposioStorageForTool(args: {
+  asset: SessionAsset;
+  toolkitSlug: string;
+  toolSlug: string;
+  fetchRemote?: boolean;
+}): Promise<ComposioStagedAsset> {
+  const loaded = await loadSessionAssetContent(args.asset, { fetchRemote: args.fetchRemote ?? true });
+  const bytes = base64ToBytes(loaded.base64);
+  const md5Hex = md5HexFromBytes(bytes);
+  const cacheKey = [
+    args.toolkitSlug,
+    normalizeComposioToolSlug(args.toolSlug),
+    loaded.filename,
+    loaded.mimeType,
+    md5Hex,
+  ].join("|");
+
+  const existing = composioStagedAssetCache.get(cacheKey);
+  if (existing) return await existing;
+
+  const promise = (async () => {
+    const request = await requestComposioStorageUpload({
+      toolkitSlug: args.toolkitSlug,
+      toolSlug: args.toolSlug,
+      filename: loaded.filename,
+      mimeType: loaded.mimeType,
+      md5Hex,
+    });
+
+    if (request.uploadUrl) {
+      await uploadBytesToComposioPresignedUrl({
+        uploadUrl: request.uploadUrl,
+        bytes,
+        mimeType: loaded.mimeType,
+      });
+    }
+
+    return {
+      s3key: request.key,
+      key: request.key,
+      filename: loaded.filename,
+      mimeType: loaded.mimeType,
+      sizeBytes: loaded.sizeBytes,
+      md5Hex,
+      toolkitSlug: args.toolkitSlug,
+      toolSlug: normalizeComposioToolSlug(args.toolSlug),
+      uploadRequestType: request.type,
+      uploadRequestId: request.requestId,
+    };
+  })();
+
+  composioStagedAssetCache.set(cacheKey, promise);
+
+  try {
+    return await promise;
+  } catch (error) {
+    composioStagedAssetCache.delete(cacheKey);
+    throw error;
+  }
+}
+
+function buildMinimalComposioStagedFilePayload(staged: ComposioStagedAsset) {
+  return {
+    s3key: staged.s3key,
+    name: staged.filename,
+    mimetype: staged.mimeType,
+  };
+}
+
+async function resolveAssetForToolExecution(args: {
+  asset: SessionAsset;
+  mode: AssetResolutionMode;
+  toolSlug?: string | null;
+  toolkitSlug?: string | null;
+  fetchRemote?: boolean;
+}): Promise<{
+  filename: string;
+  mimeType: string;
+  url: string | null;
+  dataUrl: string | null;
+  base64: string | null;
+  blob: Blob | File | null;
+  staged: ComposioStagedAsset | null;
+  sizeBytes: number | null;
+}> {
+  const mode = args.mode;
+  const asset = args.asset;
+  const signedUrl = await buildSignedAssetUrl(asset);
+  const toolSlug = normalizeComposioToolSlug(args.toolSlug ?? "");
+  const toolkitSlug = String(args.toolkitSlug ?? "").trim().toLowerCase() || (toolSlug ? inferComposioToolkitSlugFromToolSlug(toolSlug) : "");
+
+  if (mode === "url") {
+    if (signedUrl || asset.url) {
+      return {
+        filename: asset.filename,
+        mimeType: asset.mimeType,
+        url: signedUrl ?? asset.url ?? null,
+        dataUrl: null,
+        base64: null,
+        blob: null,
+        staged: null,
+        sizeBytes: asset.sizeBytes ?? null,
+      };
+    }
+
+    const loaded = await loadSessionAssetContent(asset, { fetchRemote: args.fetchRemote ?? true });
+    return {
+      filename: loaded.filename,
+      mimeType: loaded.mimeType,
+      url: null,
+      dataUrl: loaded.dataUrl ?? `data:${loaded.mimeType};base64,${loaded.base64}`,
+      base64: loaded.base64,
+      blob: null,
+      staged: null,
+      sizeBytes: loaded.sizeBytes,
+    };
+  }
+
+  if (mode === "base64") {
+    const loaded = await loadSessionAssetContent(asset, { fetchRemote: args.fetchRemote ?? true });
+    return {
+      filename: loaded.filename,
+      mimeType: loaded.mimeType,
+      url: signedUrl ?? asset.url ?? null,
+      dataUrl: loaded.dataUrl ?? null,
+      base64: loaded.base64,
+      blob: null,
+      staged: null,
+      sizeBytes: loaded.sizeBytes,
+    };
+  }
+
+  if (mode === "dataUrl") {
+    const loaded = await loadSessionAssetContent(asset, { fetchRemote: args.fetchRemote ?? true });
+    return {
+      filename: loaded.filename,
+      mimeType: loaded.mimeType,
+      url: signedUrl ?? asset.url ?? null,
+      dataUrl: loaded.dataUrl ?? `data:${loaded.mimeType};base64,${loaded.base64}`,
+      base64: loaded.base64,
+      blob: null,
+      staged: null,
+      sizeBytes: loaded.sizeBytes,
+    };
+  }
+
+  if (mode === "blob" || mode === "file") {
+    const loaded = await loadSessionAssetContent(asset, { fetchRemote: args.fetchRemote ?? true });
+    return {
+      filename: loaded.filename,
+      mimeType: loaded.mimeType,
+      url: signedUrl ?? asset.url ?? null,
+      dataUrl: loaded.dataUrl ?? `data:${loaded.mimeType};base64,${loaded.base64}`,
+      base64: loaded.base64,
+      blob: createNamedUploadBlob(loaded.filename, loaded.mimeType, loaded.base64),
+      staged: null,
+      sizeBytes: loaded.sizeBytes,
+    };
+  }
+
+  if (mode === "s3key" || mode === "composioFile") {
+    if (!toolSlug || !toolkitSlug) {
+      throw new Error("Composio asset staging requires a target tool slug and toolkit slug");
+    }
+
+    const staged = await stageAssetToComposioStorageForTool({
+      asset,
+      toolSlug,
+      toolkitSlug,
+      fetchRemote: args.fetchRemote ?? true,
+    });
+
+    return {
+      filename: staged.filename,
+      mimeType: staged.mimeType,
+      url: signedUrl ?? asset.url ?? null,
+      dataUrl: null,
+      base64: null,
+      blob: null,
+      staged,
+      sizeBytes: staged.sizeBytes,
+    };
+  }
+
+  if (signedUrl || asset.url) {
+    return {
+      filename: asset.filename,
+      mimeType: asset.mimeType,
+      url: signedUrl ?? asset.url ?? null,
+      dataUrl: null,
+      base64: null,
+      blob: null,
+      staged: null,
+      sizeBytes: asset.sizeBytes ?? null,
+    };
+  }
+
+  const loaded = await loadSessionAssetContent(asset, { fetchRemote: args.fetchRemote ?? true });
+  return {
+    filename: loaded.filename,
+    mimeType: loaded.mimeType,
+    url: null,
+    dataUrl: loaded.dataUrl ?? `data:${loaded.mimeType};base64,${loaded.base64}`,
+    base64: loaded.base64,
+    blob: null,
+    staged: null,
+    sizeBytes: loaded.sizeBytes,
+  };
+}
+
+async function transformToolInputAssets(
+  value: unknown,
+  ctx: {
+    sessionAssets: SessionAsset[];
+    currentKey?: string;
+    toolSlug?: string;
+    toolkitSlug?: string;
+    fetchRemote?: boolean;
+  }
+): Promise<unknown> {
+  if (typeof value === "string") {
+    const assetId = maybeAssetIdFromString(value, ctx.sessionAssets);
+    if (assetId) {
+      const asset = ctx.sessionAssets.find((x) => x.id === assetId);
+      if (!asset) return value;
+
+      const mode = inferResolutionModeFromContext({
+        key: ctx.currentKey,
+        toolSlug: ctx.toolSlug,
+      });
+
+      const resolved = await resolveAssetForToolExecution({
+        asset,
+        mode,
+        toolSlug: ctx.toolSlug,
+        toolkitSlug: ctx.toolkitSlug,
+        fetchRemote: ctx.fetchRemote ?? true,
+      });
+
+      if (mode === "s3key") return resolved.staged?.s3key ?? value;
+      if (mode === "composioFile") return resolved.staged ? buildMinimalComposioStagedFilePayload(resolved.staged) : value;
+      if (mode === "base64") return resolved.base64 ?? value;
+      if (mode === "dataUrl") return resolved.dataUrl ?? value;
+      if (mode === "blob" || mode === "file") return resolved.blob ?? resolved.dataUrl ?? resolved.base64 ?? value;
+      if (mode === "url") return resolved.url ?? resolved.dataUrl ?? resolved.base64 ?? value;
+
+      return resolved.url ?? resolved.dataUrl ?? resolved.base64 ?? value;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    for (const item of value) {
+      out.push(await transformToolInputAssets(item, ctx));
+    }
+    return out;
+  }
+
+  if (value && typeof value === "object") {
+    const input = value as Record<string, any>;
+
+    const directS3KeyAsset = resolveDirectS3KeyAssetField(input, ctx.sessionAssets);
+    if (directS3KeyAsset) {
+      const asset = ctx.sessionAssets.find((x) => x.id === directS3KeyAsset.assetId);
+      if (!asset) return value;
+
+      const resolved = await resolveAssetForToolExecution({
+        asset,
+        mode: "s3key",
+        toolSlug: ctx.toolSlug,
+        toolkitSlug: ctx.toolkitSlug,
+        fetchRemote: ctx.fetchRemote ?? true,
+      });
+
+      if (!resolved.staged) return value;
+
+      const next: Record<string, any> = {
+        ...input,
+        [directS3KeyAsset.fieldName]: resolved.staged.s3key,
+      };
+
+      if (
+        next.name == null &&
+        next.filename == null &&
+        next.fileName == null &&
+        next.title == null
+      ) {
+        next.name = resolved.staged.filename;
+      }
+
+      if (
+        next.mimetype == null &&
+        next.mimeType == null &&
+        next.contentType == null &&
+        next.mediaType == null
+      ) {
+        next.mimetype = resolved.staged.mimeType;
+      }
+
+      const transformedEntries = await Promise.all(
+        Object.entries(next).map(async ([k, v]) => [
+          k,
+          await transformToolInputAssets(v, {
+            ...ctx,
+            currentKey: k,
+          }),
+        ])
+      );
+      return Object.fromEntries(transformedEntries);
+    }
+
+    const objectAssetId = resolveToolObjectAssetId(input);
+
+    if (objectAssetId) {
+      const asset = ctx.sessionAssets.find((x) => x.id === objectAssetId);
+      if (!asset) return value;
+
+      const explicitMode = String(input._assetMode ?? "").trim() as AssetResolutionMode;
+      const inferredMode = inferResolutionModeFromContext({
+        key: ctx.currentKey,
+        toolSlug: ctx.toolSlug,
+      });
+
+      const mode: AssetResolutionMode =
+        explicitMode === "url" ||
+        explicitMode === "dataUrl" ||
+        explicitMode === "base64" ||
+        explicitMode === "blob" ||
+        explicitMode === "file" ||
+        explicitMode === "s3key" ||
+        explicitMode === "composioFile" ||
+        explicitMode === "auto"
+          ? explicitMode
+          : inferredMode;
+
+      const resolved = await resolveAssetForToolExecution({
+        asset,
+        mode,
+        toolSlug: ctx.toolSlug,
+        toolkitSlug: ctx.toolkitSlug,
+        fetchRemote: ctx.fetchRemote ?? true,
+      });
+
+      const next: Record<string, any> = { ...input };
+      delete next.assetId;
+      delete next.sessionAssetId;
+      delete next.sourceAssetId;
+      delete next._assetMode;
+
+      if (mode === "s3key" || mode === "composioFile") {
+        if (resolved.staged) {
+          if (next.s3key == null && next.s3Key == null && next.s3_key == null) {
+            next.s3key = resolved.staged.s3key;
+          }
+
+          if (
+            next.name == null &&
+            next.filename == null &&
+            next.fileName == null &&
+            next.title == null
+          ) {
+            next.name = resolved.staged.filename;
+          }
+
+          if (
+            next.mimetype == null &&
+            next.mimeType == null &&
+            next.contentType == null &&
+            next.mediaType == null
+          ) {
+            next.mimetype = resolved.staged.mimeType;
+          }
+        }
+      } else {
+        if (next.filename == null && next.fileName == null && next.name == null) {
+          next.filename = resolved.filename;
+        }
+        if (next.mimeType == null && next.mediaType == null && next.contentType == null) {
+          next.mimeType = resolved.mimeType;
+        }
+      }
+
+      const wantsUrlFields =
+        "url" in next ||
+        "uri" in next ||
+        "href" in next ||
+        "link" in next ||
+        "downloadUrl" in next ||
+        "sourceUrl" in next ||
+        mode === "url" ||
+        mode === "auto";
+
+      if (wantsUrlFields && resolved.url) {
+        if (next.url == null) next.url = resolved.url;
+        if (next.uri == null) next.uri = resolved.url;
+      }
+
+      if (mode === "dataUrl" || ("dataUrl" in next && next.dataUrl == null)) {
+        if (resolved.dataUrl) next.dataUrl = resolved.dataUrl;
+      }
+
+      if (
+        mode === "base64" ||
+        ("base64" in next && next.base64 == null) ||
+        ("contentBase64" in next && next.contentBase64 == null)
+      ) {
+        if (resolved.base64) {
+          if (next.base64 == null) next.base64 = resolved.base64;
+          if (next.contentBase64 == null) next.contentBase64 = resolved.base64;
+        }
+      }
+
+      if (mode === "blob" || mode === "file") {
+        const uploadFieldCandidates = ["file", "blob", "attachment", "document", "media"];
+        const candidate = uploadFieldCandidates.find((field) => next[field] == null);
+        if (candidate && resolved.blob) {
+          next[candidate] = resolved.blob;
+        }
+      }
+
+      const transformedEntries = await Promise.all(
+        Object.entries(next).map(async ([k, v]) => [
+          k,
+          await transformToolInputAssets(v, {
+            ...ctx,
+            currentKey: k,
+          }),
+        ])
+      );
+      return Object.fromEntries(transformedEntries);
+    }
+
+    const transformedEntries = await Promise.all(
+      Object.entries(input).map(async ([k, v]) => [
+        k,
+        await transformToolInputAssets(v, {
+          ...ctx,
+          currentKey: k,
+        }),
+      ])
+    );
+    return Object.fromEntries(transformedEntries);
+  }
+
+  return value;
+}
+
+function wrapComposioToolsWithAssetResolution(
+  composioTools: ToolSet,
+  deps: {
+    sessionAssets: SessionAsset[];
+  }
+): ToolSet {
+  const wrapped: Record<string, any> = {};
+
+  for (const [toolName, toolDef] of Object.entries(composioTools as Record<string, any>)) {
+    if (!toolDef || typeof toolDef !== "object" || typeof toolDef.execute !== "function") {
+      wrapped[toolName] = toolDef;
+      continue;
+    }
+
+    const normalizedToolSlug = normalizeComposioToolSlug(toolName);
+    const toolkitSlug = inferComposioToolkitSlugFromToolSlug(normalizedToolSlug);
+
+    wrapped[toolName] = {
+      ...toolDef,
+      execute: async (input: any, ...rest: any[]) => {
+        const resolvedInput = await transformToolInputAssets(input, {
+          sessionAssets: deps.sessionAssets,
+          toolSlug: normalizedToolSlug,
+          toolkitSlug,
+          fetchRemote: true,
+        });
+        return await toolDef.execute(resolvedInput, ...rest);
+      },
+    };
+  }
+
+  return wrapped as ToolSet;
+}
+
+function isReasoningModel(modelName: string): boolean {
+  const name = String(modelName ?? "").trim().toLowerCase();
+  return /^gpt-5(?:[.-]|$)/.test(name) || /^o[134](?:[.-]|$)/.test(name) || name.includes("reasoning");
+}
+
+function shouldSendTemperature(modelName: string, temperature: number): boolean {
+  return Number.isFinite(temperature) && !isReasoningModel(modelName);
+}
+
+function stringifyError(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error ?? "");
+  }
+}
+
+function isPromptBudgetRetryableError(error: unknown): boolean {
+  const text = stringifyError(error).toLowerCase();
+  return (
+    text.includes("rate_limit_exceeded") ||
+    text.includes("context_length_exceeded") ||
+    text.includes("tokens per min") ||
+    (text.includes("requested") && text.includes("tokens"))
+  );
+}
+
+const TOOL_SELECTION_STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "the",
+  "to",
+  "for",
+  "with",
+  "from",
+  "into",
+  "on",
+  "in",
+  "at",
+  "of",
+  "my",
+  "me",
+  "this",
+  "that",
+  "it",
+  "is",
+  "are",
+  "be",
+  "please",
+  "can",
+  "could",
+  "would",
+  "should",
+  "you",
+  "i",
+  "we",
+  "they",
+  "them",
+  "their",
+  "our",
+  "your",
+  "want",
+  "need",
+  "using",
+  "use",
+  "make",
+  "do",
+  "does",
+  "did",
+  "help",
+]);
+
+function tokenizeForToolSelection(input: string): string[] {
+  const matches = String(input ?? "").toLowerCase().match(/[a-z0-9][a-z0-9._/-]{1,}/g) ?? [];
+  return [...new Set(matches.filter((token) => !TOOL_SELECTION_STOPWORDS.has(token)))].slice(0, 32);
+}
+
+function looksLikeExternalActionRequest(text: string): boolean {
+  return /\b(connect|authorize|login|send|email|mail|calendar|schedule|upload|download|create|update|delete|post|publish|tweet|message|slack|github|gitlab|drive|docs|sheets|notion|jira|linear|discord|whatsapp|telegram|sms|crm|hubspot|salesforce)\b/i.test(
+    String(text ?? "")
+  );
+}
+
+function scoreComposioToolForTurn(toolName: string, toolDef: any, userText: string): number {
+  const haystack = `${toolName} ${String(toolDef?.description ?? "")}`.toLowerCase();
+  const lowerUserText = String(userText ?? "").toLowerCase();
+  const tokens = tokenizeForToolSelection(lowerUserText);
+
+  let score = 0;
+
+  for (const token of tokens) {
+    if (haystack.includes(token)) {
+      score += token.length >= 5 ? 3 : 2;
+    }
+  }
+
+  if (
+    /\b(upload|attachment|file|document|image|audio|video)\b/.test(lowerUserText) &&
+    /\b(upload|file|document|attachment|image|audio|video)\b/.test(haystack)
+  ) {
+    score += 4;
+  }
+
+  if (/\b(email|gmail|mail)\b/.test(lowerUserText) && /\b(email|gmail|mail)\b/.test(haystack)) {
+    score += 6;
+  }
+
+  if (
+    /\b(calendar|meeting|schedule)\b/.test(lowerUserText) &&
+    /\b(calendar|meeting|schedule)\b/.test(haystack)
+  ) {
+    score += 6;
+  }
+
+  if (
+    /\b(github|gitlab|repo|pull request|pr|issue)\b/.test(lowerUserText) &&
+    /\b(github|gitlab|repo|pull request|issue)\b/.test(haystack)
+  ) {
+    score += 6;
+  }
+
+  if (
+    /\b(google drive|drive|docs|sheets|spreadsheet|document)\b/.test(lowerUserText) &&
+    /\b(google|drive|docs|sheets|spreadsheet|document)\b/.test(haystack)
+  ) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function selectComposioToolsForTurn(tools: ToolSet, userText: string): ToolSet {
+  const entries = Object.entries(tools as Record<string, any>);
+  const maxTools = Math.max(0, parseIntOr(env("COMPOSIO_MAX_TOOLS_PER_TURN"), 24));
+
+  if (!entries.length || maxTools <= 0) return {};
+  if (entries.length <= maxTools) return tools;
+
+  const ranked = entries
+    .map(([name, def], index) => ({
+      name,
+      def,
+      index,
+      score: scoreComposioToolForTurn(name, def, userText),
+    }))
+    .sort((a, b) => (b.score - a.score) || (a.index - b.index));
+
+  const positive = ranked.filter((item) => item.score > 0);
+  const picked = positive.length
+    ? positive.slice(0, maxTools)
+    : looksLikeExternalActionRequest(userText)
+      ? ranked.slice(0, maxTools)
+      : [];
+
+  return Object.fromEntries(picked.map((item) => [item.name, item.def])) as ToolSet;
+}
+
+function buildModelCallArgs(args: {
+  modelName: string;
+  system: string;
+  messages: ModelMessage[];
+  tools: ToolSet;
+  temperature: number;
+  maxToolSteps: number;
+}) {
+  const request: any = {
+    model: openai(args.modelName),
+    system: args.system,
+    messages: args.messages,
+    tools: args.tools,
+    stopWhen: stepCountIs(args.maxToolSteps),
+  };
+
+  if (shouldSendTemperature(args.modelName, args.temperature)) {
+    request.temperature = args.temperature;
+  }
+
+  return request;
+}
+
+// ============================================================
 // Composio allowlist handling ("*" means ALL)
 // ============================================================
 function filterComposioTools(tools: ToolSet): ToolSet {
@@ -923,7 +2818,7 @@ function resolveConfiguredAuthConfigId(toolkitSlug: string): string | undefined 
       const exact = parsed[toolkitSlug] ?? parsed[toolkitSlug.toLowerCase()] ?? parsed[slugKey];
       if (exact) return String(exact);
     } catch {
-      // ignore invalid JSON, fallback below
+      // ignore invalid JSON
     }
   }
 
@@ -958,7 +2853,6 @@ async function composioResolveToolkitAndAuthConfig(userId: string, toolkitInput:
       const slugNorm = slug.replace(/\s+/g, "");
       const nameNorm = name.replace(/\s+/g, "");
       const connected = Boolean(t?.connection?.connectedAccount?.id);
-
       const discoveredAuthConfigId =
         t?.connection?.authConfig?.id ?? t?.authConfig?.id ?? t?.defaultAuthConfig?.id ?? null;
 
@@ -1015,22 +2909,10 @@ async function composioConnectToolkitByName(userId: string, toolkitInput: string
   const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
 
   const authorizeOptionsVariants = [
-    {
-      callbackUrl,
-      authConfigId: resolved.authConfigId,
-    },
-    {
-      callbackUrl,
-      auth_config_id: resolved.authConfigId,
-    },
-    {
-      callback_url: callbackUrl,
-      authConfigId: resolved.authConfigId,
-    },
-    {
-      callback_url: callbackUrl,
-      auth_config_id: resolved.authConfigId,
-    },
+    { callbackUrl, authConfigId: resolved.authConfigId },
+    { callbackUrl, auth_config_id: resolved.authConfigId },
+    { callback_url: callbackUrl, authConfigId: resolved.authConfigId },
+    { callback_url: callbackUrl, auth_config_id: resolved.authConfigId },
     callbackUrl ? { callbackUrl } : {},
   ].filter(Boolean) as any[];
 
@@ -1094,7 +2976,7 @@ function createEditCoalescer(opts: { sessionId: string; messageId: number; throt
       lastSent = t;
       lastAt = Date.now();
     } catch {
-      // best-effort
+      // best effort
     }
   }
 
@@ -1137,29 +3019,39 @@ export async function agentTurn(args: {
 
   const autonomy = env("AUTONOMOUS_MODE") ?? "assistive";
 
-  const messages = normalizeHistory(args.history);
-  const userText = String(extractRecentUserText(messages) ?? "").trim();
-  const hasImages = historyHasImages(messages);
+  const normalizedHistory = normalizeHistory(args.history);
+  const sessionAssets = collectSessionAssets(normalizedHistory);
+  const userText = String(extractRecentUserText(normalizedHistory) ?? "").trim();
+  const hasRichMedia = historyHasRichMedia(normalizedHistory);
+
+  const primaryMessages = sanitizeMessagesForModel(normalizedHistory);
+  const retryMessages = sanitizeMessagesForModel(normalizedHistory, {
+    maxMessages: parseIntOr(env("AGENT_RETRY_MAX_HISTORY_MESSAGES"), 4),
+    maxTextChars: parseIntOr(env("AGENT_RETRY_MAX_TEXT_PART_CHARS"), 2000),
+    maxTotalChars: parseIntOr(env("AGENT_RETRY_MAX_TOTAL_CONTEXT_CHARS"), 12000),
+    maxAssistantMessages: parseIntOr(env("AGENT_RETRY_MAX_ASSISTANT_HISTORY_MESSAGES"), 1),
+  });
 
   const virtualRuntime = await createVirtualRuntime({
     sessionId: args.sessionId,
     userId: args.userId,
     channel: args.channel,
     userText,
-    history: messages,
+    history: primaryMessages,
+    sessionAssets,
   });
 
   const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o-mini";
   const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o";
-  const modelName = hasImages ? smartModel : fastModel;
+  const forceSmart = (env("AGENT_FORCE_SMART_MODEL") ?? "true") !== "false";
+  const modelName = forceSmart ? smartModel : hasRichMedia ? smartModel : fastModel;
 
   const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.2");
+  const maxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 11));
 
   const isTelegram = args.channel === "telegram";
   const telegramStreamingEnabled =
-    isTelegram &&
-    (args.showTyping ?? true) &&
-    (env("TELEGRAM_STREAMING") ?? "true") !== "false";
+    isTelegram && (args.showTyping ?? true) && (env("TELEGRAM_STREAMING") ?? "true") !== "false";
 
   const editThrottleMs = Math.max(250, Number(env("TELEGRAM_STREAM_EDIT_THROTTLE_MS") ?? 750));
   const typingIntervalMs = Math.max(1000, Number(env("TELEGRAM_TYPING_INTERVAL_MS") ?? 4000));
@@ -1169,7 +3061,7 @@ export async function agentTurn(args: {
   let placeholderMsgId: number | null = null;
 
   // ============================================================
-  // Tools
+  // Native tools
   // ============================================================
   const scheduleMessage = tool({
     description: "Schedule a message back to this user/session after delaySeconds.",
@@ -1205,13 +3097,13 @@ export async function agentTurn(args: {
         if (!explicit) return { ok: false, blocked: true, message: "Use /ssh <command> to run SSH." };
       }
       const output = await sshExec(input.command);
-      return { ok: true, output };
+      return { ok: true, output: truncateText(output, 5000) };
     },
   });
 
   const connectToolkit = tool({
     description:
-      "Generate a Composio connect/authorize link for a toolkit using the current user's namespace. Accepts user-friendly names like 'Typeform', 'Google Drive', or 'X'. Resolves toolkit slug and auth config before creating the auth link.",
+      "Generate a Composio connect/authorize link for a toolkit using the current user's namespace. Accepts user-friendly names like 'Typeform', 'Google Drive', or 'X'.",
     inputSchema: zodSchema(
       z.object({
         toolkit: z.string().min(1),
@@ -1259,8 +3151,7 @@ export async function agentTurn(args: {
   });
 
   const readSkill = tool({
-    description:
-      "Read a specific inline skill by name, such as routing, composio, ssh, scheduling, filesystem, or telegram.",
+    description: "Read a specific inline skill by name.",
     inputSchema: zodSchema(
       z.object({
         name: z.string().min(1),
@@ -1298,7 +3189,7 @@ export async function agentTurn(args: {
         return {
           ok: true,
           path: sanitizePath(input.path),
-          content: truncateText(content, 60_000),
+          content: truncateText(content, 30000),
         };
       } catch (error: any) {
         return {
@@ -1315,7 +3206,7 @@ export async function agentTurn(args: {
     inputSchema: zodSchema(
       z.object({
         path: z.string().min(1).max(4000),
-        content: z.string().max(200_000),
+        content: z.string().max(120_000),
       })
     ),
     execute: async (input: { path: string; content: string }) => {
@@ -1324,7 +3215,7 @@ export async function agentTurn(args: {
         return {
           ok: true,
           path: sanitizePath(input.path),
-          bytes: Buffer.byteLength(input.content, "utf8"),
+          bytes: utf8ByteLength(input.content),
         };
       } catch (error: any) {
         return {
@@ -1338,7 +3229,7 @@ export async function agentTurn(args: {
 
   const virtualShell = tool({
     description:
-      "Run shell-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep. This does not touch the host OS.",
+      "Run shell-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep.",
     inputSchema: zodSchema(
       z.object({
         command: z.string().min(1).max(120000),
@@ -1348,16 +3239,164 @@ export async function agentTurn(args: {
       const result = await execVirtualShell(virtualRuntime, input.command);
       return {
         ok: result.ok,
-        command: input.command,
-        stdout: truncateText(result.stdout, 20_000),
-        stderr: truncateText(result.stderr, 12_000),
+        command: truncateText(input.command, 500),
+        stdout: truncateText(result.stdout, 5000),
+        stderr: truncateText(result.stderr, 2000),
         exitCode: result.exitCode,
       };
     },
   });
 
+  const listSessionAssets = tool({
+    description:
+      "List images, audio, video, and files detected in the current conversation history, including canonical IDs for follow-up asset preparation.",
+    inputSchema: zodSchema(z.object({})),
+    execute: async () => {
+      return {
+        ok: true,
+        count: sessionAssets.length,
+        assets: sessionAssets.map((asset) => ({
+          ...describeSessionAsset(asset),
+          ref: `asset://${asset.id}`,
+        })),
+      };
+    },
+  });
+
+  const prepareSessionAsset = tool({
+    description:
+      "Prepare a session asset for external tool usage. By default returns metadata and upload hints only. Set includeInlineData=true only when the target tool truly needs inline content.",
+    inputSchema: zodSchema(
+      z.object({
+        assetId: z.string().min(1),
+        fetchRemote: z.boolean().optional(),
+        includeInlineData: z.boolean().optional(),
+        materializeToVfs: z.boolean().optional(),
+      })
+    ),
+    execute: async (input: {
+      assetId: string;
+      fetchRemote?: boolean;
+      includeInlineData?: boolean;
+      materializeToVfs?: boolean;
+    }) => {
+      const asset = sessionAssets.find((x) => x.id === input.assetId);
+      if (!asset) {
+        return {
+          ok: false,
+          error: `Unknown assetId "${input.assetId}"`,
+          availableAssetIds: sessionAssets.map((x) => x.id),
+        };
+      }
+
+      const includeInlineData = input.includeInlineData ?? false;
+      const fetchRemote = input.fetchRemote ?? true;
+
+      let loaded: LoadedSessionAsset | null = null;
+      let materialized:
+        | {
+            assetRoot: string;
+            metaPath: string;
+            base64Path: string | null;
+            textPath: string | null;
+            infoPath: string;
+          }
+        | null = null;
+
+      try {
+        if (includeInlineData || input.materializeToVfs) {
+          loaded = await loadSessionAssetContent(asset, { fetchRemote });
+        }
+
+        if (input.materializeToVfs) {
+          const result = await materializeSessionAssetToVfs(virtualRuntime, asset, {
+            fetchRemote,
+            includeBase64: includeInlineData,
+          });
+          materialized = {
+            assetRoot: result.assetRoot,
+            metaPath: result.metaPath,
+            base64Path: result.base64Path,
+            textPath: result.textPath,
+            infoPath: result.infoPath,
+          };
+          loaded = result.loaded;
+        }
+
+        return {
+          ok: true,
+          ref: `asset://${asset.id}`,
+          ...buildPreparedAssetPayload(asset, {
+            loaded,
+            materialized,
+            includeInlineData,
+            signedUrl: await buildSignedAssetUrl(asset),
+          }),
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          asset: describeSessionAsset(asset),
+          error: String(error?.message ?? error ?? "Unknown prepare_session_asset error"),
+        };
+      }
+    },
+  });
+
+  const materializeSessionAsset = tool({
+    description:
+      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/. Does not include base64 unless explicitly requested.",
+    inputSchema: zodSchema(
+      z.object({
+        assetId: z.string().min(1),
+        fetchRemote: z.boolean().optional(),
+        includeBase64: z.boolean().optional(),
+      })
+    ),
+    execute: async (input: { assetId: string; fetchRemote?: boolean; includeBase64?: boolean }) => {
+      const asset = sessionAssets.find((x) => x.id === input.assetId);
+      if (!asset) {
+        return {
+          ok: false,
+          error: `Unknown assetId "${input.assetId}"`,
+          availableAssetIds: sessionAssets.map((x) => x.id),
+        };
+      }
+
+      try {
+        const result = await materializeSessionAssetToVfs(virtualRuntime, asset, {
+          fetchRemote: input.fetchRemote ?? true,
+          includeBase64: input.includeBase64 ?? false,
+        });
+
+        return {
+          ok: true,
+          asset: describeSessionAsset(asset),
+          ref: `asset://${asset.id}`,
+          assetRoot: result.assetRoot,
+          metaPath: result.metaPath,
+          base64Path: result.base64Path,
+          textPath: result.textPath,
+          infoPath: result.infoPath,
+          loaded: {
+            filename: result.loaded.filename,
+            mimeType: result.loaded.mimeType,
+            sizeBytes: result.loaded.sizeBytes,
+            source: result.loaded.source,
+          },
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          asset: describeSessionAsset(asset),
+          error: String(error?.message ?? error ?? "Unknown materialize_session_asset error"),
+        };
+      }
+    },
+  });
+
   // ============================================================
-  // Fast-path /ssh (instant, no model)
+  // Fast-path /ssh
   // ============================================================
   const slash = parseSlashCommand(userText);
   if (slash?.cmd === "/ssh") {
@@ -1367,15 +3406,18 @@ export async function agentTurn(args: {
   }
 
   // ============================================================
-  // Load Composio tools
+  // Load Composio tools and wrap them with deterministic asset resolution
   // ============================================================
   let composioTools: ToolSet = {};
   if (env("COMPOSIO_API_KEY")) {
-    composioTools = await getComposioToolsForUser(args.userId).catch(() => ({} as ToolSet));
+    const rawTools = await getComposioToolsForUser(args.userId).catch(() => ({} as ToolSet));
+    const wrappedTools = wrapComposioToolsWithAssetResolution(rawTools, {
+      sessionAssets,
+    });
+    composioTools = selectComposioToolsForTurn(wrappedTools, userText);
   }
 
-  const tools: ToolSet = {
-    ...composioTools,
+  const nativeTools: ToolSet = {
     schedule_message: scheduleMessage,
     ssh_exec: sshTool,
     connect_toolkit: connectToolkit,
@@ -1386,7 +3428,17 @@ export async function agentTurn(args: {
     read_virtual_file: readVirtualFile,
     write_virtual_file: writeVirtualFile,
     virtual_shell: virtualShell,
+    list_session_assets: listSessionAssets,
+    prepare_session_asset: prepareSessionAsset,
+    materialize_session_asset: materializeSessionAsset,
   };
+
+  const tools: ToolSet = {
+    ...composioTools,
+    ...nativeTools,
+  };
+
+  const retryTools: ToolSet = nativeTools;
 
   // ============================================================
   // Telegram streaming helpers
@@ -1432,75 +3484,93 @@ export async function agentTurn(args: {
   // System prompt
   // ============================================================
   const system = [
-    "You are an Agentic Operating System similar to Open Claw and assistant running inside Telegram/WhatsApp/SMS connected to Composio tools via auth configs.",
+    "You are an Agentic Operating System assistant running in Telegram/WhatsApp/SMS with Composio tools.",
     "",
     "CRITICAL TOOL RULES:",
-    "- If the user asks you to do an external action (Typeform, Twitter/X, Discord, Slack, etc.), you MUST use the appropriate tool.",
+    "- If the user asks for an external action, use the appropriate tool.",
     "- Never claim an action succeeded unless a tool call returned success.",
-    "- If an action requires the user to connect a toolkit, call connect_toolkit and provide the link.",
-    "- If you're unsure what's connected, call list_connections.",
-    "- If you need to know which auth config and toolkit slug will be used, call resolve_toolkit_connection.",
+    "- If an action requires toolkit auth, call connect_toolkit and provide the link.",
+    "- If you're unsure what is connected, call list_connections.",
+    "- If you need to resolve toolkit/auth config, call resolve_toolkit_connection.",
     "",
     "COMPOSIO NAMESPACE:",
-    `- The active Composio namespace for this turn is the user's ID: ${args.userId}`,
-    "- All auth links and connected accounts should be treated as belonging to that namespace.",
+    `- Active namespace: ${args.userId}`,
     "",
-    "VIRTUAL FILESYSTEM:",
-    "- You have read_virtual_file and write_virtual_file for a Redis-backed virtual filesystem.",
-    "- You also have virtual_shell for shell-like operations against that virtual filesystem only.",
-    "- Prefer virtual filesystem tools for drafting, staging, payload prep, notes, reports, JSON, and scratch work.",
-    "- The virtual filesystem persists in Upstash Redis and is scoped to the current user + session.",
+    "FILESYSTEM:",
+    "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
+    "- Use virtual_shell for shell-like operations on the virtual filesystem only.",
+    "- Prefer /workspace for drafts, payloads, notes, JSON, and staging.",
+    "",
+    "MODALITIES:",
+    `- Session asset count available via tools: ${sessionAssets.length}`,
+    "- Use list_session_assets to inspect assets.",
+    "- Use prepare_session_asset first for metadata and upload hints.",
+    "- When calling external tools, pass asset references like asset://asset_m6_p2.",
+    "- The execution wrapper resolves asset references deterministically before the external tool runs, staging asset bytes into Composio storage when a tool expects an s3key-backed upload.",
+    "- Only request inline content when the target tool really needs it.",
     "",
     "SSH:",
-    "- You can run SSH via ssh_exec if needed.",
-    "- Prefer ssh_exec only for real host actions the user actually wants.",
+    "- Use ssh_exec only for real host actions the user wants.",
     "- If blocked, tell the user to use /ssh <command>.",
     "",
     "SKILLS:",
-    "- Agent skills are statically inlined in this file and also mounted into virtual files under /workspace/skills/*.md.",
-    "- You can use list_skills and read_skill when useful.",
+    "- Use list_skills or read_skill only when needed.",
     "",
     `Mode: ${autonomy}`,
-    "Be concise and correct. Avoid hallucinations.",
-    "",
-    "Inline skills reference:",
-    renderAllSkillsForPrompt(),
+    "Be concise, accurate, and tool-grounded.",
   ].join("\n");
 
-  // ============================================================
-  // Run generation
-  // ============================================================
+  async function runStreamingAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
+    const s = streamText(
+      buildModelCallArgs({
+        modelName,
+        system,
+        messages: attemptMessages,
+        tools: attemptTools,
+        temperature,
+        maxToolSteps,
+      })
+    );
+
+    const text = await streamToTelegram(s.textStream);
+    await deliverFinalTelegram(text);
+    return { text, responseMessages: [] as any[], delivered: true };
+  }
+
+  async function runGenerateAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
+    const r = await generateText(
+      buildModelCallArgs({
+        modelName,
+        system,
+        messages: attemptMessages,
+        tools: attemptTools,
+        temperature,
+        maxToolSteps,
+      })
+    );
+
+    return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
+  }
+
   try {
     if (telegramStreamingEnabled) {
       typingLoop = telegramStartChatActionLoop(args.sessionId, "typing", { intervalMs: typingIntervalMs });
-
       placeholderMsgId = await telegramSendMessage(args.sessionId, "…", { disableNotification: true });
 
-      const s = streamText({
-        model: openai(modelName),
-        system,
-        messages,
-        tools,
-        temperature,
-        stopWhen: stepCountIs(11),
-      });
-
-      const text = await streamToTelegram(s.textStream);
-      await deliverFinalTelegram(text);
-
-      return { text, responseMessages: [] as any[], delivered: true };
+      try {
+        return await runStreamingAttempt(primaryMessages, tools);
+      } catch (error) {
+        if (!isPromptBudgetRetryableError(error)) throw error;
+        return await runStreamingAttempt(retryMessages, retryTools);
+      }
     }
 
-    const r = await generateText({
-      model: openai(modelName),
-      system,
-      messages,
-      tools,
-      temperature,
-      stopWhen: stepCountIs(11),
-    });
-
-    return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
+    try {
+      return await runGenerateAttempt(primaryMessages, tools);
+    } catch (error) {
+      if (!isPromptBudgetRetryableError(error)) throw error;
+      return await runGenerateAttempt(retryMessages, retryTools);
+    }
   } finally {
     typingLoop?.stop();
   }
