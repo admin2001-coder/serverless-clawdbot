@@ -119,6 +119,20 @@ function truncateText(text: unknown, max: number): string {
   return s.length > max ? `${s.slice(0, max)}\n...[truncated ${s.length - max} chars]` : s;
 }
 
+function truncateForModelContext(text: unknown, max: number): string {
+  const s = typeof text === "string" ? text : String(text ?? "");
+  if (s.length <= max) return s;
+  if (max <= 80) return s.slice(-max);
+
+  const head = Math.max(20, Math.floor(max * 0.6));
+  const tail = Math.max(20, max - head - 32);
+  const omitted = s.length - head - tail;
+
+  if (omitted <= 0) return s.slice(0, max);
+
+  return `${s.slice(0, head)}\n...[omitted ${omitted} chars]...\n${s.slice(-tail)}`;
+}
+
 function utf8ToBytes(text: string): Uint8Array {
   return new TextEncoder().encode(String(text ?? ""));
 }
@@ -127,6 +141,37 @@ function toWebCryptoBufferSource(bytes: Uint8Array): ArrayBuffer {
   const out = new Uint8Array(bytes.byteLength);
   out.set(bytes);
   return out.buffer;
+}
+
+function createNamedUploadBlob(filename: string, mimeType: string, base64: string): Blob | File {
+  if (typeof Blob === "undefined") {
+    throw new Error("Blob is not available in this runtime");
+  }
+
+  const safeName = safeFilenameSegment(filename || "asset.bin");
+  const safeMime = String(mimeType || "application/octet-stream").trim() || "application/octet-stream";
+  const bytes = base64ToBytes(base64);
+  const blob = new Blob([toWebCryptoBufferSource(bytes)], { type: safeMime });
+
+  if (typeof File !== "undefined") {
+    try {
+      return new File([blob], safeName, { type: safeMime });
+    } catch {
+      // fall through to a named Blob
+    }
+  }
+
+  try {
+    Object.defineProperty(blob, "name", {
+      value: safeName,
+      enumerable: true,
+      configurable: true,
+    });
+  } catch {
+    // best effort only
+  }
+
+  return blob;
 }
 
 function bytesToUtf8(bytes: Uint8Array): string {
@@ -631,60 +676,113 @@ function mediaPartToTextPlaceholder(part: any): { type: "text"; text: string } {
   };
 }
 
-function sanitizeMessagesForModel(history: ModelMessage[]): ModelMessage[] {
-  const maxMessages = Math.max(4, parseIntOr(env("AGENT_MAX_HISTORY_MESSAGES"), 12));
-  const maxTextChars = Math.max(1000, parseIntOr(env("AGENT_MAX_TEXT_PART_CHARS"), 12000));
+type SanitizeHistoryOptions = {
+  maxMessages?: number;
+  maxTextChars?: number;
+  maxTotalChars?: number;
+  maxAssistantMessages?: number;
+};
+
+function approximateModelMessageChars(message: ModelMessage): number {
+  const content: any = (message as any).content;
+
+  if (typeof content === "string") return content.length;
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part?.text === "string") return part.text.length;
+        return JSON.stringify(part ?? "").length;
+      })
+      .reduce((sum, n) => sum + n, 0);
+  }
+
+  return 0;
+}
+
+function sanitizeMessagesForModel(history: ModelMessage[], opts?: SanitizeHistoryOptions): ModelMessage[] {
+  const maxMessages = Math.max(2, opts?.maxMessages ?? parseIntOr(env("AGENT_MAX_HISTORY_MESSAGES"), 8));
+  const maxTextChars = Math.max(500, opts?.maxTextChars ?? parseIntOr(env("AGENT_MAX_TEXT_PART_CHARS"), 4000));
+  const maxTotalChars = Math.max(
+    maxTextChars,
+    opts?.maxTotalChars ?? parseIntOr(env("AGENT_MAX_TOTAL_CONTEXT_CHARS"), 24000)
+  );
+  const maxAssistantMessages = Math.max(
+    0,
+    opts?.maxAssistantMessages ?? parseIntOr(env("AGENT_MAX_ASSISTANT_HISTORY_MESSAGES"), 3)
+  );
+
   const trimmed = history.slice(-maxMessages);
+  const selected: ModelMessage[] = [];
+  let totalChars = 0;
+  let assistantCount = 0;
 
-  const out: ModelMessage[] = [];
-
-  for (const msg of trimmed) {
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    const msg = trimmed[i];
     const role = String((msg as any).role ?? "");
 
     if (role === "tool") continue;
+    if (role === "assistant" && assistantCount >= maxAssistantMessages) continue;
 
     const content: any = (msg as any).content;
+    let candidate: ModelMessage | null = null;
 
     if (typeof content === "string") {
       if (role === "system" || role === "user" || role === "assistant") {
-        out.push({ ...msg, content: clampNonEmptyText(truncateText(content, maxTextChars)) } as any);
+        candidate = {
+          ...msg,
+          content: clampNonEmptyText(truncateForModelContext(content, maxTextChars)),
+        } as any;
       }
-      continue;
-    }
+    } else if (Array.isArray(content)) {
+      const safeParts: any[] = [];
+      for (const part of content) {
+        const type = String(part?.type ?? "");
 
-    if (!Array.isArray(content)) continue;
+        if (type === "text") {
+          safeParts.push({
+            type: "text",
+            text: clampNonEmptyText(truncateForModelContext(String(part?.text ?? ""), maxTextChars)),
+          });
+          continue;
+        }
 
-    const safeParts: any[] = [];
-    for (const part of content) {
-      const type = String(part?.type ?? "");
-
-      if (type === "text") {
-        safeParts.push({
-          type: "text",
-          text: clampNonEmptyText(truncateText(String(part?.text ?? ""), maxTextChars)),
-        });
-        continue;
+        if (type === "image" || type === "audio" || type === "video" || type === "file") {
+          safeParts.push(mediaPartToTextPlaceholder(part));
+          continue;
+        }
       }
 
-      if (type === "image" || type === "audio" || type === "video" || type === "file") {
-        safeParts.push(mediaPartToTextPlaceholder(part));
-        continue;
+      if (!safeParts.length) {
+        safeParts.push({ type: "text", text: "…" });
+      }
+
+      if (role === "user" || role === "assistant") {
+        candidate = { ...msg, content: safeParts } as any;
+      } else if (role === "system") {
+        candidate = {
+          role: "system",
+          content: clampNonEmptyText(
+            truncateForModelContext(
+              safeParts.map((part) => part.text).join("\n"),
+              maxTextChars
+            )
+          ),
+        } as any;
       }
     }
 
-    if (!safeParts.length) {
-      safeParts.push({ type: "text", text: "…" });
-    }
+    if (!candidate) continue;
 
-    if (role === "user" || role === "assistant") {
-      out.push({ ...msg, content: safeParts } as any);
-    } else if (role === "system") {
-      const systemText = safeParts.map((p) => p.text).join("\n");
-      out.push({ role: "system", content: clampNonEmptyText(systemText) } as any);
-    }
+    const candidateChars = approximateModelMessageChars(candidate);
+    if (selected.length > 0 && totalChars + candidateChars > maxTotalChars) continue;
+
+    if (role === "assistant") assistantCount += 1;
+    totalChars += candidateChars;
+    selected.push(candidate);
   }
 
-  return out;
+  return selected.reverse();
 }
 
 function splitForTelegram(text: string, maxChars: number): string[] {
@@ -1588,7 +1686,7 @@ function buildPreparedAssetPayload(
 // ============================================================
 // Deterministic asset URL + tool input resolution
 // ============================================================
-type AssetResolutionMode = "url" | "dataUrl" | "base64" | "auto";
+type AssetResolutionMode = "url" | "dataUrl" | "base64" | "blob" | "file" | "auto";
 
 function isAssetRefString(value: string): boolean {
   return /^asset:\/\/[A-Za-z0-9._:-]+$/.test(String(value ?? "").trim());
@@ -1613,12 +1711,32 @@ function maybeAssetIdFromString(value: string, sessionAssets: SessionAsset[]): s
   return null;
 }
 
+function isBlobLikeResolutionKey(key: string | null | undefined): boolean {
+  const raw = String(key ?? "").trim().toLowerCase();
+  if (!raw) return false;
+
+  if (
+    /(^|_)(filename|filepath|file_path|fileid|file_id|mime|mimetype|mime_type|filetype|file_type)$/.test(raw)
+  ) {
+    return false;
+  }
+
+  const compact = raw.replace(/[^a-z0-9]+/g, "_");
+  return (
+    /(^|_)(file|files|blob|blobs|attachment|attachments|document|documents|media|upload|uploads|image|images|audio|audios|video|videos)$/.test(
+      compact
+    ) ||
+    /(^|_)(inputfile|inputfiles|uploadfile|uploadfiles|fileupload|fileuploads)$/.test(compact)
+  );
+}
+
 function inferResolutionModeFromKey(key: string | null | undefined): AssetResolutionMode {
   const k = String(key ?? "").toLowerCase();
   if (!k) return "auto";
   if (/(^|_)(url|uri|href|link|downloadurl|sourceurl|fileurl)$/.test(k)) return "url";
   if (/(^|_)(dataurl)$/.test(k)) return "dataUrl";
   if (/(^|_)(base64|contentbase64)$/.test(k)) return "base64";
+  if (isBlobLikeResolutionKey(k)) return "blob";
   return "auto";
 }
 
@@ -1641,6 +1759,7 @@ async function resolveAssetForToolExecution(args: {
   url: string | null;
   dataUrl: string | null;
   base64: string | null;
+  blob: Blob | File | null;
   sizeBytes: number | null;
 }> {
   const mode = args.mode;
@@ -1655,6 +1774,7 @@ async function resolveAssetForToolExecution(args: {
         url: signedUrl ?? asset.url ?? null,
         dataUrl: null,
         base64: null,
+        blob: null,
         sizeBytes: asset.sizeBytes ?? null,
       };
     }
@@ -1666,6 +1786,7 @@ async function resolveAssetForToolExecution(args: {
       url: null,
       dataUrl: loaded.dataUrl ?? `data:${loaded.mimeType};base64,${loaded.base64}`,
       base64: loaded.base64,
+      blob: null,
       sizeBytes: loaded.sizeBytes,
     };
   }
@@ -1678,6 +1799,7 @@ async function resolveAssetForToolExecution(args: {
       url: signedUrl ?? asset.url ?? null,
       dataUrl: loaded.dataUrl ?? null,
       base64: loaded.base64,
+      blob: null,
       sizeBytes: loaded.sizeBytes,
     };
   }
@@ -1690,6 +1812,20 @@ async function resolveAssetForToolExecution(args: {
       url: signedUrl ?? asset.url ?? null,
       dataUrl: loaded.dataUrl ?? `data:${loaded.mimeType};base64,${loaded.base64}`,
       base64: loaded.base64,
+      blob: null,
+      sizeBytes: loaded.sizeBytes,
+    };
+  }
+
+  if (mode === "blob" || mode === "file") {
+    const loaded = await loadSessionAssetContent(asset, { fetchRemote: args.fetchRemote ?? true });
+    return {
+      filename: loaded.filename,
+      mimeType: loaded.mimeType,
+      url: signedUrl ?? asset.url ?? null,
+      dataUrl: loaded.dataUrl ?? `data:${loaded.mimeType};base64,${loaded.base64}`,
+      base64: loaded.base64,
+      blob: createNamedUploadBlob(loaded.filename, loaded.mimeType, loaded.base64),
       sizeBytes: loaded.sizeBytes,
     };
   }
@@ -1701,6 +1837,7 @@ async function resolveAssetForToolExecution(args: {
       url: signedUrl ?? asset.url ?? null,
       dataUrl: null,
       base64: null,
+      blob: null,
       sizeBytes: asset.sizeBytes ?? null,
     };
   }
@@ -1712,8 +1849,80 @@ async function resolveAssetForToolExecution(args: {
     url: signedUrl ?? asset.url ?? null,
     dataUrl: loaded.dataUrl ?? `data:${loaded.mimeType};base64,${loaded.base64}`,
     base64: loaded.base64,
+    blob: null,
     sizeBytes: loaded.sizeBytes,
   };
+}
+
+function objectWantsBinaryPayload(input: Record<string, any>, mode: AssetResolutionMode, currentKey?: string): boolean {
+  if (mode === "blob" || mode === "file") return true;
+  if (isBlobLikeResolutionKey(currentKey)) return true;
+
+  return [
+    "file",
+    "files",
+    "blob",
+    "blobs",
+    "attachment",
+    "attachments",
+    "document",
+    "documents",
+    "media",
+    "upload",
+    "uploads",
+    "image",
+    "images",
+    "audio",
+    "audios",
+    "video",
+    "videos",
+  ].some((key) => key in input);
+}
+
+function assignResolvedBinaryFields(
+  input: Record<string, any>,
+  binary: Blob | File,
+  mode: AssetResolutionMode,
+  currentKey?: string
+): Record<string, any> {
+  const next = { ...input };
+
+  const setIfEmpty = (key: string, value: unknown) => {
+    if (key in next && next[key] == null) {
+      next[key] = value;
+    }
+  };
+
+  setIfEmpty("file", binary);
+  setIfEmpty("blob", binary);
+  setIfEmpty("attachment", binary);
+  setIfEmpty("document", binary);
+  setIfEmpty("media", binary);
+  setIfEmpty("upload", binary);
+  setIfEmpty("image", binary);
+  setIfEmpty("audio", binary);
+  setIfEmpty("video", binary);
+
+  if ("files" in next && next.files == null) next.files = [binary];
+  if ("blobs" in next && next.blobs == null) next.blobs = [binary];
+  if ("attachments" in next && next.attachments == null) next.attachments = [binary];
+  if ("documents" in next && next.documents == null) next.documents = [binary];
+  if ("uploads" in next && next.uploads == null) next.uploads = [binary];
+  if ("images" in next && next.images == null) next.images = [binary];
+  if ("audios" in next && next.audios == null) next.audios = [binary];
+  if ("videos" in next && next.videos == null) next.videos = [binary];
+
+  const shouldDefaultToFile =
+    mode === "blob" ||
+    mode === "file" ||
+    isBlobLikeResolutionKey(currentKey) ||
+    !objectWantsBinaryPayload(input, "auto");
+
+  if (shouldDefaultToFile && !("file" in next) && !("files" in next)) {
+    next.file = binary;
+  }
+
+  return next;
 }
 
 async function transformToolInputAssets(
@@ -1739,6 +1948,7 @@ async function transformToolInputAssets(
 
       if (mode === "base64") return resolved.base64 ?? value;
       if (mode === "dataUrl") return resolved.dataUrl ?? value;
+      if (mode === "blob" || mode === "file") return resolved.blob ?? resolved.dataUrl ?? resolved.base64 ?? value;
       if (mode === "url") return resolved.url ?? resolved.dataUrl ?? resolved.base64 ?? value;
 
       return resolved.url ?? resolved.dataUrl ?? resolved.base64 ?? value;
@@ -1762,10 +1972,16 @@ async function transformToolInputAssets(
       if (!asset) return value;
 
       const explicitMode = String(input._assetMode ?? "").trim() as AssetResolutionMode;
+      const inferredMode = inferResolutionModeFromKey(ctx.currentKey);
       const mode: AssetResolutionMode =
-        explicitMode === "url" || explicitMode === "dataUrl" || explicitMode === "base64" || explicitMode === "auto"
+        explicitMode === "url" ||
+        explicitMode === "dataUrl" ||
+        explicitMode === "base64" ||
+        explicitMode === "blob" ||
+        explicitMode === "file" ||
+        explicitMode === "auto"
           ? explicitMode
-          : "auto";
+          : inferredMode;
 
       const resolved = await resolveAssetForToolExecution({
         asset,
@@ -1816,6 +2032,10 @@ async function transformToolInputAssets(
         }
       }
 
+      if (resolved.blob && objectWantsBinaryPayload(next, mode, ctx.currentKey)) {
+        Object.assign(next, assignResolvedBinaryFields(next, resolved.blob, mode, ctx.currentKey));
+      }
+
       const transformedEntries = await Promise.all(
         Object.entries(next).map(async ([k, v]) => [k, await transformToolInputAssets(v, { ...ctx, currentKey: k })])
       );
@@ -1858,6 +2078,190 @@ function wrapComposioToolsWithAssetResolution(
   }
 
   return wrapped as ToolSet;
+}
+
+function isReasoningModel(modelName: string): boolean {
+  const name = String(modelName ?? "").trim().toLowerCase();
+  return /^gpt-5(?:[.-]|$)/.test(name) || /^o[134](?:[.-]|$)/.test(name) || name.includes("reasoning");
+}
+
+function shouldSendTemperature(modelName: string, temperature: number): boolean {
+  return Number.isFinite(temperature) && !isReasoningModel(modelName);
+}
+
+function stringifyError(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error ?? "");
+  }
+}
+
+function isPromptBudgetRetryableError(error: unknown): boolean {
+  const text = stringifyError(error).toLowerCase();
+  return (
+    text.includes("rate_limit_exceeded") ||
+    text.includes("context_length_exceeded") ||
+    text.includes("tokens per min") ||
+    (text.includes("requested") && text.includes("tokens"))
+  );
+}
+
+const TOOL_SELECTION_STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "the",
+  "to",
+  "for",
+  "with",
+  "from",
+  "into",
+  "on",
+  "in",
+  "at",
+  "of",
+  "my",
+  "me",
+  "this",
+  "that",
+  "it",
+  "is",
+  "are",
+  "be",
+  "please",
+  "can",
+  "could",
+  "would",
+  "should",
+  "you",
+  "i",
+  "we",
+  "they",
+  "them",
+  "their",
+  "our",
+  "your",
+  "want",
+  "need",
+  "using",
+  "use",
+  "make",
+  "do",
+  "does",
+  "did",
+  "help",
+]);
+
+function tokenizeForToolSelection(input: string): string[] {
+  const matches = String(input ?? "").toLowerCase().match(/[a-z0-9][a-z0-9._/-]{1,}/g) ?? [];
+  return [...new Set(matches.filter((token) => !TOOL_SELECTION_STOPWORDS.has(token)))].slice(0, 32);
+}
+
+function looksLikeExternalActionRequest(text: string): boolean {
+  return /\b(connect|authorize|login|send|email|mail|calendar|schedule|upload|download|create|update|delete|post|publish|tweet|message|slack|github|gitlab|drive|docs|sheets|notion|jira|linear|discord|whatsapp|telegram|sms|crm|hubspot|salesforce)\b/i.test(
+    String(text ?? "")
+  );
+}
+
+function scoreComposioToolForTurn(toolName: string, toolDef: any, userText: string): number {
+  const haystack = `${toolName} ${String(toolDef?.description ?? "")}`.toLowerCase();
+  const lowerUserText = String(userText ?? "").toLowerCase();
+  const tokens = tokenizeForToolSelection(lowerUserText);
+
+  let score = 0;
+
+  for (const token of tokens) {
+    if (haystack.includes(token)) {
+      score += token.length >= 5 ? 3 : 2;
+    }
+  }
+
+  if (
+    /\b(upload|attachment|file|document|image|audio|video)\b/.test(lowerUserText) &&
+    /\b(upload|file|document|attachment|image|audio|video)\b/.test(haystack)
+  ) {
+    score += 4;
+  }
+
+  if (/\b(email|gmail|mail)\b/.test(lowerUserText) && /\b(email|gmail|mail)\b/.test(haystack)) {
+    score += 6;
+  }
+
+  if (
+    /\b(calendar|meeting|schedule)\b/.test(lowerUserText) &&
+    /\b(calendar|meeting|schedule)\b/.test(haystack)
+  ) {
+    score += 6;
+  }
+
+  if (
+    /\b(github|gitlab|repo|pull request|pr|issue)\b/.test(lowerUserText) &&
+    /\b(github|gitlab|repo|pull request|issue)\b/.test(haystack)
+  ) {
+    score += 6;
+  }
+
+  if (
+    /\b(google drive|drive|docs|sheets|spreadsheet|document)\b/.test(lowerUserText) &&
+    /\b(google|drive|docs|sheets|spreadsheet|document)\b/.test(haystack)
+  ) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function selectComposioToolsForTurn(tools: ToolSet, userText: string): ToolSet {
+  const entries = Object.entries(tools as Record<string, any>);
+  const maxTools = Math.max(0, parseIntOr(env("COMPOSIO_MAX_TOOLS_PER_TURN"), 24));
+
+  if (!entries.length || maxTools <= 0) return {};
+  if (entries.length <= maxTools) return tools;
+
+  const ranked = entries
+    .map(([name, def], index) => ({
+      name,
+      def,
+      index,
+      score: scoreComposioToolForTurn(name, def, userText),
+    }))
+    .sort((a, b) => (b.score - a.score) || (a.index - b.index));
+
+  const positive = ranked.filter((item) => item.score > 0);
+  const picked = positive.length
+    ? positive.slice(0, maxTools)
+    : looksLikeExternalActionRequest(userText)
+      ? ranked.slice(0, maxTools)
+      : [];
+
+  return Object.fromEntries(picked.map((item) => [item.name, item.def])) as ToolSet;
+}
+
+function buildModelCallArgs(args: {
+  modelName: string;
+  system: string;
+  messages: ModelMessage[];
+  tools: ToolSet;
+  temperature: number;
+  maxToolSteps: number;
+}) {
+  const request: any = {
+    model: openai(args.modelName),
+    system: args.system,
+    messages: args.messages,
+    tools: args.tools,
+    stopWhen: stepCountIs(args.maxToolSteps),
+  };
+
+  if (shouldSendTemperature(args.modelName, args.temperature)) {
+    request.temperature = args.temperature;
+  }
+
+  return request;
 }
 
 // ============================================================
@@ -2146,14 +2550,20 @@ export async function agentTurn(args: {
   const userText = String(extractRecentUserText(normalizedHistory) ?? "").trim();
   const hasRichMedia = historyHasRichMedia(normalizedHistory);
 
-  const messages = sanitizeMessagesForModel(normalizedHistory);
+  const primaryMessages = sanitizeMessagesForModel(normalizedHistory);
+  const retryMessages = sanitizeMessagesForModel(normalizedHistory, {
+    maxMessages: parseIntOr(env("AGENT_RETRY_MAX_HISTORY_MESSAGES"), 4),
+    maxTextChars: parseIntOr(env("AGENT_RETRY_MAX_TEXT_PART_CHARS"), 2000),
+    maxTotalChars: parseIntOr(env("AGENT_RETRY_MAX_TOTAL_CONTEXT_CHARS"), 12000),
+    maxAssistantMessages: parseIntOr(env("AGENT_RETRY_MAX_ASSISTANT_HISTORY_MESSAGES"), 1),
+  });
 
   const virtualRuntime = await createVirtualRuntime({
     sessionId: args.sessionId,
     userId: args.userId,
     channel: args.channel,
     userText,
-    history: messages,
+    history: primaryMessages,
     sessionAssets,
   });
 
@@ -2163,6 +2573,7 @@ export async function agentTurn(args: {
   const modelName = forceSmart ? smartModel : hasRichMedia ? smartModel : fastModel;
 
   const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.2");
+  const maxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 11));
 
   const isTelegram = args.channel === "telegram";
   const telegramStreamingEnabled =
@@ -2526,13 +2937,13 @@ export async function agentTurn(args: {
   let composioTools: ToolSet = {};
   if (env("COMPOSIO_API_KEY")) {
     const rawTools = await getComposioToolsForUser(args.userId).catch(() => ({} as ToolSet));
-    composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
+    const wrappedTools = wrapComposioToolsWithAssetResolution(rawTools, {
       sessionAssets,
     });
+    composioTools = selectComposioToolsForTurn(wrappedTools, userText);
   }
 
-  const tools: ToolSet = {
-    ...composioTools,
+  const nativeTools: ToolSet = {
     schedule_message: scheduleMessage,
     ssh_exec: sshTool,
     connect_toolkit: connectToolkit,
@@ -2547,6 +2958,13 @@ export async function agentTurn(args: {
     prepare_session_asset: prepareSessionAsset,
     materialize_session_asset: materializeSessionAsset,
   };
+
+  const tools: ToolSet = {
+    ...composioTools,
+    ...nativeTools,
+  };
+
+  const retryTools: ToolSet = nativeTools;
 
   // ============================================================
   // Telegram streaming helpers
@@ -2614,7 +3032,7 @@ export async function agentTurn(args: {
     "- Use list_session_assets to inspect assets.",
     "- Use prepare_session_asset first for metadata and upload hints.",
     "- When calling external tools, pass asset references like asset://asset_m6_p2.",
-    "- The execution wrapper resolves asset references deterministically before the external tool runs.",
+    "- The execution wrapper resolves asset references deterministically before the external tool runs, including Blob/File materialization for upload-style fields.",
     "- Only request inline content when the target tool really needs it.",
     "",
     "SSH:",
@@ -2628,36 +3046,57 @@ export async function agentTurn(args: {
     "Be concise, accurate, and tool-grounded.",
   ].join("\n");
 
+  async function runStreamingAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
+    const s = streamText(
+      buildModelCallArgs({
+        modelName,
+        system,
+        messages: attemptMessages,
+        tools: attemptTools,
+        temperature,
+        maxToolSteps,
+      })
+    );
+
+    const text = await streamToTelegram(s.textStream);
+    await deliverFinalTelegram(text);
+    return { text, responseMessages: [] as any[], delivered: true };
+  }
+
+  async function runGenerateAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
+    const r = await generateText(
+      buildModelCallArgs({
+        modelName,
+        system,
+        messages: attemptMessages,
+        tools: attemptTools,
+        temperature,
+        maxToolSteps,
+      })
+    );
+
+    return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
+  }
+
   try {
     if (telegramStreamingEnabled) {
       typingLoop = telegramStartChatActionLoop(args.sessionId, "typing", { intervalMs: typingIntervalMs });
       placeholderMsgId = await telegramSendMessage(args.sessionId, "…", { disableNotification: true });
 
-      const s = streamText({
-        model: openai(modelName),
-        system,
-        messages,
-        tools,
-        temperature,
-        stopWhen: stepCountIs(11),
-      });
-
-      const text = await streamToTelegram(s.textStream);
-      await deliverFinalTelegram(text);
-
-      return { text, responseMessages: [] as any[], delivered: true };
+      try {
+        return await runStreamingAttempt(primaryMessages, tools);
+      } catch (error) {
+        if (!isPromptBudgetRetryableError(error)) throw error;
+        return await runStreamingAttempt(retryMessages, retryTools);
+      }
     }
 
-    const r = await generateText({
-      model: openai(modelName),
-      system,
-      messages,
-      tools,
-      temperature,
-      stopWhen: stepCountIs(11),
-    });
-
-    return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
+    try {
+      return await runGenerateAttempt(primaryMessages, tools);
+    } catch (error) {
+      if (!isPromptBudgetRetryableError(error)) throw error;
+      return await runGenerateAttempt(retryMessages, retryTools);
+    }
   } finally {
     typingLoop?.stop();
   }
