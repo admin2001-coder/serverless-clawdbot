@@ -12,7 +12,6 @@ import {
 import { openai } from "@ai-sdk/openai";
 import { Composio } from "@composio/core";
 import { VercelProvider } from "@composio/vercel";
-import { createHmac } from "node:crypto";
 import { z } from "zod/v4";
 
 import { env, csvEnv } from "@/app/lib/env";
@@ -118,6 +117,84 @@ function clampNonEmptyText(text: string): string {
 function truncateText(text: unknown, max: number): string {
   const s = typeof text === "string" ? text : String(text ?? "");
   return s.length > max ? `${s.slice(0, max)}\n...[truncated ${s.length - max} chars]` : s;
+}
+
+function utf8ToBytes(text: string): Uint8Array {
+  return new TextEncoder().encode(String(text ?? ""));
+}
+
+function bytesToUtf8(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes);
+}
+
+function utf8ByteLength(text: string): number {
+  return utf8ToBytes(text).byteLength;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("base64");
+  }
+
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    let chunkBinary = "";
+    for (let j = 0; j < chunk.length; j++) {
+      chunkBinary += String.fromCharCode(chunk[j]);
+    }
+    binary += chunkBinary;
+  }
+
+  return btoa(binary);
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+  const clean = String(base64 ?? "").replace(/\s+/g, "");
+
+  if (typeof Buffer !== "undefined") {
+    return new Uint8Array(Buffer.from(clean, "base64"));
+  }
+
+  const binary = atob(clean);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function utf8ToBase64(text: string): string {
+  return bytesToBase64(utf8ToBytes(text));
+}
+
+function base64ToUtf8(base64: string): string {
+  return bytesToUtf8(base64ToBytes(base64));
+}
+
+function hexFromBytes(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new Error("Web Crypto subtle API is not available in this runtime");
+  }
+
+  const key = await subtle.importKey(
+    "raw",
+    utf8ToBytes(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const sig = await subtle.sign("HMAC", key, utf8ToBytes(message));
+  return hexFromBytes(new Uint8Array(sig));
 }
 
 function normalizeHistory(history: ModelMessage[]): ModelMessage[] {
@@ -325,7 +402,7 @@ function estimateBase64Bytes(base64: string): number | null {
 
 function tryUtf8FromBase64(base64: string): string | null {
   try {
-    return Buffer.from(base64, "base64").toString("utf8");
+    return base64ToUtf8(base64);
   } catch {
     return null;
   }
@@ -437,22 +514,24 @@ function coerceAssetSource(payload: unknown): {
       const base64 = stripDataUrlPrefix(payload);
       return { source: "data_url", dataUrl: payload, base64, sizeBytes: estimateBase64Bytes(base64) };
     }
-    return { source: "text", text: payload, sizeBytes: Buffer.byteLength(payload, "utf8") };
+    return { source: "text", text: payload, sizeBytes: utf8ByteLength(payload) };
   }
 
   if (payload instanceof Uint8Array) {
-    const base64 = Buffer.from(payload).toString("base64");
+    const base64 = bytesToBase64(payload);
     return { source: "base64", base64, sizeBytes: payload.byteLength };
   }
 
   if (Array.isArray(payload) && payload.every((x) => typeof x === "number")) {
-    const base64 = Buffer.from(payload).toString("base64");
+    const bytes = new Uint8Array(payload);
+    const base64 = bytesToBase64(bytes);
     return { source: "base64", base64, sizeBytes: payload.length };
   }
 
   if (typeof Buffer !== "undefined" && Buffer.isBuffer(payload)) {
-    const base64 = payload.toString("base64");
-    return { source: "base64", base64, sizeBytes: payload.length };
+    const bytes = new Uint8Array(payload);
+    const base64 = bytesToBase64(bytes);
+    return { source: "base64", base64, sizeBytes: bytes.byteLength };
   }
 
   if (typeof payload === "object") {
@@ -556,8 +635,6 @@ function sanitizeMessagesForModel(history: ModelMessage[]): ModelMessage[] {
   for (const msg of trimmed) {
     const role = String((msg as any).role ?? "");
 
-    // Tool role messages are the most likely to violate schema if reused naively.
-    // Drop them from the prompt transcript.
     if (role === "tool") continue;
 
     const content: any = (msg as any).content;
@@ -1287,12 +1364,12 @@ async function loadSessionAssetContent(
   }
 
   if (asset.text != null) {
-    const base64 = Buffer.from(asset.text, "utf8").toString("base64");
+    const base64 = utf8ToBase64(asset.text);
     return {
       base64,
       mimeType: asset.mimeType || "text/plain",
       filename: asset.filename,
-      sizeBytes: Buffer.byteLength(asset.text, "utf8"),
+      sizeBytes: utf8ByteLength(asset.text),
       source: asset.source,
       textPreview: asset.text,
       dataUrl: `data:${asset.mimeType || "text/plain"};base64,${base64}`,
@@ -1310,10 +1387,10 @@ async function loadSessionAssetContent(
       throw new Error(`Remote asset too large (${arr.byteLength} bytes > ${maxBytes} bytes)`);
     }
 
-    const base64 = Buffer.from(arr).toString("base64");
+    const base64 = bytesToBase64(arr);
     const contentType =
       response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || asset.mimeType || "application/octet-stream";
-    const textPreview = isTextualMimeType(contentType) ? Buffer.from(arr).toString("utf8") : null;
+    const textPreview = isTextualMimeType(contentType) ? bytesToUtf8(arr) : null;
 
     return {
       base64,
@@ -1394,6 +1471,41 @@ async function materializeSessionAssetToVfs(
   };
 }
 
+function getPublicBaseUrl(): string | null {
+  const value =
+    env("ASSET_PUBLIC_BASE_URL") ||
+    env("APP_BASE_URL") ||
+    env("NEXT_PUBLIC_APP_URL") ||
+    env("PUBLIC_APP_URL") ||
+    "";
+  const trimmed = value.trim().replace(/\/+$/, "");
+  return trimmed ? trimmed : null;
+}
+
+function getAssetSigningSecret(): string | null {
+  const v = env("ASSET_URL_SIGNING_SECRET") || env("SESSION_ASSET_SIGNING_SECRET") || "";
+  return v.trim() || null;
+}
+
+async function buildSignedAssetUrl(asset: SessionAsset, ttlSeconds = 900): Promise<string | null> {
+  const baseUrl = getPublicBaseUrl();
+  const secret = getAssetSigningSecret();
+  const subtle = globalThis.crypto?.subtle;
+
+  if (!baseUrl || !secret || !subtle) return null;
+
+  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, ttlSeconds);
+  const payload = `${asset.id}.${expiresAt}.${asset.filename}.${asset.mimeType}`;
+  const sig = await hmacSha256Hex(secret, payload);
+
+  const url = new URL(`${baseUrl}/api/assets/${encodeURIComponent(asset.id)}`);
+  url.searchParams.set("expires", String(expiresAt));
+  url.searchParams.set("filename", asset.filename);
+  url.searchParams.set("mimeType", asset.mimeType);
+  url.searchParams.set("sig", sig);
+  return url.toString();
+}
+
 function buildPreparedAssetPayload(
   asset: SessionAsset,
   opts?: {
@@ -1472,45 +1584,27 @@ function buildPreparedAssetPayload(
 // ============================================================
 type AssetResolutionMode = "url" | "dataUrl" | "base64" | "auto";
 
-function getPublicBaseUrl(): string | null {
-  const value =
-    env("ASSET_PUBLIC_BASE_URL") ||
-    env("APP_BASE_URL") ||
-    env("NEXT_PUBLIC_APP_URL") ||
-    env("PUBLIC_APP_URL") ||
-    "";
-  const trimmed = value.trim().replace(/\/+$/, "");
-  return trimmed ? trimmed : null;
-}
-
-function getAssetSigningSecret(): string | null {
-  const v = env("ASSET_URL_SIGNING_SECRET") || env("SESSION_ASSET_SIGNING_SECRET") || "";
-  return v.trim() || null;
-}
-
-function buildSignedAssetUrl(asset: SessionAsset, ttlSeconds = 900): string | null {
-  const baseUrl = getPublicBaseUrl();
-  const secret = getAssetSigningSecret();
-  if (!baseUrl || !secret) return null;
-
-  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, ttlSeconds);
-  const payload = `${asset.id}.${expiresAt}.${asset.filename}.${asset.mimeType}`;
-  const sig = createHmac("sha256", secret).update(payload).digest("hex");
-
-  const url = new URL(`${baseUrl}/api/assets/${encodeURIComponent(asset.id)}`);
-  url.searchParams.set("expires", String(expiresAt));
-  url.searchParams.set("filename", asset.filename);
-  url.searchParams.set("mimeType", asset.mimeType);
-  url.searchParams.set("sig", sig);
-  return url.toString();
-}
-
 function isAssetRefString(value: string): boolean {
   return /^asset:\/\/[A-Za-z0-9._:-]+$/.test(String(value ?? "").trim());
 }
 
 function assetIdFromRef(value: string): string {
   return String(value ?? "").trim().replace(/^asset:\/\//, "");
+}
+
+function maybeAssetIdFromString(value: string, sessionAssets: SessionAsset[]): string | null {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return null;
+
+  if (isAssetRefString(trimmed)) {
+    return assetIdFromRef(trimmed);
+  }
+
+  if (sessionAssets.some((x) => x.id === trimmed)) {
+    return trimmed;
+  }
+
+  return null;
 }
 
 function inferResolutionModeFromKey(key: string | null | undefined): AssetResolutionMode {
@@ -1545,17 +1639,28 @@ async function resolveAssetForToolExecution(args: {
 }> {
   const mode = args.mode;
   const asset = args.asset;
-
-  const signedUrl = buildSignedAssetUrl(asset);
+  const signedUrl = await buildSignedAssetUrl(asset);
 
   if (mode === "url") {
+    if (signedUrl || asset.url) {
+      return {
+        filename: asset.filename,
+        mimeType: asset.mimeType,
+        url: signedUrl ?? asset.url ?? null,
+        dataUrl: null,
+        base64: null,
+        sizeBytes: asset.sizeBytes ?? null,
+      };
+    }
+
+    const loaded = await loadSessionAssetContent(asset, { fetchRemote: args.fetchRemote ?? true });
     return {
-      filename: asset.filename,
-      mimeType: asset.mimeType,
-      url: signedUrl ?? asset.url ?? null,
-      dataUrl: null,
-      base64: null,
-      sizeBytes: asset.sizeBytes ?? null,
+      filename: loaded.filename,
+      mimeType: loaded.mimeType,
+      url: null,
+      dataUrl: loaded.dataUrl ?? `data:${loaded.mimeType};base64,${loaded.base64}`,
+      base64: loaded.base64,
+      sizeBytes: loaded.sizeBytes,
     };
   }
 
@@ -1583,7 +1688,6 @@ async function resolveAssetForToolExecution(args: {
     };
   }
 
-  // auto
   if (signedUrl || asset.url) {
     return {
       filename: asset.filename,
@@ -1614,27 +1718,27 @@ async function transformToolInputAssets(
     fetchRemote?: boolean;
   }
 ): Promise<unknown> {
-  // String asset ref
-  if (typeof value === "string" && isAssetRefString(value)) {
-    const assetId = assetIdFromRef(value);
-    const asset = ctx.sessionAssets.find((x) => x.id === assetId);
-    if (!asset) return value;
+  if (typeof value === "string") {
+    const assetId = maybeAssetIdFromString(value, ctx.sessionAssets);
+    if (assetId) {
+      const asset = ctx.sessionAssets.find((x) => x.id === assetId);
+      if (!asset) return value;
 
-    const mode = inferResolutionModeFromKey(ctx.currentKey);
-    const resolved = await resolveAssetForToolExecution({
-      asset,
-      mode,
-      fetchRemote: ctx.fetchRemote ?? true,
-    });
+      const mode = inferResolutionModeFromKey(ctx.currentKey);
+      const resolved = await resolveAssetForToolExecution({
+        asset,
+        mode,
+        fetchRemote: ctx.fetchRemote ?? true,
+      });
 
-    if (mode === "base64") return resolved.base64 ?? value;
-    if (mode === "dataUrl") return resolved.dataUrl ?? value;
-    if (mode === "url") return resolved.url ?? resolved.dataUrl ?? value;
+      if (mode === "base64") return resolved.base64 ?? value;
+      if (mode === "dataUrl") return resolved.dataUrl ?? value;
+      if (mode === "url") return resolved.url ?? resolved.dataUrl ?? resolved.base64 ?? value;
 
-    return resolved.url ?? resolved.dataUrl ?? resolved.base64 ?? value;
+      return resolved.url ?? resolved.dataUrl ?? resolved.base64 ?? value;
+    }
   }
 
-  // Arrays
   if (Array.isArray(value)) {
     const out: unknown[] = [];
     for (const item of value) {
@@ -1643,13 +1747,10 @@ async function transformToolInputAssets(
     return out;
   }
 
-  // Objects
   if (value && typeof value === "object") {
     const input = value as Record<string, any>;
     const objectAssetId = resolveToolObjectAssetId(input);
 
-    // Object directive form:
-    // { assetId: "asset_m6_p2", _assetMode?: "url" | "dataUrl" | "base64", ... }
     if (objectAssetId) {
       const asset = ctx.sessionAssets.find((x) => x.id === objectAssetId);
       if (!asset) return value;
@@ -2039,8 +2140,6 @@ export async function agentTurn(args: {
   const userText = String(extractRecentUserText(normalizedHistory) ?? "").trim();
   const hasRichMedia = historyHasRichMedia(normalizedHistory);
 
-  // Critical fix for the logged failure:
-  // only send valid ModelMessage shapes to the model.
   const messages = sanitizeMessagesForModel(normalizedHistory);
 
   const virtualRuntime = await createVirtualRuntime({
@@ -2225,7 +2324,7 @@ export async function agentTurn(args: {
         return {
           ok: true,
           path: sanitizePath(input.path),
-          bytes: Buffer.byteLength(input.content, "utf8"),
+          bytes: utf8ByteLength(input.content),
         };
       } catch (error: any) {
         return {
@@ -2340,7 +2439,7 @@ export async function agentTurn(args: {
             loaded,
             materialized,
             includeInlineData,
-            signedUrl: buildSignedAssetUrl(asset),
+            signedUrl: await buildSignedAssetUrl(asset),
           }),
         };
       } catch (error: any) {
