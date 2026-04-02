@@ -1,3 +1,4 @@
+
 /* agentTurn.ts */
 // app/steps/agentTurn.ts
 import {
@@ -122,374 +123,25 @@ function normalizeHistory(history: ModelMessage[]): ModelMessage[] {
   });
 }
 
-function trimHistoryForModel(history: ModelMessage[]): ModelMessage[] {
-  const maxMessages = Math.max(4, parseIntOr(env("AGENT_MAX_HISTORY_MESSAGES"), 12));
-  const trimmed = history.slice(-maxMessages);
-
-  return trimmed.map((m) => {
-    const c: any = (m as any).content;
-    if (!Array.isArray(c)) return m;
-
-    const out: any[] = [];
-    for (const part of c) {
-      const type = String(part?.type ?? "");
-      if (type === "text") {
-        const text = String(part?.text ?? "");
-        out.push({
-          ...part,
-          text: truncateText(text, Math.max(1000, parseIntOr(env("AGENT_MAX_TEXT_PART_CHARS"), 12000))),
-        });
-        continue;
-      }
-
-      if (type === "image" || type === "audio" || type === "video" || type === "file") {
-        out.push(stripHeavyMediaPart(part));
-        continue;
-      }
-
-      out.push(part);
-    }
-
-    return { ...m, content: out } as any;
-  });
-}
-
-function stripHeavyMediaPart(part: any) {
-  const type = String(part?.type ?? "file");
-  const filename = String(part?.filename ?? part?.name ?? part?.fileName ?? "").trim();
-  const mimeType = String(part?.mimeType ?? part?.mediaType ?? part?.contentType ?? "").trim();
-  const url = pickFirstDefined(
-    typeof part?.url === "string" ? part.url : undefined,
-    typeof part?.uri === "string" ? part.uri : undefined,
-    typeof part?.image === "string" && isProbablyUrl(part.image) ? part.image : undefined,
-    typeof part?.audio === "string" && isProbablyUrl(part.audio) ? part.audio : undefined,
-    typeof part?.video === "string" && isProbablyUrl(part.video) ? part.video : undefined,
-    typeof part?.file === "string" && isProbablyUrl(part.file) ? part.file : undefined
-  );
-
-  return {
-    type,
-    filename: filename || undefined,
-    mimeType: mimeType || undefined,
-    url: url || undefined,
-    note: "heavy media payload omitted from model context; use session asset tools",
-  };
-}
-
 function extractRecentUserText(history: ModelMessage[]): string {
   const lastUser = [...history].reverse().find((m) => m.role === "user");
   if (!lastUser) return "";
   const c: any = (lastUser as any).content;
   if (typeof c === "string") return c;
   if (Array.isArray(c)) {
-    const textParts = c.filter((p) => p?.type === "text" && typeof p?.text === "string").map((p) => p.text);
-    return textParts.join("\n").trim();
+    const t = c.find((p) => p?.type === "text")?.text;
+    if (typeof t === "string") return t;
   }
   return "";
 }
 
-type SessionAssetKind = "image" | "audio" | "video" | "file";
-type SessionAssetSource = "url" | "data_url" | "base64" | "text" | "unknown";
-
-type SessionAsset = {
-  id: string;
-  kind: SessionAssetKind;
-  role: string;
-  messageIndex: number;
-  partIndex: number;
-  partType: string;
-  filename: string;
-  mimeType: string;
-  extension: string;
-  source: SessionAssetSource;
-  url?: string;
-  dataUrl?: string;
-  base64?: string;
-  text?: string;
-  sizeBytes?: number | null;
-};
-
-function isRichMediaPartType(type: string): boolean {
-  return ["image", "audio", "video", "file"].includes(String(type ?? "").toLowerCase());
-}
-
-function historyHasRichMedia(history: ModelMessage[]): boolean {
+function historyHasImages(history: ModelMessage[]): boolean {
   for (const msg of history) {
     const c: any = (msg as any).content;
     if (!Array.isArray(c)) continue;
-    if (c.some((p) => isRichMediaPartType(String(p?.type ?? "")))) return true;
+    if (c.some((p) => p?.type === "image")) return true;
   }
   return false;
-}
-
-function isProbablyUrl(value: unknown): value is string {
-  return typeof value === "string" && /^https?:\/\//i.test(value.trim());
-}
-
-function isDataUrl(value: unknown): value is string {
-  return typeof value === "string" && /^data:/i.test(value.trim());
-}
-
-function safeFilenameSegment(value: string): string {
-  const s = String(value ?? "")
-    .trim()
-    .replace(/[^a-zA-Z0-9._-]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  return s || "asset";
-}
-
-function inferExtensionFromMime(mimeType: string): string {
-  const mime = String(mimeType ?? "").toLowerCase().split(";")[0].trim();
-  const map: Record<string, string> = {
-    "image/jpeg": "jpg",
-    "image/jpg": "jpg",
-    "image/png": "png",
-    "image/webp": "webp",
-    "image/gif": "gif",
-    "image/heic": "heic",
-    "image/heif": "heif",
-    "image/svg+xml": "svg",
-    "audio/mpeg": "mp3",
-    "audio/mp3": "mp3",
-    "audio/wav": "wav",
-    "audio/x-wav": "wav",
-    "audio/ogg": "ogg",
-    "audio/webm": "webm",
-    "audio/mp4": "m4a",
-    "video/mp4": "mp4",
-    "video/quicktime": "mov",
-    "video/webm": "webm",
-    "video/x-msvideo": "avi",
-    "application/pdf": "pdf",
-    "application/json": "json",
-    "text/plain": "txt",
-    "text/markdown": "md",
-    "text/csv": "csv",
-    "application/zip": "zip",
-  };
-  return map[mime] ?? "bin";
-}
-
-function inferMimeFromFilename(name: string): string {
-  const ext = String(name ?? "").split(".").pop()?.toLowerCase() ?? "";
-  const map: Record<string, string> = {
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    png: "image/png",
-    webp: "image/webp",
-    gif: "image/gif",
-    heic: "image/heic",
-    heif: "image/heif",
-    svg: "image/svg+xml",
-    mp3: "audio/mpeg",
-    wav: "audio/wav",
-    ogg: "audio/ogg",
-    m4a: "audio/mp4",
-    webm: "video/webm",
-    mp4: "video/mp4",
-    mov: "video/quicktime",
-    avi: "video/x-msvideo",
-    pdf: "application/pdf",
-    json: "application/json",
-    txt: "text/plain",
-    md: "text/markdown",
-    csv: "text/csv",
-    zip: "application/zip",
-  };
-  return map[ext] ?? "application/octet-stream";
-}
-
-function guessMimeTypeFromKind(kind: SessionAssetKind): string {
-  switch (kind) {
-    case "image":
-      return "image/*";
-    case "audio":
-      return "audio/*";
-    case "video":
-      return "video/*";
-    default:
-      return "application/octet-stream";
-  }
-}
-
-function extractMimeTypeFromDataUrl(dataUrl: string): string {
-  const match = String(dataUrl ?? "").match(/^data:([^;,]+)(;base64)?,/i);
-  return match?.[1]?.toLowerCase() ?? "application/octet-stream";
-}
-
-function stripDataUrlPrefix(dataUrl: string): string {
-  return String(dataUrl ?? "").replace(/^data:[^,]*,/, "");
-}
-
-function estimateBase64Bytes(base64: string): number | null {
-  const s = String(base64 ?? "").trim();
-  if (!s) return 0;
-  const padding = s.endsWith("==") ? 2 : s.endsWith("=") ? 1 : 0;
-  return Math.max(0, Math.floor((s.length * 3) / 4) - padding);
-}
-
-function tryUtf8FromBase64(base64: string): string | null {
-  try {
-    return Buffer.from(base64, "base64").toString("utf8");
-  } catch {
-    return null;
-  }
-}
-
-function isTextualMimeType(mimeType: string): boolean {
-  const mime = String(mimeType ?? "").toLowerCase();
-  return (
-    mime.startsWith("text/") ||
-    mime.includes("json") ||
-    mime.includes("xml") ||
-    mime.includes("yaml") ||
-    mime.includes("javascript") ||
-    mime.includes("typescript") ||
-    mime.includes("csv")
-  );
-}
-
-function pickFirstDefined<T>(...values: Array<T | undefined | null>): T | undefined {
-  for (const value of values) {
-    if (value !== undefined && value !== null) return value;
-  }
-  return undefined;
-}
-
-function assetKindFromPart(part: any): SessionAssetKind | null {
-  const type = String(part?.type ?? "").toLowerCase();
-  if (["image", "audio", "video", "file"].includes(type)) return type as SessionAssetKind;
-  if (part?.image || part?.image_url) return "image";
-  if (part?.audio || part?.input_audio) return "audio";
-  if (part?.video) return "video";
-  if (part?.file || part?.filename || part?.mimeType || part?.mediaType) return "file";
-  return null;
-}
-
-function rawAssetPayloadFromPart(part: any, kind: SessionAssetKind): unknown {
-  switch (kind) {
-    case "image":
-      return pickFirstDefined(part?.image, part?.image_url, part?.url, part?.uri, part?.data);
-    case "audio":
-      return pickFirstDefined(part?.audio, part?.input_audio?.data, part?.url, part?.uri, part?.data);
-    case "video":
-      return pickFirstDefined(part?.video, part?.url, part?.uri, part?.data);
-    default:
-      return pickFirstDefined(part?.file, part?.url, part?.uri, part?.data, part?.bytes, part?.content);
-  }
-}
-
-function coerceAssetSource(payload: unknown): {
-  source: SessionAssetSource;
-  url?: string;
-  dataUrl?: string;
-  base64?: string;
-  text?: string;
-  sizeBytes?: number | null;
-} {
-  if (payload == null) return { source: "unknown", sizeBytes: null };
-
-  if (typeof payload === "string") {
-    if (isProbablyUrl(payload)) return { source: "url", url: payload.trim(), sizeBytes: null };
-    if (isDataUrl(payload)) {
-      const base64 = stripDataUrlPrefix(payload);
-      return { source: "data_url", dataUrl: payload, base64, sizeBytes: estimateBase64Bytes(base64) };
-    }
-    return { source: "text", text: payload, sizeBytes: Buffer.byteLength(payload, "utf8") };
-  }
-
-  if (payload instanceof Uint8Array) {
-    const base64 = Buffer.from(payload).toString("base64");
-    return { source: "base64", base64, sizeBytes: payload.byteLength };
-  }
-
-  if (Array.isArray(payload) && payload.every((x) => typeof x === "number")) {
-    const base64 = Buffer.from(payload).toString("base64");
-    return { source: "base64", base64, sizeBytes: payload.length };
-  }
-
-  if (typeof Buffer !== "undefined" && Buffer.isBuffer(payload)) {
-    const base64 = payload.toString("base64");
-    return { source: "base64", base64, sizeBytes: payload.length };
-  }
-
-  if (typeof payload === "object") {
-    const obj: any = payload;
-    const nested = pickFirstDefined(obj?.url, obj?.uri, obj?.href, obj?.data, obj?.base64, obj?.content);
-    if (nested !== undefined) return coerceAssetSource(nested);
-  }
-
-  return { source: "unknown", text: truncateText(payload, 2000), sizeBytes: null };
-}
-
-function buildSessionAsset(part: any, role: string, messageIndex: number, partIndex: number): SessionAsset | null {
-  const kind = assetKindFromPart(part);
-  if (!kind) return null;
-
-  const partType = String(part?.type ?? kind).toLowerCase();
-  const payload = rawAssetPayloadFromPart(part, kind);
-  const sourceInfo = coerceAssetSource(payload);
-
-  let mimeType =
-    String(
-      pickFirstDefined(
-        part?.mimeType,
-        part?.mediaType,
-        part?.contentType,
-        part?.input_audio?.format ? `audio/${String(part.input_audio.format).toLowerCase()}` : undefined,
-        sourceInfo.dataUrl ? extractMimeTypeFromDataUrl(sourceInfo.dataUrl) : undefined
-      ) ?? ""
-    ).toLowerCase() || guessMimeTypeFromKind(kind);
-
-  const explicitFilename = String(
-    pickFirstDefined(part?.filename, part?.name, part?.fileName, part?.title, part?.metadata?.filename) ?? ""
-  ).trim();
-
-  const extension = explicitFilename.includes(".")
-    ? explicitFilename.split(".").pop()!.toLowerCase()
-    : inferExtensionFromMime(mimeType);
-
-  const filename = explicitFilename || `asset_${messageIndex + 1}_${partIndex + 1}.${extension}`;
-
-  if (!mimeType || mimeType === "application/octet-stream") {
-    mimeType = inferMimeFromFilename(filename) || mimeType;
-  }
-
-  const normalizedFilename = safeFilenameSegment(filename);
-
-  return {
-    id: `asset_m${messageIndex + 1}_p${partIndex + 1}`,
-    kind,
-    role,
-    messageIndex,
-    partIndex,
-    partType,
-    filename: normalizedFilename,
-    mimeType,
-    extension: extension || inferExtensionFromMime(mimeType),
-    source: sourceInfo.source,
-    url: sourceInfo.url,
-    dataUrl: sourceInfo.dataUrl,
-    base64: sourceInfo.base64,
-    text: sourceInfo.text,
-    sizeBytes: sourceInfo.sizeBytes ?? null,
-  };
-}
-
-function collectSessionAssets(history: ModelMessage[]): SessionAsset[] {
-  const assets: SessionAsset[] = [];
-  for (let messageIndex = 0; messageIndex < history.length; messageIndex++) {
-    const msg: any = history[messageIndex];
-    const content = msg?.content;
-    if (!Array.isArray(content)) continue;
-
-    for (let partIndex = 0; partIndex < content.length; partIndex++) {
-      const asset = buildSessionAsset(content[partIndex], String(msg?.role ?? "user"), messageIndex, partIndex);
-      if (asset) assets.push(asset);
-    }
-  }
-  return assets;
 }
 
 function splitForTelegram(text: string, maxChars: number): string[] {
@@ -583,6 +235,12 @@ function dirname(p: string): string {
   return s.slice(0, idx);
 }
 
+function basename(p: string): string {
+  const s = sanitizePath(p);
+  const idx = s.lastIndexOf("/");
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
 function parentDirs(p: string): string[] {
   const s = sanitizePath(p);
   const parts = s.split("/").filter(Boolean);
@@ -660,18 +318,22 @@ const INLINE_SKILLS: Record<string, InlineSkill> = {
       "Prefer keeping work under /workspace.",
     ],
   },
-  modalities: {
-    name: "modalities",
-    whenToUse: "Use when the user message includes images, audio, video, or files that need staging or upload.",
-    guidance: [
-      "Use list_session_assets to inspect available assets.",
-      "Use prepare_session_asset first for metadata and upload hints.",
-      "Use materialize_session_asset only when you actually need persisted content in the VFS.",
-      "Prefer URL handoff when available; otherwise request inline content only when needed.",
-      "Do not assume all Composio upload tools use the same schema.",
-    ],
-  },
+  
 };
+
+function renderAllSkillsForPrompt(): string {
+  return Object.values(INLINE_SKILLS)
+    .map((skill) =>
+      [
+        `## Skill: ${skill.name}`,
+        `When to use: ${skill.whenToUse}`,
+        "Guidance:",
+        ...skill.guidance.map((g) => `- ${g}`),
+        ...(skill.examples?.length ? ["Examples:", ...skill.examples.map((e) => `- ${e}`)] : []),
+      ].join("\n")
+    )
+    .join("\n\n");
+}
 
 function renderSingleSkill(skill: InlineSkill): string {
   return [
@@ -689,7 +351,9 @@ function renderSingleSkill(skill: InlineSkill): string {
 // ============================================================
 async function vfsAllPaths(rt: VirtualRuntime): Promise<string[]> {
   const raw = (await rt.redis.smembers(vfsPathsKey(rt.userId, rt.sessionId))) ?? [];
-  return (Array.isArray(raw) ? raw : []).map((x) => sanitizePath(String(x))).sort();
+  return (Array.isArray(raw) ? raw : [])
+    .map((x) => sanitizePath(String(x)))
+    .sort();
 }
 
 async function vfsGetNode(rt: VirtualRuntime, path: string): Promise<VfsNode | undefined> {
@@ -821,7 +485,9 @@ async function vfsMove(rt: VirtualRuntime, fromPath: string, toPath: string): Pr
   if (to.startsWith(`${from}/`)) throw new Error(`Cannot move a path into itself: ${from} -> ${to}`);
 
   const keys = await vfsAllPaths(rt);
-  const entries = keys.filter((p) => p === from || p.startsWith(`${from}/`)).sort((a, b) => a.length - b.length);
+  const entries = keys
+    .filter((p) => p === from || p.startsWith(`${from}/`))
+    .sort((a, b) => a.length - b.length);
 
   if (node.type === "file") {
     await vfsWriteFile(rt, to, node.content);
@@ -857,7 +523,9 @@ async function vfsCopy(rt: VirtualRuntime, fromPath: string, toPath: string): Pr
   if (to.startsWith(`${from}/`)) throw new Error(`Cannot copy a path into itself: ${from} -> ${to}`);
 
   const keys = await vfsAllPaths(rt);
-  const entries = keys.filter((p) => p === from || p.startsWith(`${from}/`)).sort((a, b) => a.length - b.length);
+  const entries = keys
+    .filter((p) => p === from || p.startsWith(`${from}/`))
+    .sort((a, b) => a.length - b.length);
 
   if (node.type === "file") {
     await vfsWriteFile(rt, to, node.content);
@@ -917,7 +585,6 @@ async function createVirtualRuntime(args: {
   channel: Channel;
   userText: string;
   history: ModelMessage[];
-  sessionAssets?: SessionAsset[];
 }): Promise<VirtualRuntime> {
   const redis = await getRedisClient();
   if (!redis) {
@@ -938,7 +605,6 @@ async function createVirtualRuntime(args: {
   await vfsEnsureDir(rt, "/workspace");
   await vfsEnsureDir(rt, "/workspace/context");
   await vfsEnsureDir(rt, "/workspace/skills");
-  await vfsEnsureDir(rt, "/workspace/assets");
 
   await rt.redis.set(vfsMetaKey(args.userId, args.sessionId), {
     sessionId: args.sessionId,
@@ -971,9 +637,8 @@ async function createVirtualRuntime(args: {
       sessionId: args.sessionId,
       userId: args.userId,
       channel: args.channel,
-      userText: truncateText(args.userText, 4000),
+      userText: args.userText,
       historyCount: args.history.length,
-      sessionAssetCount: args.sessionAssets?.length ?? 0,
       createdAt: nowIso(),
     })
   );
@@ -983,25 +648,6 @@ async function createVirtualRuntime(args: {
     "/workspace/context/skills.index.json",
     toSafeJson({
       skills: Object.keys(INLINE_SKILLS),
-    })
-  );
-
-  await vfsWriteFile(
-    rt,
-    "/workspace/context/session_assets.index.json",
-    toSafeJson({
-      assets:
-        args.sessionAssets?.map((asset) => ({
-          id: asset.id,
-          kind: asset.kind,
-          role: asset.role,
-          filename: asset.filename,
-          mimeType: asset.mimeType,
-          source: asset.source,
-          sizeBytes: asset.sizeBytes ?? null,
-          hasUrl: Boolean(asset.url),
-          hasInlineData: Boolean(asset.base64 || asset.dataUrl || asset.text),
-        })) ?? [],
     })
   );
 
@@ -1198,251 +844,6 @@ async function execVirtualShell(rt: VirtualRuntime, input: string) {
 }
 
 // ============================================================
-// Session asset preparation / materialization
-// ============================================================
-type LoadedSessionAsset = {
-  base64: string;
-  mimeType: string;
-  filename: string;
-  sizeBytes: number | null;
-  source: SessionAssetSource | "fetched_url";
-  textPreview?: string | null;
-  dataUrl?: string;
-};
-
-function describeSessionAsset(asset: SessionAsset) {
-  return {
-    id: asset.id,
-    kind: asset.kind,
-    role: asset.role,
-    messageIndex: asset.messageIndex,
-    partIndex: asset.partIndex,
-    partType: asset.partType,
-    filename: asset.filename,
-    mimeType: asset.mimeType,
-    extension: asset.extension,
-    source: asset.source,
-    sizeBytes: asset.sizeBytes ?? null,
-    hasUrl: Boolean(asset.url),
-    hasInlineData: Boolean(asset.base64 || asset.dataUrl || asset.text),
-    url: asset.url ?? null,
-  };
-}
-
-async function loadSessionAssetContent(
-  asset: SessionAsset,
-  opts?: { fetchRemote?: boolean; maxBytes?: number }
-): Promise<LoadedSessionAsset> {
-  const fetchRemote = opts?.fetchRemote ?? true;
-  const maxBytes = Math.max(1024, opts?.maxBytes ?? parseIntOr(env("SESSION_ASSET_MAX_BYTES"), 25 * 1024 * 1024));
-
-  if (asset.base64) {
-    const textPreview = isTextualMimeType(asset.mimeType) ? tryUtf8FromBase64(asset.base64) : null;
-    return {
-      base64: asset.base64,
-      mimeType: asset.mimeType,
-      filename: asset.filename,
-      sizeBytes: asset.sizeBytes ?? estimateBase64Bytes(asset.base64),
-      source: asset.source,
-      textPreview,
-      dataUrl: asset.dataUrl ?? `data:${asset.mimeType};base64,${asset.base64}`,
-    };
-  }
-
-  if (asset.dataUrl) {
-    const base64 = stripDataUrlPrefix(asset.dataUrl);
-    const textPreview = isTextualMimeType(asset.mimeType) ? tryUtf8FromBase64(base64) : null;
-    return {
-      base64,
-      mimeType: asset.mimeType,
-      filename: asset.filename,
-      sizeBytes: asset.sizeBytes ?? estimateBase64Bytes(base64),
-      source: asset.source,
-      textPreview,
-      dataUrl: asset.dataUrl,
-    };
-  }
-
-  if (asset.text != null) {
-    const base64 = Buffer.from(asset.text, "utf8").toString("base64");
-    return {
-      base64,
-      mimeType: asset.mimeType || "text/plain",
-      filename: asset.filename,
-      sizeBytes: Buffer.byteLength(asset.text, "utf8"),
-      source: asset.source,
-      textPreview: asset.text,
-      dataUrl: `data:${asset.mimeType || "text/plain"};base64,${base64}`,
-    };
-  }
-
-  if (asset.url && fetchRemote) {
-    const response = await fetch(asset.url);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch asset URL (${response.status} ${response.statusText})`);
-    }
-
-    const arr = new Uint8Array(await response.arrayBuffer());
-    if (arr.byteLength > maxBytes) {
-      throw new Error(`Remote asset too large (${arr.byteLength} bytes > ${maxBytes} bytes)`);
-    }
-
-    const base64 = Buffer.from(arr).toString("base64");
-    const contentType =
-      response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || asset.mimeType || "application/octet-stream";
-    const textPreview = isTextualMimeType(contentType) ? Buffer.from(arr).toString("utf8") : null;
-
-    return {
-      base64,
-      mimeType: contentType,
-      filename: asset.filename,
-      sizeBytes: arr.byteLength,
-      source: "fetched_url",
-      textPreview,
-      dataUrl: `data:${contentType};base64,${base64}`,
-    };
-  }
-
-  throw new Error(`Asset ${asset.id} does not currently have retrievable inline data or an accessible URL`);
-}
-
-async function materializeSessionAssetToVfs(
-  rt: VirtualRuntime,
-  asset: SessionAsset,
-  opts?: { fetchRemote?: boolean; includeBase64?: boolean }
-) {
-  const includeBase64 = opts?.includeBase64 ?? false;
-  const loaded = await loadSessionAssetContent(asset, { fetchRemote: opts?.fetchRemote ?? true });
-  const assetRoot = sanitizePath(`/workspace/assets/${asset.id}`);
-  const metaPath = sanitizePath(`${assetRoot}/meta.json`);
-  const rawBase64Path = sanitizePath(`${assetRoot}/${asset.filename}.base64.txt`);
-  const textPath = sanitizePath(`${assetRoot}/${asset.filename}.txt`);
-  const infoPath = sanitizePath(`${assetRoot}/composio_payload.json`);
-
-  await vfsEnsureDir(rt, assetRoot);
-
-  await vfsWriteFile(
-    rt,
-    metaPath,
-    toSafeJson({
-      ...describeSessionAsset(asset),
-      loadedMimeType: loaded.mimeType,
-      loadedSizeBytes: loaded.sizeBytes,
-      loadedSource: loaded.source,
-      createdAt: nowIso(),
-    })
-  );
-
-  if (includeBase64) {
-    await vfsWriteFile(rt, rawBase64Path, loaded.base64);
-  }
-
-  if (loaded.textPreview != null) {
-    await vfsWriteFile(rt, textPath, loaded.textPreview);
-  }
-
-  await vfsWriteFile(
-    rt,
-    infoPath,
-    toSafeJson({
-      filename: loaded.filename,
-      mimeType: loaded.mimeType,
-      url: asset.url ?? null,
-      dataUrl: includeBase64 ? loaded.dataUrl ?? null : null,
-      base64Path: includeBase64 ? rawBase64Path : null,
-      textPath: loaded.textPreview != null ? textPath : null,
-      notes: [
-        "Prefer url when a target Composio tool accepts URL-based file ingestion.",
-        "Otherwise request inline content only when the target tool truly requires it.",
-        "Not all Composio tools share the same schema; adapt to the declared tool input schema.",
-      ],
-    })
-  );
-
-  return {
-    ok: true,
-    assetId: asset.id,
-    assetRoot,
-    metaPath,
-    base64Path: includeBase64 ? rawBase64Path : null,
-    textPath: loaded.textPreview != null ? textPath : null,
-    infoPath,
-    loaded,
-  };
-}
-
-function buildPreparedAssetPayload(
-  asset: SessionAsset,
-  opts?: {
-    loaded?: LoadedSessionAsset | null;
-    materialized?: {
-      assetRoot: string;
-      metaPath: string;
-      base64Path: string | null;
-      textPath: string | null;
-      infoPath: string;
-    } | null;
-    includeInlineData?: boolean;
-  }
-) {
-  const loaded = opts?.loaded ?? null;
-  const materialized = opts?.materialized ?? null;
-  const includeInlineData = opts?.includeInlineData ?? false;
-
-  const mimeType = loaded?.mimeType ?? asset.mimeType;
-  const filename = loaded?.filename ?? asset.filename;
-  const sizeBytes = loaded?.sizeBytes ?? asset.sizeBytes ?? null;
-  const base64 = includeInlineData ? loaded?.base64 ?? asset.base64 ?? null : null;
-  const dataUrl =
-    includeInlineData
-      ? loaded?.dataUrl ?? asset.dataUrl ?? (base64 ? `data:${mimeType};base64,${base64}` : null)
-      : null;
-
-  return {
-    asset: describeSessionAsset(asset),
-    prepared: {
-      filename,
-      mimeType,
-      sizeBytes,
-      url: asset.url ?? null,
-      dataUrl,
-      base64,
-      textPreview: includeInlineData ? loaded?.textPreview ?? asset.text ?? null : null,
-    },
-    composioHints: {
-      commonCandidateFields: {
-        filename,
-        fileName: filename,
-        name: filename,
-        mimeType,
-        contentType: mimeType,
-        fileMimeType: mimeType,
-        url: asset.url ?? null,
-        uri: asset.url ?? null,
-        dataUrl,
-        contentBase64: base64,
-        base64,
-      },
-      guidance: [
-        "Inspect the target Composio tool schema first.",
-        "If the tool accepts a URL or URI, prefer the asset URL.",
-        "If the tool accepts inline file content, ask for includeInlineData=true and use dataUrl or base64 with filename and mimeType.",
-        "If the tool expects a staged artifact, materialize into the VFS first.",
-      ],
-    },
-    virtualPaths: materialized
-      ? {
-          assetRoot: materialized.assetRoot,
-          metaPath: materialized.metaPath,
-          base64Path: materialized.base64Path,
-          textPath: materialized.textPath,
-          infoPath: materialized.infoPath,
-        }
-      : null,
-  };
-}
-
-// ============================================================
 // Composio allowlist handling ("*" means ALL)
 // ============================================================
 function filterComposioTools(tools: ToolSet): ToolSet {
@@ -1522,7 +923,7 @@ function resolveConfiguredAuthConfigId(toolkitSlug: string): string | undefined 
       const exact = parsed[toolkitSlug] ?? parsed[toolkitSlug.toLowerCase()] ?? parsed[slugKey];
       if (exact) return String(exact);
     } catch {
-      // ignore invalid JSON
+      // ignore invalid JSON, fallback below
     }
   }
 
@@ -1557,6 +958,7 @@ async function composioResolveToolkitAndAuthConfig(userId: string, toolkitInput:
       const slugNorm = slug.replace(/\s+/g, "");
       const nameNorm = name.replace(/\s+/g, "");
       const connected = Boolean(t?.connection?.connectedAccount?.id);
+
       const discoveredAuthConfigId =
         t?.connection?.authConfig?.id ?? t?.authConfig?.id ?? t?.defaultAuthConfig?.id ?? null;
 
@@ -1613,10 +1015,22 @@ async function composioConnectToolkitByName(userId: string, toolkitInput: string
   const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
 
   const authorizeOptionsVariants = [
-    { callbackUrl, authConfigId: resolved.authConfigId },
-    { callbackUrl, auth_config_id: resolved.authConfigId },
-    { callback_url: callbackUrl, authConfigId: resolved.authConfigId },
-    { callback_url: callbackUrl, auth_config_id: resolved.authConfigId },
+    {
+      callbackUrl,
+      authConfigId: resolved.authConfigId,
+    },
+    {
+      callbackUrl,
+      auth_config_id: resolved.authConfigId,
+    },
+    {
+      callback_url: callbackUrl,
+      authConfigId: resolved.authConfigId,
+    },
+    {
+      callback_url: callbackUrl,
+      auth_config_id: resolved.authConfigId,
+    },
     callbackUrl ? { callbackUrl } : {},
   ].filter(Boolean) as any[];
 
@@ -1680,7 +1094,7 @@ function createEditCoalescer(opts: { sessionId: string; messageId: number; throt
       lastSent = t;
       lastAt = Date.now();
     } catch {
-      // best effort
+      // best-effort
     }
   }
 
@@ -1723,12 +1137,9 @@ export async function agentTurn(args: {
 
   const autonomy = env("AUTONOMOUS_MODE") ?? "assistive";
 
-  const normalizedHistory = normalizeHistory(args.history);
-  const sessionAssets = collectSessionAssets(normalizedHistory);
-  const userText = String(extractRecentUserText(normalizedHistory) ?? "").trim();
-  const hasRichMedia = historyHasRichMedia(normalizedHistory);
-
-  const messages = trimHistoryForModel(normalizedHistory);
+  const messages = normalizeHistory(args.history);
+  const userText = String(extractRecentUserText(messages) ?? "").trim();
+  const hasImages = historyHasImages(messages);
 
   const virtualRuntime = await createVirtualRuntime({
     sessionId: args.sessionId,
@@ -1736,19 +1147,19 @@ export async function agentTurn(args: {
     channel: args.channel,
     userText,
     history: messages,
-    sessionAssets,
   });
 
   const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o-mini";
   const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o";
-  const forceSmart = (env("AGENT_FORCE_SMART_MODEL") ?? "true") !== "false";
-  const modelName = forceSmart ? smartModel : hasRichMedia ? smartModel : fastModel;
+  const modelName = hasImages ? smartModel : fastModel;
 
   const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.2");
 
   const isTelegram = args.channel === "telegram";
   const telegramStreamingEnabled =
-    isTelegram && (args.showTyping ?? true) && (env("TELEGRAM_STREAMING") ?? "true") !== "false";
+    isTelegram &&
+    (args.showTyping ?? true) &&
+    (env("TELEGRAM_STREAMING") ?? "true") !== "false";
 
   const editThrottleMs = Math.max(250, Number(env("TELEGRAM_STREAM_EDIT_THROTTLE_MS") ?? 750));
   const typingIntervalMs = Math.max(1000, Number(env("TELEGRAM_TYPING_INTERVAL_MS") ?? 4000));
@@ -1794,13 +1205,13 @@ export async function agentTurn(args: {
         if (!explicit) return { ok: false, blocked: true, message: "Use /ssh <command> to run SSH." };
       }
       const output = await sshExec(input.command);
-      return { ok: true, output: truncateText(output, 5000) };
+      return { ok: true, output };
     },
   });
 
   const connectToolkit = tool({
     description:
-      "Generate a Composio connect/authorize link for a toolkit using the current user's namespace. Accepts user-friendly names like 'Typeform', 'Google Drive', or 'X'.",
+      "Generate a Composio connect/authorize link for a toolkit using the current user's namespace. Accepts user-friendly names like 'Typeform', 'Google Drive', or 'X'. Resolves toolkit slug and auth config before creating the auth link.",
     inputSchema: zodSchema(
       z.object({
         toolkit: z.string().min(1),
@@ -1848,7 +1259,8 @@ export async function agentTurn(args: {
   });
 
   const readSkill = tool({
-    description: "Read a specific inline skill by name.",
+    description:
+      "Read a specific inline skill by name, such as routing, composio, ssh, scheduling, filesystem, or telegram.",
     inputSchema: zodSchema(
       z.object({
         name: z.string().min(1),
@@ -1886,7 +1298,7 @@ export async function agentTurn(args: {
         return {
           ok: true,
           path: sanitizePath(input.path),
-          content: truncateText(content, 30000),
+          content: truncateText(content, 60_000),
         };
       } catch (error: any) {
         return {
@@ -1903,7 +1315,7 @@ export async function agentTurn(args: {
     inputSchema: zodSchema(
       z.object({
         path: z.string().min(1).max(4000),
-        content: z.string().max(120_000),
+        content: z.string().max(200_000),
       })
     ),
     execute: async (input: { path: string; content: string }) => {
@@ -1926,7 +1338,7 @@ export async function agentTurn(args: {
 
   const virtualShell = tool({
     description:
-      "Run shell-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep.",
+      "Run shell-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep. This does not touch the host OS.",
     inputSchema: zodSchema(
       z.object({
         command: z.string().min(1).max(120000),
@@ -1936,153 +1348,11 @@ export async function agentTurn(args: {
       const result = await execVirtualShell(virtualRuntime, input.command);
       return {
         ok: result.ok,
-        command: truncateText(input.command, 500),
-        stdout: truncateText(result.stdout, 5000),
-        stderr: truncateText(result.stderr, 2000),
+        command: input.command,
+        stdout: truncateText(result.stdout, 20_000),
+        stderr: truncateText(result.stderr, 12_000),
         exitCode: result.exitCode,
       };
-    },
-  });
-
-  const listSessionAssets = tool({
-    description:
-      "List images, audio, video, and files detected in the current conversation history, including canonical IDs for follow-up asset preparation.",
-    inputSchema: zodSchema(z.object({})),
-    execute: async () => {
-      return {
-        ok: true,
-        count: sessionAssets.length,
-        assets: sessionAssets.map(describeSessionAsset),
-      };
-    },
-  });
-
-  const prepareSessionAsset = tool({
-    description:
-      "Prepare a session asset for external tool usage. By default returns metadata and upload hints only. Set includeInlineData=true only when the target tool truly needs inline content.",
-    inputSchema: zodSchema(
-      z.object({
-        assetId: z.string().min(1),
-        fetchRemote: z.boolean().optional(),
-        includeInlineData: z.boolean().optional(),
-        materializeToVfs: z.boolean().optional(),
-      })
-    ),
-    execute: async (input: {
-      assetId: string;
-      fetchRemote?: boolean;
-      includeInlineData?: boolean;
-      materializeToVfs?: boolean;
-    }) => {
-      const asset = sessionAssets.find((x) => x.id === input.assetId);
-      if (!asset) {
-        return {
-          ok: false,
-          error: `Unknown assetId "${input.assetId}"`,
-          availableAssetIds: sessionAssets.map((x) => x.id),
-        };
-      }
-
-      const includeInlineData = input.includeInlineData ?? false;
-      const fetchRemote = input.fetchRemote ?? true;
-
-      let loaded: LoadedSessionAsset | null = null;
-      let materialized:
-        | {
-            assetRoot: string;
-            metaPath: string;
-            base64Path: string | null;
-            textPath: string | null;
-            infoPath: string;
-          }
-        | null = null;
-
-      try {
-        if (includeInlineData || input.materializeToVfs) {
-          loaded = await loadSessionAssetContent(asset, { fetchRemote });
-        }
-
-        if (input.materializeToVfs) {
-          const result = await materializeSessionAssetToVfs(virtualRuntime, asset, {
-            fetchRemote,
-            includeBase64: includeInlineData,
-          });
-          materialized = {
-            assetRoot: result.assetRoot,
-            metaPath: result.metaPath,
-            base64Path: result.base64Path,
-            textPath: result.textPath,
-            infoPath: result.infoPath,
-          };
-          loaded = result.loaded;
-        }
-
-        return {
-          ok: true,
-          ...buildPreparedAssetPayload(asset, {
-            loaded,
-            materialized,
-            includeInlineData,
-          }),
-        };
-      } catch (error: any) {
-        return {
-          ok: false,
-          asset: describeSessionAsset(asset),
-          error: String(error?.message ?? error ?? "Unknown prepare_session_asset error"),
-        };
-      }
-    },
-  });
-
-  const materializeSessionAsset = tool({
-    description:
-      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/. Does not include base64 unless explicitly requested.",
-    inputSchema: zodSchema(
-      z.object({
-        assetId: z.string().min(1),
-        fetchRemote: z.boolean().optional(),
-        includeBase64: z.boolean().optional(),
-      })
-    ),
-    execute: async (input: { assetId: string; fetchRemote?: boolean; includeBase64?: boolean }) => {
-      const asset = sessionAssets.find((x) => x.id === input.assetId);
-      if (!asset) {
-        return {
-          ok: false,
-          error: `Unknown assetId "${input.assetId}"`,
-          availableAssetIds: sessionAssets.map((x) => x.id),
-        };
-      }
-
-      try {
-        const result = await materializeSessionAssetToVfs(virtualRuntime, asset, {
-          fetchRemote: input.fetchRemote ?? true,
-          includeBase64: input.includeBase64 ?? false,
-        });
-
-        return {
-          ok: true,
-          asset: describeSessionAsset(asset),
-          assetRoot: result.assetRoot,
-          metaPath: result.metaPath,
-          base64Path: result.base64Path,
-          textPath: result.textPath,
-          infoPath: result.infoPath,
-          loaded: {
-            filename: result.loaded.filename,
-            mimeType: result.loaded.mimeType,
-            sizeBytes: result.loaded.sizeBytes,
-            source: result.loaded.source,
-          },
-        };
-      } catch (error: any) {
-        return {
-          ok: false,
-          asset: describeSessionAsset(asset),
-          error: String(error?.message ?? error ?? "Unknown materialize_session_asset error"),
-        };
-      }
     },
   });
 
@@ -2116,9 +1386,6 @@ export async function agentTurn(args: {
     read_virtual_file: readVirtualFile,
     write_virtual_file: writeVirtualFile,
     virtual_shell: virtualShell,
-    list_session_assets: listSessionAssets,
-    prepare_session_asset: prepareSessionAsset,
-    materialize_session_asset: materializeSessionAsset,
   };
 
   // ============================================================
@@ -2165,39 +1432,39 @@ export async function agentTurn(args: {
   // System prompt
   // ============================================================
   const system = [
-    "You are an Agentic Operating System assistant running in Telegram/WhatsApp/SMS with Composio tools.",
+    "You are an Agentic Operating System similar to Open Claw and assistant running inside Telegram/WhatsApp/SMS connected to Composio tools via auth configs.",
     "",
     "CRITICAL TOOL RULES:",
-    "- If the user asks for an external action, use the appropriate tool.",
+    "- If the user asks you to do an external action (Typeform, Twitter/X, Discord, Slack, etc.), you MUST use the appropriate tool.",
     "- Never claim an action succeeded unless a tool call returned success.",
-    "- If an action requires toolkit auth, call connect_toolkit and provide the link.",
-    "- If you're unsure what is connected, call list_connections.",
-    "- If you need to resolve toolkit/auth config, call resolve_toolkit_connection.",
+    "- If an action requires the user to connect a toolkit, call connect_toolkit and provide the link.",
+    "- If you're unsure what's connected, call list_connections.",
+    "- If you need to know which auth config and toolkit slug will be used, call resolve_toolkit_connection.",
     "",
     "COMPOSIO NAMESPACE:",
-    `- Active namespace: ${args.userId}`,
+    `- The active Composio namespace for this turn is the user's ID: ${args.userId}`,
+    "- All auth links and connected accounts should be treated as belonging to that namespace.",
     "",
-    "FILESYSTEM:",
-    "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
-    "- Use virtual_shell for shell-like operations on the virtual filesystem only.",
-    "- Prefer /workspace for drafts, payloads, notes, JSON, and staging.",
-    "",
-    "MODALITIES:",
-    `- Session asset count available via tools: ${sessionAssets.length}`,
-    "- Use list_session_assets to inspect assets.",
-    "- Use prepare_session_asset first for metadata and upload hints.",
-    "- Use materialize_session_asset only when you truly need persisted content.",
-    "- Request includeInlineData=true only if the target tool requires inline bytes/base64.",
+    "VIRTUAL FILESYSTEM:",
+    "- You have read_virtual_file and write_virtual_file for a Redis-backed virtual filesystem.",
+    "- You also have virtual_shell for shell-like operations against that virtual filesystem only.",
+    "- Prefer virtual filesystem tools for drafting, staging, payload prep, notes, reports, JSON, and scratch work.",
+    "- The virtual filesystem persists in Upstash Redis and is scoped to the current user + session.",
     "",
     "SSH:",
-    "- Use ssh_exec only for real host actions the user wants.",
+    "- You can run SSH via ssh_exec if needed.",
+    "- Prefer ssh_exec only for real host actions the user actually wants.",
     "- If blocked, tell the user to use /ssh <command>.",
     "",
     "SKILLS:",
-    "- Use list_skills or read_skill only when needed.",
+    "- Agent skills are statically inlined in this file and also mounted into virtual files under /workspace/skills/*.md.",
+    "- You can use list_skills and read_skill when useful.",
     "",
     `Mode: ${autonomy}`,
-    "Be concise, accurate, and tool-grounded.",
+    "Be concise and correct. Avoid hallucinations.",
+    "",
+    "Inline skills reference:",
+    renderAllSkillsForPrompt(),
   ].join("\n");
 
   // ============================================================
