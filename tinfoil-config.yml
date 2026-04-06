@@ -4,7 +4,7 @@ memory: 8192
 
 containers:
   - name: "app"
-    image: "docker.io/fruitbox12/dylan:main@sha256:1e2ee4999fdfbd62d79648c1ee9d12a4e2bb81c04120eac3bc52308039371c2b" # e.g. ghcr.io/myorg/my-app:v1.0.0@sha256:abc123...
+    image: "docker.io/fruitbox12/dylan:main@sha256:a5acbae715a79305c5efa30266efcda3cfaf2b76" # updated from latest docker-publish head_sha
     env:
       - PORT: "3000"
     command: ["--port", "3000"]
