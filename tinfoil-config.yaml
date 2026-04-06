@@ -11,8 +11,6 @@ containers:
 
 shim:
   upstream-port: 3000
-shim:
-  upstream-port: 8080
   paths:
     - /
     - /_not-found
