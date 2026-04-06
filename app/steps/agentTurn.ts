@@ -3572,6 +3572,22 @@ export async function agentTurn(args: {
       );
     };
 
+    const upsertToolState = (part: any, patch: Partial<TelegramLiveToolState>) => {
+      const toolCallId = String(part?.toolCallId ?? part?.id ?? "");
+      const prev = toolStates.get(toolCallId) ?? {
+        toolCallId,
+        toolName: String(part?.toolName ?? "tool"),
+        status: "running" as const,
+      };
+
+      toolStates.set(toolCallId, {
+        ...prev,
+        ...patch,
+        toolCallId,
+        toolName: String(part?.toolName ?? patch.toolName ?? prev.toolName ?? "tool"),
+      });
+    };
+
     requestRender();
 
     for await (const part of fullStream) {
@@ -3584,36 +3600,31 @@ export async function agentTurn(args: {
           break;
         }
 
-        case "reasoning": {
+        case "reasoning":
+        case "reasoning-start":
+        case "reasoning-delta": {
           sawReasoning = true;
           requestRender();
           break;
         }
 
+        case "tool-input-start":
         case "tool-call-streaming-start": {
-          const toolCallId = String(part?.toolCallId ?? "");
-          toolStates.set(toolCallId, {
-            toolCallId,
-            toolName: String(part?.toolName ?? "tool"),
+          upsertToolState(part, {
             status: "running",
           });
           requestRender();
           break;
         }
 
+        case "tool-input-delta":
         case "tool-call-delta": {
-          const toolCallId = String(part?.toolCallId ?? "");
-          const prev = toolStates.get(toolCallId) ?? {
-            toolCallId,
-            toolName: String(part?.toolName ?? "tool"),
-            status: "running" as const,
-          };
+          const previousId = String(part?.toolCallId ?? part?.id ?? "");
+          const previous = toolStates.get(previousId);
+          const delta = String(part?.delta ?? part?.argsTextDelta ?? "");
+          const nextArgs = `${previous?.argsPreview ?? ""}${delta}`;
 
-          const nextArgs = `${prev.argsPreview ?? ""}${String(part?.argsTextDelta ?? "")}`;
-
-          toolStates.set(toolCallId, {
-            ...prev,
-            toolName: String(part?.toolName ?? prev.toolName ?? "tool"),
+          upsertToolState(part, {
             status: "running",
             argsPreview: singleLineStatus(nextArgs, 220),
           });
@@ -3621,37 +3632,24 @@ export async function agentTurn(args: {
           break;
         }
 
-        case "tool-call": {
-          const toolCallId = String(part?.toolCallId ?? "");
-          const prev = toolStates.get(toolCallId) ?? {
-            toolCallId,
-            toolName: String(part?.toolName ?? "tool"),
-            status: "running" as const,
-          };
+        case "tool-input-end": {
+          requestRender();
+          break;
+        }
 
-          toolStates.set(toolCallId, {
-            ...prev,
-            toolName: String(part?.toolName ?? prev.toolName ?? "tool"),
+        case "tool-call": {
+          upsertToolState(part, {
             status: "running",
-            argsPreview: summarizeToolPayloadForTelegram(part?.input, 220) || prev.argsPreview,
+            argsPreview: summarizeToolPayloadForTelegram(part?.input ?? part?.args, 220),
           });
           requestRender();
           break;
         }
 
         case "tool-result": {
-          const toolCallId = String(part?.toolCallId ?? "");
-          const prev = toolStates.get(toolCallId) ?? {
-            toolCallId,
-            toolName: String(part?.toolName ?? "tool"),
-            status: "running" as const,
-          };
-
-          toolStates.set(toolCallId, {
-            ...prev,
-            toolName: String(part?.toolName ?? prev.toolName ?? "tool"),
+          upsertToolState(part, {
             status: "done",
-            resultPreview: summarizeToolPayloadForTelegram(part?.output, 180),
+            resultPreview: summarizeToolPayloadForTelegram(part?.output ?? part?.result, 180),
           });
           requestRender();
           break;
@@ -3663,11 +3661,16 @@ export async function agentTurn(args: {
           break;
         }
 
-        case "finish-step": {
+        case "text-delta": {
+          full += String(part?.delta ?? part?.textDelta ?? "");
           requestRender();
           break;
         }
 
+        case "text-start":
+        case "text-end":
+        case "finish-step":
+        case "finish":
         case "error": {
           requestRender();
           break;
@@ -3734,7 +3737,22 @@ export async function agentTurn(args: {
       })
     );
 
-    const text = await streamToTelegram(s.fullStream as AsyncIterable<any>);
+    const streamedText = await streamToTelegram(s.fullStream as AsyncIterable<any>);
+
+    const maybeText = (s as any).text;
+    const fallbackText =
+      typeof maybeText === "string"
+        ? maybeText
+        : maybeText && typeof maybeText.then === "function"
+          ? await maybeText
+          : "";
+
+    const text = String(streamedText || fallbackText || "").trim();
+
+    if (!text) {
+      throw new Error("Streaming completed without assistant text");
+    }
+
     await deliverFinalTelegram(text);
 
     const responseMessages = Array.isArray((await (s as any).response)?.messages)
@@ -3743,6 +3761,7 @@ export async function agentTurn(args: {
 
     return { text, responseMessages, delivered: true };
   }
+
 
   async function runGenerateAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
     const r = await generateText(
