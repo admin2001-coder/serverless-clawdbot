@@ -1,4 +1,4 @@
-cvm-version: <CVM_VERSION>
+cvm-version: 0.7.1
 cpus: 2
 memory: 8192
 
@@ -11,5 +11,29 @@ containers:
 
 shim:
   upstream-port: 3000
+shim:
+  upstream-port: 8080
   paths:
-    - /<YOUR_ENDPOINT>
+    - /
+    - /_not-found
+    - /.well-known/workflow/v1/flow
+    - /.well-known/workflow/v1/step
+    - /.well-known/workflow/v1/webhook/*
+    - /api/claw
+    - /api/ui/autopilot/set-interval
+    - /api/ui/autopilot/set-primary-last
+    - /api/ui/autopilot/start
+    - /api/ui/autopilot/stop
+    - /api/ui/composio/authorize
+    - /api/ui/composio/callback
+    - /api/ui/gateway/clear-token
+    - /api/ui/gateway/regenerate-pairing
+    - /api/ui/login
+    - /api/ui/logout
+    - /api/ui/telegram/delete-webhook
+    - /api/ui/telegram/set-webhook
+    - /api/ui/textbelt/send-test
+    - /api/ui/whatsapp/send-test
+    - /ui
+    - /ui/composio/callback
+    - /ui/login
