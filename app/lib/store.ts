@@ -56,7 +56,6 @@ function ensureEventTargetPolyfill() {
     g.EventTarget = MiniEventTarget;
   }
 
-  // Optional safety: some libs also expect Event
   if (typeof (globalThis as any).Event === "undefined") {
     (globalThis as any).Event = class {
       type: string;
@@ -146,7 +145,7 @@ class UpstashStore implements Store {
     if (this.redisPromise) return this.redisPromise;
 
     this.redisPromise = (async () => {
-      ensureEventTargetPolyfill(); // MUST happen before importing @upstash/redis in workflow VM
+      ensureEventTargetPolyfill();
       const mod = await import("@upstash/redis");
       const RedisCtor = (mod as any).Redis;
       return new RedisCtor({ url: this.url, token: this.token });
@@ -193,18 +192,43 @@ class UpstashStore implements Store {
     const r = await this.redis();
     await r.zadd(key, { score, member } as any);
   }
-  async zrangebyscore(key: string, min: number, max: number, opts?: { limit?: number }): Promise<string[]> {
-    const r = await this.redis();
+
+  async zrangebyscore(
+    key: string,
+    min: number,
+    max: number,
+    opts?: { limit?: number }
+  ): Promise<string[]> {
+    const r: any = await this.redis();
     const limit = opts?.limit;
 
-    const v = await (r as any).zrangebyscore(key, min, max, ...(limit != null ? ["LIMIT", 0, limit] : []));
+    let v: unknown;
 
-    if (Array.isArray(v)) {
-      if (v.length > 0 && Array.isArray(v[0])) return v.map((t: any) => String(t[0]));
-      return v.map((x: any) => String(x));
+    if (typeof r.zrange === "function") {
+      v = await r.zrange(key, min, max, {
+        byScore: true,
+        ...(limit != null ? { offset: 0, count: limit } : {}),
+      });
+    } else if (typeof r.zrangebyscore === "function") {
+      v = await r.zrangebyscore(
+        key,
+        min,
+        max,
+        ...(limit != null ? ["LIMIT", 0, limit] : [])
+      );
+    } else {
+      throw new TypeError("Redis client does not support zrange/zrangebyscore");
     }
-    return [];
+
+    if (!Array.isArray(v)) return [];
+
+    if (v.length > 0 && Array.isArray(v[0])) {
+      return v.map((row: any) => String(row[0]));
+    }
+
+    return v.map((x: any) => String(x));
   }
+
   async zrem(key: string, member: string): Promise<void> {
     const r = await this.redis();
     await r.zrem(key, member);
