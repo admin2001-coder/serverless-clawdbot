@@ -1,79 +1,56 @@
 name: Docker
 
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
 on:
   schedule:
     - cron: '30 11 * * *'
   push:
     branches: [ "main" ]
-    # Publish semver tags as releases.
     tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ "main" ]
 
 env:
-  # Use docker.io for Docker Hub if empty
   REGISTRY: docker.io
-  # github.repository as <account>/<repo>
   IMAGE_NAME: fruitbox12/dylan
-
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      # This is used to complete the identity challenge
-      # with sigstore/fulcio when running outside of PRs.
       id-token: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Install the cosign tool except on PR
-      # https://github.com/sigstore/cosign-installer
       - name: Install cosign
         if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 #v3.5.0
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20
         with:
           cosign-release: 'v2.2.4'
 
-      # Set up BuildKit Docker container builder to be able to build
-      # multi-platform images and export cache
-      # https://github.com/docker/setup-buildx-action
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226
 
-      # Login against a Docker registry except on PR
-      # https://github.com/docker/login-action
       - name: Log into registry ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d
         with:
           registry: ${{ env.REGISTRY }}
           username: fruitbox12
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
-      # Build and push Docker image with Buildx (don't push on PR)
-      # https://github.com/docker/build-push-action
       - name: Build and push Docker image
         id: build-and-push
-        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
@@ -81,18 +58,38 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            APP_BASE_URL=${{ secrets.APP_BASE_URL }}
+            TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+            TELEGRAM_WEBHOOK_SECRET=${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+            WHATSAPP_ACCESS_TOKEN=${{ secrets.WHATSAPP_ACCESS_TOKEN }}
+            WHATSAPP_PHONE_NUMBER_ID=${{ secrets.WHATSAPP_PHONE_NUMBER_ID }}
+            WHATSAPP_VERIFY_TOKEN=${{ secrets.WHATSAPP_VERIFY_TOKEN }}
+            QSTASH_URL=${{ secrets.QSTASH_URL }}
+            QSTASH_TOKEN=${{ secrets.QSTASH_TOKEN }}
+            QSTASH_NEXT_SIGNING_KEY=${{ secrets.QSTASH_NEXT_SIGNING_KEY }}
+            QSTASH_CURRENT_SIGNING_KEY=${{ secrets.QSTASH_CURRENT_SIGNING_KEY }}
+            UPSTASH_REDIS_REST_URL=${{ secrets.UPSTASH_REDIS_REST_URL }}
+            UPSTASH_REDIS_REST_TOKEN=${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+            COMPOSIO_API_KEY=${{ secrets.COMPOSIO_API_KEY }}
+            COMPOSIO_CALLBACK_URL=${{ secrets.COMPOSIO_CALLBACK_URL }}
+            FAST_MODEL_NAME=${{ secrets.FAST_MODEL_NAME }}
+            SMART_MODEL_NAME=${{ secrets.SMART_MODEL_NAME }}
+            MODEL_TEMPERATURE=${{ secrets.MODEL_TEMPERATURE }}
+            TELEGRAM_ALLOWED_USERS=${{ secrets.TELEGRAM_ALLOWED_USERS }}
+            WHATSAPP_ALLOWED_NUMBERS=${{ secrets.WHATSAPP_ALLOWED_NUMBERS }}
+            SMS_ALLOWED_NUMBERS=${{ secrets.SMS_ALLOWED_NUMBERS }}
+            TELEGRAM_STREAMING=${{ secrets.TELEGRAM_STREAMING }}
+            TELEGRAM_STREAM_EDIT_THROTTLE_MS=${{ secrets.TELEGRAM_STREAM_EDIT_THROTTLE_MS }}
+            TELEGRAM_TYPING_INTERVAL_MS=${{ secrets.TELEGRAM_TYPING_INTERVAL_MS }}
+            TELEGRAM_STREAM_CHUNK_CHARS=${{ secrets.TELEGRAM_STREAM_CHUNK_CHARS }}
+            SSH_HOST=${{ secrets.SSH_HOST }}
+            SSH_USER=${{ secrets.SSH_USER }}
+            SSH_PRIVATE_KEY_B64=${{ secrets.SSH_PRIVATE_KEY_B64 }}
 
-      # Sign the resulting Docker image digest except on PRs.
-      # This will only write to the public Rekor transparency log when the Docker
-      # repository is public to avoid leaking data.  If you would like to publish
-      # transparency data even for private images, pass --force to cosign below.
-      # https://github.com/sigstore/cosign
       - name: Sign the published Docker image
         if: ${{ github.event_name != 'pull_request' }}
         env:
-          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        # This step uses the identity token to provision an ephemeral certificate
-        # against the sigstore community Fulcio instance.
         run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
