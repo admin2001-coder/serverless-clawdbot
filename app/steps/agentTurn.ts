@@ -813,6 +813,90 @@ function splitForTelegram(text: string, maxChars: number): string[] {
   return out.length ? out : ["…"];
 }
 
+function truncateForTelegramLive(text: string, maxChars: number): string {
+  const t = clampNonEmptyText(text);
+  if (t.length <= maxChars) return t;
+  const keep = Math.max(80, maxChars - 24);
+  return `${t.slice(0, keep)}\n...[live truncated]`;
+}
+
+function singleLineStatus(text: unknown, maxChars = 220): string {
+  return truncateText(String(text ?? "").replace(/\s+/g, " ").trim(), maxChars);
+}
+
+function summarizeToolPayloadForTelegram(value: unknown, maxChars = 220): string {
+  if (value == null) return "";
+  const raw = typeof value === "string" ? value : toSafeJson(value);
+  return singleLineStatus(raw, maxChars);
+}
+
+type TelegramLiveToolState = {
+  toolCallId: string;
+  toolName: string;
+  status: "running" | "done";
+  argsPreview?: string;
+  resultPreview?: string;
+};
+
+function renderTelegramStatus(args: {
+  stepNumber: number;
+  sawReasoning: boolean;
+  tools: TelegramLiveToolState[];
+}): string {
+  const active = args.tools.filter((tool) => tool.status === "running");
+  const done = args.tools.filter((tool) => tool.status === "done").slice(-2);
+
+  const lines: string[] = [args.sawReasoning ? "Thinking…" : "Working…"];
+
+  if (args.stepNumber > 0) {
+    lines.push(`Step ${args.stepNumber}`);
+  }
+
+  if (active.length) {
+    for (const tool of active) {
+      lines.push(`⏳ ${tool.toolName}`);
+      if (tool.argsPreview) lines.push(`↳ ${tool.argsPreview}`);
+    }
+    return lines.join("\n");
+  }
+
+  if (done.length) {
+    for (const tool of done) {
+      lines.push(`✅ ${tool.toolName}`);
+    }
+    return lines.join("\n");
+  }
+
+  lines.push("Preparing response…");
+  return lines.join("\n");
+}
+
+function renderTelegramLiveText(args: {
+  fullText: string;
+  stepNumber: number;
+  sawReasoning: boolean;
+  tools: TelegramLiveToolState[];
+  maxChars: number;
+}): string {
+  const statusText = renderTelegramStatus({
+    stepNumber: args.stepNumber,
+    sawReasoning: args.sawReasoning,
+    tools: args.tools,
+  });
+
+  const hasActiveTools = args.tools.some((tool) => tool.status === "running");
+
+  if (!args.fullText.trim()) {
+    return truncateForTelegramLive(statusText, args.maxChars);
+  }
+
+  if (!hasActiveTools) {
+    return truncateForTelegramLive(args.fullText, args.maxChars);
+  }
+
+  return truncateForTelegramLive(`${args.fullText}\n\n—\n${statusText}`, args.maxChars);
+}
+
 // ============================================================
 // Inline skill system
 // ============================================================
@@ -3463,17 +3547,135 @@ export async function agentTurn(args: {
     return { delivered: true };
   }
 
-  async function streamToTelegram(textStream: AsyncIterable<string>): Promise<string> {
+  async function streamToTelegram(fullStream: AsyncIterable<any>): Promise<string> {
     let full = "";
+    let stepNumber = 0;
+    let sawReasoning = false;
+
+    const toolStates = new Map<string, TelegramLiveToolState>();
+
     const editor = createEditCoalescer({
       sessionId: args.sessionId,
       messageId: placeholderMsgId!,
       throttleMs: editThrottleMs,
     });
 
-    for await (const delta of textStream) {
-      full += delta;
-      editor.request(full.slice(0, maxEditChars));
+    const requestRender = () => {
+      editor.request(
+        renderTelegramLiveText({
+          fullText: full,
+          stepNumber,
+          sawReasoning,
+          tools: Array.from(toolStates.values()),
+          maxChars: maxEditChars,
+        })
+      );
+    };
+
+    requestRender();
+
+    for await (const part of fullStream) {
+      const type = String(part?.type ?? "");
+
+      switch (type) {
+        case "start-step": {
+          stepNumber += 1;
+          requestRender();
+          break;
+        }
+
+        case "reasoning": {
+          sawReasoning = true;
+          requestRender();
+          break;
+        }
+
+        case "tool-call-streaming-start": {
+          const toolCallId = String(part?.toolCallId ?? "");
+          toolStates.set(toolCallId, {
+            toolCallId,
+            toolName: String(part?.toolName ?? "tool"),
+            status: "running",
+          });
+          requestRender();
+          break;
+        }
+
+        case "tool-call-delta": {
+          const toolCallId = String(part?.toolCallId ?? "");
+          const prev = toolStates.get(toolCallId) ?? {
+            toolCallId,
+            toolName: String(part?.toolName ?? "tool"),
+            status: "running" as const,
+          };
+
+          const nextArgs = `${prev.argsPreview ?? ""}${String(part?.argsTextDelta ?? "")}`;
+
+          toolStates.set(toolCallId, {
+            ...prev,
+            toolName: String(part?.toolName ?? prev.toolName ?? "tool"),
+            status: "running",
+            argsPreview: singleLineStatus(nextArgs, 220),
+          });
+          requestRender();
+          break;
+        }
+
+        case "tool-call": {
+          const toolCallId = String(part?.toolCallId ?? "");
+          const prev = toolStates.get(toolCallId) ?? {
+            toolCallId,
+            toolName: String(part?.toolName ?? "tool"),
+            status: "running" as const,
+          };
+
+          toolStates.set(toolCallId, {
+            ...prev,
+            toolName: String(part?.toolName ?? prev.toolName ?? "tool"),
+            status: "running",
+            argsPreview: summarizeToolPayloadForTelegram(part?.input, 220) || prev.argsPreview,
+          });
+          requestRender();
+          break;
+        }
+
+        case "tool-result": {
+          const toolCallId = String(part?.toolCallId ?? "");
+          const prev = toolStates.get(toolCallId) ?? {
+            toolCallId,
+            toolName: String(part?.toolName ?? "tool"),
+            status: "running" as const,
+          };
+
+          toolStates.set(toolCallId, {
+            ...prev,
+            toolName: String(part?.toolName ?? prev.toolName ?? "tool"),
+            status: "done",
+            resultPreview: summarizeToolPayloadForTelegram(part?.output, 180),
+          });
+          requestRender();
+          break;
+        }
+
+        case "text": {
+          full += String(part?.text ?? "");
+          requestRender();
+          break;
+        }
+
+        case "finish-step": {
+          requestRender();
+          break;
+        }
+
+        case "error": {
+          requestRender();
+          break;
+        }
+
+        default:
+          break;
+      }
     }
 
     await editor.flush();
@@ -3532,9 +3734,14 @@ export async function agentTurn(args: {
       })
     );
 
-    const text = await streamToTelegram(s.textStream);
+    const text = await streamToTelegram(s.fullStream as AsyncIterable<any>);
     await deliverFinalTelegram(text);
-    return { text, responseMessages: [] as any[], delivered: true };
+
+    const responseMessages = Array.isArray((await (s as any).response)?.messages)
+      ? ((await (s as any).response).messages as any[])
+      : [];
+
+    return { text, responseMessages, delivered: true };
   }
 
   async function runGenerateAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
@@ -3555,7 +3762,7 @@ export async function agentTurn(args: {
   try {
     if (telegramStreamingEnabled) {
       typingLoop = telegramStartChatActionLoop(args.sessionId, "typing", { intervalMs: typingIntervalMs });
-      placeholderMsgId = await telegramSendMessage(args.sessionId, "…", { disableNotification: true });
+      placeholderMsgId = await telegramSendMessage(args.sessionId, "Thinking…", { disableNotification: true });
 
       try {
         return await runStreamingAttempt(primaryMessages, tools);
