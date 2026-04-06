@@ -1,0 +1,51 @@
+name: Build and Attest
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+      - uses: tinfoilsh/pri-build-action@5d450a7f30904866efc401e24484b935b7ed52dd # v0.6.1
+        with:
+          config-file: ${{ github.workspace }}/tinfoil-config.yml
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: "true"
+          build-args: |
+            APP_BASE_URL=${{ secrets.APP_BASE_URL }}
+            TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+            TELEGRAM_WEBHOOK_SECRET=${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+            WHATSAPP_ACCESS_TOKEN=${{ secrets.WHATSAPP_ACCESS_TOKEN }}
+            WHATSAPP_PHONE_NUMBER_ID=${{ secrets.WHATSAPP_PHONE_NUMBER_ID }}
+            WHATSAPP_VERIFY_TOKEN=${{ secrets.WHATSAPP_VERIFY_TOKEN }}
+            QSTASH_URL=${{ secrets.QSTASH_URL }}
+            QSTASH_TOKEN=${{ secrets.QSTASH_TOKEN }}
+            QSTASH_NEXT_SIGNING_KEY=${{ secrets.QSTASH_NEXT_SIGNING_KEY }}
+            QSTASH_CURRENT_SIGNING_KEY=${{ secrets.QSTASH_CURRENT_SIGNING_KEY }}
+            UPSTASH_REDIS_REST_URL=${{ secrets.UPSTASH_REDIS_REST_URL }}
+            UPSTASH_REDIS_REST_TOKEN=${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+            COMPOSIO_API_KEY=${{ secrets.COMPOSIO_API_KEY }}
+            COMPOSIO_CALLBACK_URL=${{ secrets.COMPOSIO_CALLBACK_URL }}
+            FAST_MODEL_NAME=${{ secrets.FAST_MODEL_NAME }}
+            SMART_MODEL_NAME=${{ secrets.SMART_MODEL_NAME }}
+            MODEL_TEMPERATURE=${{ secrets.MODEL_TEMPERATURE }}
+            TELEGRAM_ALLOWED_USERS=${{ secrets.TELEGRAM_ALLOWED_USERS }}
+            WHATSAPP_ALLOWED_NUMBERS=${{ secrets.WHATSAPP_ALLOWED_NUMBERS }}
+            SMS_ALLOWED_NUMBERS=${{ secrets.SMS_ALLOWED_NUMBERS }}
+            TELEGRAM_STREAMING=${{ secrets.TELEGRAM_STREAMING }}
+            TELEGRAM_STREAM_EDIT_THROTTLE_MS=${{ secrets.TELEGRAM_STREAM_EDIT_THROTTLE_MS }}
+            TELEGRAM_TYPING_INTERVAL_MS=${{ secrets.TELEGRAM_TYPING_INTERVAL_MS }}
+            TELEGRAM_STREAM_CHUNK_CHARS=${{ secrets.TELEGRAM_STREAM_CHUNK_CHARS }}
+            SSH_HOST=${{ secrets.SSH_HOST }}
+            SSH_USER=${{ secrets.SSH_USER }}
+            SSH_PRIVATE_KEY_B64=${{ secrets.SSH_PRIVATE_KEY_B64 }}
