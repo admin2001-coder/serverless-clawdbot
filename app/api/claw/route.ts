@@ -38,6 +38,19 @@ function jsonOk(extra: any = {}) {
   return NextResponse.json({ ok: true, ...extra });
 }
 
+async function handleCronTrigger() {
+  const store = getStore();
+  const lockKey = "daemon:lock";
+  const acquired = await store.set(lockKey, String(Date.now()), { exSeconds: 70, nx: true });
+
+  if (acquired) {
+    await start(daemonWorkflow, []);
+    return jsonOk({ started: true, acquiredLock: true });
+  }
+
+  return jsonOk({ started: false, acquiredLock: false });
+}
+
 function isStopCmd(text: string) {
   const t = (text ?? "").trim().toLowerCase();
   return t === "/stop" || t === "stop";
@@ -111,11 +124,9 @@ async function maybeHandleChatPairingCommand(msg: InboundMessage): Promise<boole
 }
 
 // ============================================================
-// Workflow routing  ✅ FIX: no inboundHook.resume
+// Workflow routing
 // ============================================================
 async function routeToSession(msg: InboundMessage): Promise<void> {
-  // Always start a fresh workflow per inbound message.
-  // This avoids hook-token conflicts and "nothing happens" issues.
   await start(sessionWorkflow, [msg.sessionId, msg]);
 }
 
@@ -221,6 +232,10 @@ export async function GET(req: Request) {
 
   if (op === "health") return jsonOk({ ts: Date.now() });
 
+  if (op === "cron") {
+    return handleCronTrigger();
+  }
+
   if (op === "whatsapp") {
     const v = whatsappVerifyChallenge(url);
     if (v.ok) return new Response(v.challenge ?? "", { status: 200 });
@@ -259,6 +274,7 @@ export async function GET(req: Request) {
 
     return new Response(res.body, { status: 200, headers });
   }
+
   if (op === "webhook") {
     const ok = await verifyGatewayBearer(req);
     if (!ok) return new Response("Unauthorized", { status: 401 });
@@ -313,7 +329,6 @@ export async function GET(req: Request) {
     const update = await req.json().catch(() => null);
     if (!update) return new Response("Bad JSON", { status: 400 });
 
-    // ✅ Dedupe Telegram retries
     const updateId = (update as any)?.update_id;
     if (typeof updateId === "number") {
       const store = getStore();
@@ -326,6 +341,7 @@ export async function GET(req: Request) {
     if (msg) await handleInbound(msg);
     return jsonOk();
   }
+
   return new Response("Not found", { status: 404 });
 }
 
@@ -337,16 +353,7 @@ export async function POST(req: Request) {
   const op = url.searchParams.get("op");
 
   if (op === "cron") {
-    const store = getStore();
-    const lockKey = "daemon:lock";
-    const acquired = await store.set(lockKey, String(Date.now()), { exSeconds: 70, nx: true });
-
-    if (acquired) {
-      await start(daemonWorkflow, []);
-      return jsonOk({ started: true, acquiredLock: true });
-    }
-
-    return jsonOk({ started: false, acquiredLock: false });
+    return handleCronTrigger();
   }
 
   if (op === "pair") {
@@ -415,7 +422,6 @@ export async function POST(req: Request) {
     const update = await req.json().catch(() => null);
     if (!update) return new Response("Bad JSON", { status: 400 });
 
-    // ✅ Dedupe Telegram retries
     const updateId = (update as any)?.update_id;
     if (typeof updateId === "number") {
       const store = getStore();
@@ -457,7 +463,6 @@ export async function POST(req: Request) {
     const raw = await req.text();
     const sig = req.headers.get("x-hub-signature-256");
 
-    // ✅ MUST await (async verifier)
     if (!(await verifyWhatsAppSignature(raw, sig))) {
       return new Response("Invalid signature", { status: 401 });
     }
