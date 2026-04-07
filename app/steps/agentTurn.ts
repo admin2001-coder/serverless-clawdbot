@@ -3040,12 +3040,19 @@ async function composioConnectToolkitByName(userId: string, toolkitInput: string
 // ============================================================
 // Telegram streaming coalescer
 // ============================================================
-function createEditCoalescer(opts: { sessionId: string; messageId: number; throttleMs: number }) {
+function createEditCoalescer(opts: {
+  sessionId: string;
+  messageId: number;
+  throttleMs: number;
+}) {
   let lastSent = "";
   let lastAt = 0;
 
   let inflight: Promise<void> | null = null;
-  let pending: string | null = null;
+  let pendingStatus: string | null = null;
+  let typewriterTarget: string | null = null;
+  let displayedTypewriterText = "";
+  let mode: "status" | "typewriter" = "status";
 
   async function doEdit(text: string) {
     const t = clampNonEmptyText(text);
@@ -3064,25 +3071,77 @@ function createEditCoalescer(opts: { sessionId: string; messageId: number; throt
     }
   }
 
-  async function worker() {
-    while (pending !== null) {
-      const t = pending;
-      pending = null;
-      await doEdit(t);
+  function nextTypewriterFrame(target: string): string {
+    const charsPerTick = 12;
+
+    if (!displayedTypewriterText) {
+      return target.slice(0, charsPerTick);
     }
+    if (!target.startsWith(displayedTypewriterText)) {
+      return target;
+    }
+    return target.slice(0, Math.min(target.length, displayedTypewriterText.length + charsPerTick));
+  }
+
+  async function worker() {
+    while (true) {
+      if (mode === "typewriter" && typewriterTarget !== null) {
+        const target = clampNonEmptyText(typewriterTarget);
+
+        if (displayedTypewriterText !== target) {
+          const next = nextTypewriterFrame(target);
+          await doEdit(next);
+          displayedTypewriterText = next;
+          continue;
+        }
+      }
+
+      if (pendingStatus !== null && (mode !== "typewriter" || !typewriterTarget)) {
+        const t = pendingStatus;
+        pendingStatus = null;
+        await doEdit(t);
+        continue;
+      }
+
+      break;
+    }
+
     inflight = null;
   }
 
   return {
-    request(text: string) {
-      pending = text;
+    requestStatus(text: string) {
+      if (mode === "typewriter" && typewriterTarget) return;
+      pendingStatus = text;
+      if (!inflight) inflight = worker();
+    },
+    requestTypewriter(text: string) {
+      mode = "typewriter";
+      typewriterTarget = clampNonEmptyText(text);
+
+      if (!displayedTypewriterText || !typewriterTarget.startsWith(displayedTypewriterText)) {
+        displayedTypewriterText = "";
+      }
+
       if (!inflight) inflight = worker();
     },
     async flush() {
-      if (inflight) await inflight;
-      if (pending !== null) {
-        const t = pending;
-        pending = null;
+      while (inflight) {
+        await inflight;
+      }
+
+      if (mode === "typewriter" && typewriterTarget !== null) {
+        const target = clampNonEmptyText(typewriterTarget);
+        if (lastSent !== target) {
+          await doEdit(target);
+          displayedTypewriterText = target;
+        }
+        return;
+      }
+
+      if (pendingStatus !== null) {
+        const t = pendingStatus;
+        pendingStatus = null;
         await doEdit(t);
       }
     },
@@ -3137,7 +3196,7 @@ export async function agentTurn(args: {
   const telegramStreamingEnabled =
     isTelegram && (args.showTyping ?? true) && (env("TELEGRAM_STREAMING") ?? "true") !== "false";
 
-  const editThrottleMs = Math.max(250, Number(env("TELEGRAM_STREAM_EDIT_THROTTLE_MS") ?? 750));
+  const editThrottleMs = 120;
   const typingIntervalMs = Math.max(1000, Number(env("TELEGRAM_TYPING_INTERVAL_MS") ?? 4000));
   const maxEditChars = Math.max(800, Math.min(3800, Number(env("TELEGRAM_STREAM_CHUNK_CHARS") ?? 3500)));
 
@@ -3561,14 +3620,20 @@ export async function agentTurn(args: {
     });
 
     const requestRender = () => {
-      editor.request(
-        renderTelegramLiveText({
-          fullText: full,
-          stepNumber,
-          sawReasoning,
-          tools: Array.from(toolStates.values()),
-          maxChars: maxEditChars,
-        })
+      if (full.length > 0) {
+        editor.requestTypewriter(truncateForTelegramLive(full, maxEditChars));
+        return;
+      }
+
+      editor.requestStatus(
+        truncateForTelegramLive(
+          renderTelegramStatus({
+            stepNumber,
+            sawReasoning,
+            tools: Array.from(toolStates.values()),
+          }),
+          maxEditChars
+        )
       );
     };
 
