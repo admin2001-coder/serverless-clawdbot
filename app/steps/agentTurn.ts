@@ -411,7 +411,6 @@ function inferMimeFromFilename(name: string): string {
     md: "text/markdown",
     csv: "text/csv",
     zip: "application/zip",
-    json: "application/json",
   };
   return map[ext] ?? "application/octet-stream";
 }
