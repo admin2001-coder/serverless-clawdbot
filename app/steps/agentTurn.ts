@@ -2720,7 +2720,7 @@ function tokenizeForToolSelection(input: string): string[] {
 }
 
 function looksLikeExternalActionRequest(text: string): boolean {
-  return /\b(connect|authorize|login|send|email|mail|calendar|schedule|upload|download|create|update|delete|post|publish|tweet|message|slack|github|gitlab|drive|docs|sheets|notion|jira|linear|discord|whatsapp|telegram|sms|crm|hubspot|salesforce)\b/i.test(
+  return /\b(connect|authorize|login|send|email|mail|calendar|schedule|upload|download|create|update|delete|post|publish|tweet|message|share|comment|article|social|linkedin|slack|github|gitlab|drive|docs|sheets|notion|jira|linear|discord|whatsapp|telegram|sms|crm|hubspot|salesforce)\b/i.test(
     String(text ?? "")
   );
 }
@@ -2768,6 +2768,13 @@ function scoreComposioToolForTurn(toolName: string, toolDef: any, userText: stri
     /\b(google|drive|docs|sheets|spreadsheet|document)\b/.test(haystack)
   ) {
     score += 6;
+  }
+
+  if (
+    /\b(linkedin|social|article|share|comment|company page|organization page|thought leadership)\b/.test(lowerUserText) &&
+    /\b(linkedin|share|comment|article|organization|company|post)\b/.test(haystack)
+  ) {
+    score += 8;
   }
 
   return score;
@@ -2847,7 +2854,7 @@ async function getComposioToolsForUser(userId: string): Promise<ToolSet> {
     if (cached && cached.expiresAt > now) return cached.tools;
   }
 
-  const userScoped = await composio.create(userId, { manageConnections: false } as any);
+  const userScoped = await createComposioSessionForUser(userId);
   const tools = (await userScoped.tools()) as ToolSet;
   const filtered = filterComposioTools(tools);
 
@@ -2976,11 +2983,83 @@ async function composioGetAuthConfigById(authConfigId: string): Promise<Composio
   return toAuthConfigSummary(payload);
 }
 
+function compareComposioAuthConfigs(a: ComposioAuthConfigSummary, b: ComposioAuthConfigSummary): number {
+  const aRouter = a.isEnabledForToolRouter === true ? 1 : 0;
+  const bRouter = b.isEnabledForToolRouter === true ? 1 : 0;
+  if (bRouter !== aRouter) return bRouter - aRouter;
+
+  const aConnections = typeof a.noOfConnections === "number" ? a.noOfConnections : -1;
+  const bConnections = typeof b.noOfConnections === "number" ? b.noOfConnections : -1;
+  if (bConnections !== aConnections) return bConnections - aConnections;
+
+  const aCustom = a.isComposioManaged ? 0 : 1;
+  const bCustom = b.isComposioManaged ? 0 : 1;
+  if (bCustom !== aCustom) return bCustom - aCustom;
+
+  const aName = String(a.name ?? "").toLowerCase();
+  const bName = String(b.name ?? "").toLowerCase();
+  if (aName !== bName) return aName.localeCompare(bName);
+
+  return a.id.localeCompare(b.id);
+}
+
+function pickPreferredAuthConfigForToolkit(
+  configs: ComposioAuthConfigSummary[]
+): ComposioAuthConfigSummary | null {
+  const enabled = configs.filter((config) => isAuthConfigEnabled(config.status));
+  if (!enabled.length) return null;
+  return [...enabled].sort(compareComposioAuthConfigs)[0] ?? null;
+}
+
+async function composioBuildSessionAuthConfigMap(): Promise<Record<string, string>> {
+  const configs = await composioListAllAuthConfigs({ showDisabled: true });
+  const byToolkit = new Map<string, ComposioAuthConfigSummary[]>();
+
+  for (const config of configs) {
+    const toolkit = String(config.toolkit ?? "").trim().toLowerCase();
+    if (!toolkit) continue;
+    const list = byToolkit.get(toolkit) ?? [];
+    list.push(config);
+    byToolkit.set(toolkit, list);
+  }
+
+  const out: Record<string, string> = {};
+
+  for (const [toolkit, items] of byToolkit.entries()) {
+    const explicit = resolveExplicitToolkitAuthConfigId(toolkit);
+    if (explicit) {
+      out[toolkit] = explicit;
+      continue;
+    }
+
+    const picked = pickPreferredAuthConfigForToolkit(items);
+    if (picked) {
+      out[toolkit] = picked.id;
+    }
+  }
+
+  return out;
+}
+
+async function createComposioSessionForUser(userId: string) {
+  const authConfigs = await composioBuildSessionAuthConfigMap().catch(() => ({} as Record<string, string>));
+
+  const options: any = {
+    manageConnections: false,
+  };
+
+  if (Object.keys(authConfigs).length) {
+    options.authConfigs = authConfigs;
+  }
+
+  return await composio.create(userId, options);
+}
+
 async function composioResolveToolkitSlug(userId: string, toolkitInput: string) {
   const wanted = aliasToolkitQuery(toolkitInput);
   const wantedNorm = wanted.replace(/\s+/g, "");
 
-  const userScoped = await composio.create(userId, { manageConnections: false } as any);
+  const userScoped = await createComposioSessionForUser(userId);
   const toolkits: any = await userScoped.toolkits();
   const items: any[] = toolkits?.items ?? [];
 
@@ -3029,7 +3108,7 @@ async function composioResolveToolkitSlug(userId: string, toolkitInput: string) 
 }
 
 async function composioListConnections(userId: string) {
-  const userScoped = await composio.create(userId, { manageConnections: false } as any);
+  const userScoped = await createComposioSessionForUser(userId);
   const toolkits: any = await userScoped.toolkits();
   const items: any[] = toolkits?.items ?? [];
 
@@ -3057,7 +3136,7 @@ async function composioListConnections(userId: string) {
   };
 }
 
-function resolveConfiguredAuthConfigId(toolkitSlug: string): string | undefined {
+function resolveExplicitToolkitAuthConfigId(toolkitSlug: string): string | undefined {
   const slugKey = normalizeToolkitKey(toolkitSlug);
   const directEnvKey = `COMPOSIO_AUTH_CONFIG_${slugKey.toUpperCase()}`;
   const direct = env(directEnvKey);
@@ -3078,7 +3157,16 @@ function resolveConfiguredAuthConfigId(toolkitSlug: string): string | undefined 
     }
   }
 
-  return env("COMPOSIO_DEFAULT_AUTH_CONFIG_ID") || env("COMPOSIO_DEFAULT_AUTHCONFIG_ID") || undefined;
+  return undefined;
+}
+
+function resolveConfiguredAuthConfigId(toolkitSlug: string): string | undefined {
+  return (
+    resolveExplicitToolkitAuthConfigId(toolkitSlug) ||
+    env("COMPOSIO_DEFAULT_AUTH_CONFIG_ID") ||
+    env("COMPOSIO_DEFAULT_AUTHCONFIG_ID") ||
+    undefined
+  );
 }
 
 async function composioResolveToolkitAndAuthConfig(userId: string, toolkitInput: string) {
@@ -3313,7 +3401,7 @@ function createEditCoalescer(opts: {
   }
 
   function nextTypewriterFrame(target: string): string {
-    const charsPerTick = 6;
+    const charsPerTick = 4;
 
     if (!displayedTypewriterText) {
       return target.slice(0, charsPerTick);
