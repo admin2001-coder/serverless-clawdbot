@@ -33,7 +33,13 @@ const composio = new Composio({
   provider: new VercelProvider(),
 });
 
-const composioToolsCache = new Map<string, { tools: ToolSet; expiresAt: number }>();
+type ComposioSessionOverrides = {
+  toolkits?: string[] | { enable?: string[]; disable?: string[] };
+  authConfigs?: Record<string, string>;
+  connectedAccounts?: Record<string, string>;
+  manageConnections?: boolean | { callbackUrl?: string };
+};
+
 
 // ============================================================
 // Upstash Redis-backed VFS
@@ -293,6 +299,13 @@ function normalizeSkillName(raw: string): string {
     .replace(/[^a-z0-9_-]/g, "");
 }
 
+function normalizeToolkitKey(raw: string): string {
+  return String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
 
 function sanitizePath(inputPath: string): string {
   let p = String(inputPath ?? "").trim();
@@ -567,13 +580,13 @@ function coerceAssetSource(payload: unknown): {
   }
 
   if (Array.isArray(payload) && payload.every((x) => typeof x === "number")) {
-    const bytes = new Uint8Array(payload);
+    const bytes = new Uint8Array(payload as ArrayLike<number>);
     const base64 = bytesToBase64(bytes);
     return { source: "base64", base64, sizeBytes: payload.length };
   }
 
   if (typeof Buffer !== "undefined" && Buffer.isBuffer(payload)) {
-    const bytes = new Uint8Array(payload);
+    const bytes = new Uint8Array(payload as ArrayLike<number>);
     const base64 = bytesToBase64(bytes);
     return { source: "base64", base64, sizeBytes: bytes.byteLength };
   }
@@ -917,9 +930,9 @@ const INLINE_SKILLS: Record<string, InlineSkill> = {
     whenToUse: "Use when the user wants to act on external services through Composio or connect a toolkit.",
     guidance: [
       "Namespace all Composio actions to the user ID passed into this agent turn.",
-      "Prefer Composio session tools and meta tools for dynamic discovery, routing, auth, and execution.",
-      "Use list_connections or resolve_toolkit_connection for diagnostics when connectivity is unclear.",
-      "Use connect_toolkit only when you explicitly need to generate a manual auth link.",
+      "Use the Composio session meta tools for discovery, authentication, and execution at runtime.",
+      "Let the active Composio project/session determine available toolkits, auth configs, and connected accounts.",
+      "Do not pre-route toolkits with keyword scoring or hard-coded auth-config lookups.",
       "Do not fabricate external side effects.",
     ],
   },
@@ -1361,11 +1374,12 @@ function parseVirtualShell(input: string): { ok: true; result: any } | { ok: fal
 
 async function execVirtualShell(rt: VirtualRuntime, input: string) {
   const parsed = parseVirtualShell(input);
-  if (!parsed.ok) {
+  if (parsed.ok === false) {
+    const parseError = parsed.error;
     return {
       ok: false,
       stdout: "",
-      stderr: parsed.error,
+      stderr: parseError,
       exitCode: 2,
     };
   }
@@ -2360,6 +2374,81 @@ async function resolveAssetForToolExecution(args: {
   };
 }
 
+function isComposioMetaToolSlug(toolSlug: string | null | undefined): boolean {
+  return normalizeComposioToolSlug(toolSlug ?? "").startsWith("COMPOSIO_");
+}
+
+function isComposioExecutionMetaTool(toolSlug: string | null | undefined): boolean {
+  const slug = normalizeComposioToolSlug(toolSlug ?? "");
+  return slug === "COMPOSIO_MULTI_EXECUTE_TOOL" || slug === "COMPOSIO_EXECUTE_TOOL";
+}
+
+function normalizePotentialToolSlug(value: unknown): string | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+
+  const normalized = normalizeComposioToolSlug(raw);
+  return normalized || null;
+}
+
+function extractTargetToolSlugFromExecutionPayload(input: Record<string, any>): string | null {
+  const direct = pickFirstDefined(
+    typeof input.tool === "string" ? input.tool : undefined,
+    typeof input.toolSlug === "string" ? input.toolSlug : undefined,
+    typeof input.tool_slug === "string" ? input.tool_slug : undefined,
+    typeof input.slug === "string" ? input.slug : undefined
+  );
+
+  const directSlug = normalizePotentialToolSlug(direct);
+  if (directSlug && !isComposioMetaToolSlug(directSlug)) {
+    return directSlug;
+  }
+
+  for (const key of ["tools", "calls", "executions", "requests", "operations"] as const) {
+    const list = input[key];
+    if (!Array.isArray(list)) continue;
+
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      const nested = extractTargetToolSlugFromExecutionPayload(item as Record<string, any>);
+      if (nested) return nested;
+    }
+  }
+
+  return null;
+}
+
+function resolveEffectiveAssetContext(
+  input: Record<string, any>,
+  ctx: {
+    sessionAssets: SessionAsset[];
+    currentKey?: string;
+    toolSlug?: string;
+    toolkitSlug?: string;
+    fetchRemote?: boolean;
+  }
+): { toolSlug?: string; toolkitSlug?: string } {
+  if (!isComposioExecutionMetaTool(ctx.toolSlug)) {
+    return {
+      toolSlug: ctx.toolSlug,
+      toolkitSlug: ctx.toolkitSlug,
+    };
+  }
+
+  const targetToolSlug = extractTargetToolSlugFromExecutionPayload(input);
+  if (!targetToolSlug || isComposioMetaToolSlug(targetToolSlug)) {
+    return {
+      toolSlug: ctx.toolSlug,
+      toolkitSlug: ctx.toolkitSlug,
+    };
+  }
+
+  return {
+    toolSlug: targetToolSlug,
+    toolkitSlug: inferComposioToolkitSlugFromToolSlug(targetToolSlug),
+  };
+}
+
 async function transformToolInputAssets(
   value: unknown,
   ctx: {
@@ -2410,6 +2499,12 @@ async function transformToolInputAssets(
 
   if (value && typeof value === "object") {
     const input = value as Record<string, any>;
+    const effectiveContext = resolveEffectiveAssetContext(input, ctx);
+    const nextCtxBase = {
+      ...ctx,
+      toolSlug: effectiveContext.toolSlug,
+      toolkitSlug: effectiveContext.toolkitSlug,
+    };
 
     const directS3KeyAsset = resolveDirectS3KeyAssetField(input, ctx.sessionAssets);
     if (directS3KeyAsset) {
@@ -2419,9 +2514,9 @@ async function transformToolInputAssets(
       const resolved = await resolveAssetForToolExecution({
         asset,
         mode: "s3key",
-        toolSlug: ctx.toolSlug,
-        toolkitSlug: ctx.toolkitSlug,
-        fetchRemote: ctx.fetchRemote ?? true,
+        toolSlug: nextCtxBase.toolSlug,
+        toolkitSlug: nextCtxBase.toolkitSlug,
+        fetchRemote: nextCtxBase.fetchRemote ?? true,
       });
 
       if (!resolved.staged) return value;
@@ -2453,7 +2548,7 @@ async function transformToolInputAssets(
         Object.entries(next).map(async ([k, v]) => [
           k,
           await transformToolInputAssets(v, {
-            ...ctx,
+            ...nextCtxBase,
             currentKey: k,
           }),
         ])
@@ -2470,7 +2565,7 @@ async function transformToolInputAssets(
       const explicitMode = String(input._assetMode ?? "").trim() as AssetResolutionMode;
       const inferredMode = inferResolutionModeFromContext({
         key: ctx.currentKey,
-        toolSlug: ctx.toolSlug,
+        toolSlug: nextCtxBase.toolSlug,
       });
 
       const mode: AssetResolutionMode =
@@ -2488,9 +2583,9 @@ async function transformToolInputAssets(
       const resolved = await resolveAssetForToolExecution({
         asset,
         mode,
-        toolSlug: ctx.toolSlug,
-        toolkitSlug: ctx.toolkitSlug,
-        fetchRemote: ctx.fetchRemote ?? true,
+        toolSlug: nextCtxBase.toolSlug,
+        toolkitSlug: nextCtxBase.toolkitSlug,
+        fetchRemote: nextCtxBase.fetchRemote ?? true,
       });
 
       const next: Record<string, any> = { ...input };
@@ -2574,7 +2669,7 @@ async function transformToolInputAssets(
         Object.entries(next).map(async ([k, v]) => [
           k,
           await transformToolInputAssets(v, {
-            ...ctx,
+            ...nextCtxBase,
             currentKey: k,
           }),
         ])
@@ -2586,7 +2681,7 @@ async function transformToolInputAssets(
       Object.entries(input).map(async ([k, v]) => [
         k,
         await transformToolInputAssets(v, {
-          ...ctx,
+          ...nextCtxBase,
           currentKey: k,
         }),
       ])
@@ -2612,7 +2707,9 @@ function wrapComposioToolsWithAssetResolution(
     }
 
     const normalizedToolSlug = normalizeComposioToolSlug(toolName);
-    const toolkitSlug = inferComposioToolkitSlugFromToolSlug(normalizedToolSlug);
+    const toolkitSlug = isComposioMetaToolSlug(normalizedToolSlug)
+      ? undefined
+      : inferComposioToolkitSlugFromToolSlug(normalizedToolSlug);
 
     wrapped[toolName] = {
       ...toolDef,
@@ -2684,309 +2781,47 @@ function isPromptBudgetRetryableError(error: unknown): boolean {
   );
 }
 
-type ComposioConnectedAccountSummary = {
-  id: string;
-  status: string | null;
-  toolkitSlug: string;
-  toolkitName: string;
-  authConfigId: string | null;
-  connectedAccountId: string | null;
-};
+function buildComposioSessionOptions(overrides?: ComposioSessionOverrides): ComposioSessionOverrides {
+  const callbackUrl =
+    env("COMPOSIO_CALLBACK_URL") ||
+    env("COMPOSIO_MANAGE_CONNECTIONS_CALLBACK_URL") ||
+    undefined;
 
-type ResolvedToolkitConnection = {
-  ok: true;
-  namespace: string;
-  toolkit: string;
-  name: string;
-  connected: boolean;
-  activeConnectedAccountIds: string[];
-  activeAuthConfigIds: string[];
-  activeAccountCount: number;
-};
+  const disableInChatAuth = (env("COMPOSIO_DISABLE_IN_CHAT_AUTH") ?? "false") === "true";
 
-function buildComposioManageConnectionsConfig(enabled: boolean) {
-  if (!enabled) return false;
+  const base: ComposioSessionOverrides = disableInChatAuth
+    ? { manageConnections: false }
+    : callbackUrl
+      ? { manageConnections: { callbackUrl } }
+      : { manageConnections: true };
 
-  const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
-  const waitForConnections = (env("COMPOSIO_WAIT_FOR_CONNECTIONS") ?? "false") === "true";
+  if (!overrides) return base;
 
-  if (!callbackUrl && !waitForConnections) {
-    return true;
-  }
-
-  const config: Record<string, unknown> = { enable: true };
-  if (callbackUrl) config.callbackUrl = callbackUrl;
-  if (waitForConnections) config.waitForConnections = true;
-  return config;
+  return {
+    ...base,
+    ...overrides,
+  };
 }
 
-async function getComposioSessionForUser(userId: string, opts?: { manageConnections?: boolean }) {
-  return await composio.create(userId, {
-    manageConnections: buildComposioManageConnectionsConfig(opts?.manageConnections ?? true),
-  } as any);
-}
-
-function aliasToolkitInput(raw: string): string {
-  const value = String(raw ?? "").trim().toLowerCase();
-  if (value === "x") return "twitter";
-  if (value === "twitter/x") return "twitter";
-  if (value === "docs") return "google docs";
-  if (value === "drive") return "google drive";
-  if (value === "sheets") return "google sheets";
-  return value;
-}
-
-function normalizeToolkitSearchTerm(raw: string): string {
-  return aliasToolkitInput(raw).replace(/\s+/g, "");
-}
-
-function extractComposioToolkitSlug(toolkit: any): string {
-  return String(toolkit?.slug ?? toolkit?.name ?? toolkit?.toolkit?.slug ?? toolkit?.toolkit?.name ?? "")
-    .trim()
-    .toLowerCase();
-}
-
-function extractComposioToolkitName(toolkit: any): string {
-  return String(toolkit?.name ?? toolkit?.slug ?? toolkit?.toolkit?.name ?? toolkit?.toolkit?.slug ?? "")
-    .trim()
-    .toLowerCase();
-}
-
-function extractConnectionRedirectUrl(request: any): string {
-  return String(request?.redirectUrl ?? request?.redirect_url ?? request?.url ?? request?.link ?? "").trim();
-}
-
-async function listActiveConnectedAccountsForUser(
+async function createComposioSessionForUser(
   userId: string,
-  toolkitSlugs?: string[]
-): Promise<ComposioConnectedAccountSummary[]> {
-  const connectedAccountsApi = (composio as any)?.connectedAccounts;
-  if (!connectedAccountsApi || typeof connectedAccountsApi.list !== "function") {
-    return [];
+  overrides?: ComposioSessionOverrides
+) {
+  if (!env("COMPOSIO_API_KEY")) {
+    throw new Error("COMPOSIO_API_KEY not set");
   }
 
-  try {
-    const response = await connectedAccountsApi.list({
-      userIds: [userId],
-      statuses: ["ACTIVE"],
-      ...(toolkitSlugs?.length ? { toolkitSlugs } : {}),
-    } as any);
-
-    const items: any[] = Array.isArray(response?.items) ? response.items : [];
-
-    return items
-      .map((account) => {
-        const toolkitSlug = String(
-          account?.toolkit?.slug ?? account?.toolkit_slug ?? account?.appName ?? account?.app_name ?? ""
-        )
-          .trim()
-          .toLowerCase();
-        const toolkitName = String(account?.toolkit?.name ?? account?.appName ?? account?.app_name ?? toolkitSlug)
-          .trim()
-          .toLowerCase();
-        const authConfigId =
-          account?.authConfig?.id ??
-          account?.auth_config?.id ??
-          account?.authConfigId ??
-          account?.auth_config_id ??
-          null;
-        const connectedAccountId =
-          account?.connectedAccountId ?? account?.connected_account_id ?? account?.id ?? null;
-
-        return {
-          id: String(account?.id ?? connectedAccountId ?? "").trim(),
-          status: account?.status ? String(account.status) : null,
-          toolkitSlug,
-          toolkitName,
-          authConfigId: authConfigId ? String(authConfigId) : null,
-          connectedAccountId: connectedAccountId ? String(connectedAccountId) : null,
-        } satisfies ComposioConnectedAccountSummary;
-      })
-      .filter((account) => account.toolkitSlug);
-  } catch {
-    return [];
-  }
+  return await composio.create(userId, buildComposioSessionOptions(overrides) as any);
 }
 
-async function getComposioSessionToolsForUser(userId: string): Promise<ToolSet> {
+async function getComposioToolsForUser(
+  userId: string,
+  overrides?: ComposioSessionOverrides
+): Promise<ToolSet> {
   if (!env("COMPOSIO_API_KEY")) return {};
 
-  const ttlMs = Math.max(0, parseIntOr(env("COMPOSIO_TOOLS_CACHE_TTL_MS"), 1 * 60_000));
-  const now = Date.now();
-
-  if (ttlMs > 0) {
-    const cached = composioToolsCache.get(userId);
-    if (cached && cached.expiresAt > now) return cached.tools;
-  }
-
-  const session = await getComposioSessionForUser(userId, { manageConnections: true });
-  const tools = (await session.tools()) as ToolSet;
-
-  if (ttlMs > 0) composioToolsCache.set(userId, { tools, expiresAt: now + ttlMs });
-  return tools;
-}
-
-async function composioListConnections(userId: string) {
-  const session = await getComposioSessionForUser(userId, { manageConnections: true });
-  const toolkitsResponse: any = await session.toolkits();
-  const toolkits: any[] = Array.isArray(toolkitsResponse?.items) ? toolkitsResponse.items : [];
-  const activeAccounts = await listActiveConnectedAccountsForUser(userId);
-
-  const accountsByToolkit = new Map<string, ComposioConnectedAccountSummary[]>();
-  for (const account of activeAccounts) {
-    const bucket = accountsByToolkit.get(account.toolkitSlug) ?? [];
-    bucket.push(account);
-    accountsByToolkit.set(account.toolkitSlug, bucket);
-  }
-
-  const normalized = toolkits
-    .map((toolkit) => {
-      const slug = extractComposioToolkitSlug(toolkit);
-      const name = extractComposioToolkitName(toolkit) || slug;
-      const connectedAccounts = accountsByToolkit.get(slug) ?? [];
-      const sessionConnected =
-        Boolean(toolkit?.connection?.connectedAccount?.id) ||
-        Boolean(toolkit?.connectedAccount?.id) ||
-        Boolean(toolkit?.connected) ||
-        connectedAccounts.length > 0;
-
-      return {
-        slug,
-        name,
-        connected: sessionConnected,
-        activeAccountCount: connectedAccounts.length,
-        activeConnectedAccountIds: [...new Set(connectedAccounts.map((x) => x.connectedAccountId).filter(Boolean))],
-        activeAuthConfigIds: [...new Set(connectedAccounts.map((x) => x.authConfigId).filter(Boolean))],
-      };
-    })
-    .filter((item) => item.slug)
-    .sort((a, b) => a.slug.localeCompare(b.slug));
-
-  return {
-    ok: true,
-    namespace: userId,
-    items: normalized,
-    connected: normalized.filter((x) => x.connected).map((x) => x.slug),
-    activeConnectedAccountCount: activeAccounts.length,
-  };
-}
-
-async function composioResolveToolkitConnection(
-  userId: string,
-  toolkitInput: string
-): Promise<ResolvedToolkitConnection | { ok: false; error: string; hint?: string }> {
-  const wanted = aliasToolkitInput(toolkitInput);
-  const wantedNorm = normalizeToolkitSearchTerm(toolkitInput);
-
-  const session = await getComposioSessionForUser(userId, { manageConnections: false });
-  const toolkitsResponse: any = await session.toolkits();
-  const items: any[] = Array.isArray(toolkitsResponse?.items) ? toolkitsResponse.items : [];
-
-  const normalized = items
-    .map((toolkit) => {
-      const slug = extractComposioToolkitSlug(toolkit);
-      const name = extractComposioToolkitName(toolkit) || slug;
-      const slugNorm = slug.replace(/\s+/g, "");
-      const nameNorm = name.replace(/\s+/g, "");
-      const connected =
-        Boolean(toolkit?.connection?.connectedAccount?.id) ||
-        Boolean(toolkit?.connectedAccount?.id) ||
-        Boolean(toolkit?.connected);
-
-      return {
-        slug,
-        name,
-        slugNorm,
-        nameNorm,
-        connected,
-      };
-    })
-    .filter((item) => item.slug);
-
-  const match =
-    normalized.find((item) => item.slug === wanted || item.name === wanted) ||
-    normalized.find((item) => item.slugNorm === wantedNorm || item.nameNorm === wantedNorm) ||
-    normalized.find((item) => item.slug.includes(wanted) || item.name.includes(wanted)) ||
-    normalized.find((item) => item.slugNorm.includes(wantedNorm) || item.nameNorm.includes(wantedNorm));
-
-  if (!match) {
-    const hint = normalized
-      .slice(0, 30)
-      .map((item) => `${item.slug}${item.connected ? " (connected)" : ""}`)
-      .join(", ");
-
-    return {
-      ok: false,
-      error: `Toolkit "${toolkitInput}" not found in Composio toolkits list.`,
-      hint: hint ? `Try one of: ${hint}` : undefined,
-    };
-  }
-
-  const activeAccounts = await listActiveConnectedAccountsForUser(userId, [match.slug]);
-
-  return {
-    ok: true,
-    namespace: userId,
-    toolkit: match.slug,
-    name: match.name,
-    connected: match.connected || activeAccounts.length > 0,
-    activeConnectedAccountIds: [
-      ...new Set(activeAccounts.map((account) => account.connectedAccountId).filter(Boolean) as string[]),
-    ],
-    activeAuthConfigIds: [
-      ...new Set(activeAccounts.map((account) => account.authConfigId).filter(Boolean) as string[]),
-    ],
-    activeAccountCount: activeAccounts.length,
-  };
-}
-
-async function composioConnectToolkitByName(userId: string, toolkitInput: string) {
-  const resolved = await composioResolveToolkitConnection(userId, toolkitInput);
-  if (!resolved.ok) return resolved;
-
-  const session = await getComposioSessionForUser(userId, { manageConnections: true });
-  const callbackUrl = env("COMPOSIO_CALLBACK_URL") || undefined;
-
-  const authorizeVariants = [
-    callbackUrl ? { callbackUrl } : null,
-    callbackUrl ? { callback_url: callbackUrl } : null,
-    null,
-  ];
-
-  let request: any = null;
-  let lastError: unknown = null;
-
-  for (const variant of authorizeVariants) {
-    try {
-      request = variant ? await session.authorize(resolved.toolkit, variant as any) : await session.authorize(resolved.toolkit);
-      if (request) break;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  const link = extractConnectionRedirectUrl(request);
-  if (!link) {
-    return {
-      ok: false,
-      namespace: userId,
-      toolkit: resolved.toolkit,
-      error: `Failed to generate auth link for toolkit "${resolved.toolkit}" under namespace "${userId}".`,
-      details: lastError ? String((lastError as any)?.message ?? lastError) : "No redirect URL returned by Composio authorize()",
-    };
-  }
-
-  return {
-    ok: true,
-    namespace: userId,
-    toolkit: resolved.toolkit,
-    name: resolved.name,
-    link,
-    alreadyConnected: resolved.connected,
-    activeConnectedAccountIds: resolved.activeConnectedAccountIds,
-    activeAuthConfigIds: resolved.activeAuthConfigIds,
-    activeAccountCount: resolved.activeAccountCount,
-  };
+  const session = await createComposioSessionForUser(userId, overrides);
+  return (await session.tools()) as ToolSet;
 }
 
 // ============================================================
@@ -3193,43 +3028,6 @@ export async function agentTurn(args: {
       }
       const output = await sshExec(input.command);
       return { ok: true, output: truncateText(output, 5000) };
-    },
-  });
-
-  const connectToolkit = tool({
-    description:
-      "Generate a manual Composio connect/authorize link for a toolkit using the current user's namespace. Accepts user-friendly names like 'Typeform', 'Google Drive', or 'X'. Prefer Composio session meta tools for normal routing; use this when you explicitly need a raw auth link.",
-    inputSchema: zodSchema(
-      z.object({
-        toolkit: z.string().min(1),
-      })
-    ),
-    execute: async (input: { toolkit: string }) => {
-      if (!env("COMPOSIO_API_KEY")) return { ok: false, error: "COMPOSIO_API_KEY not set" };
-      return composioConnectToolkitByName(args.userId, input.toolkit);
-    },
-  });
-
-  const listConnections = tool({
-    description: "Diagnose which Composio toolkits and active connected accounts exist for this user namespace, using live session + connected-accounts data.",
-    inputSchema: zodSchema(z.object({})),
-    execute: async () => {
-      if (!env("COMPOSIO_API_KEY")) return { ok: false, error: "COMPOSIO_API_KEY not set" };
-      return composioListConnections(args.userId);
-    },
-  });
-
-  const resolveToolkitConnection = tool({
-    description:
-      "Resolve the best Composio toolkit slug and live connection state for a requested toolkit name, under this user's namespace.",
-    inputSchema: zodSchema(
-      z.object({
-        toolkit: z.string().min(1),
-      })
-    ),
-    execute: async (input: { toolkit: string }) => {
-      if (!env("COMPOSIO_API_KEY")) return { ok: false, error: "COMPOSIO_API_KEY not set" };
-      return composioResolveToolkitConnection(args.userId, input.toolkit);
     },
   });
 
@@ -3501,23 +3299,19 @@ export async function agentTurn(args: {
   }
 
   // ============================================================
-  // Load Composio tools and wrap them with deterministic asset resolution
+  // Load Composio session meta tools and wrap them with deterministic asset resolution
   // ============================================================
   let composioTools: ToolSet = {};
   if (env("COMPOSIO_API_KEY")) {
-    const rawTools = await getComposioSessionToolsForUser(args.userId).catch(() => ({} as ToolSet));
-    const wrappedTools = wrapComposioToolsWithAssetResolution(rawTools, {
+    const rawTools = await getComposioToolsForUser(args.userId).catch(() => ({} as ToolSet));
+    composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
       sessionAssets,
     });
-    composioTools = wrappedTools;
   }
 
   const nativeTools: ToolSet = {
     schedule_message: scheduleMessage,
     ssh_exec: sshTool,
-    connect_toolkit: connectToolkit,
-    list_connections: listConnections,
-    resolve_toolkit_connection: resolveToolkitConnection,
     list_skills: listSkills,
     read_skill: readSkill,
     read_virtual_file: readVirtualFile,
@@ -3711,12 +3505,15 @@ export async function agentTurn(args: {
     "CRITICAL TOOL RULES:",
     "- If the user asks for an external action, use the appropriate tool.",
     "- Never claim an action succeeded unless a tool call returned success.",
-    "- Prefer Composio session tools and Composio meta tools for dynamic discovery, routing, auth, and execution.",
-    "- Use connect_toolkit only when you explicitly need to generate a manual auth link.",
-    "- Use list_connections or resolve_toolkit_connection for diagnostics when connectivity is unclear.",
+    "- For external apps/services, prefer the Composio session meta tools already loaded for this user.",
+    "- Let Composio search, authenticate, and execute dynamically at runtime instead of relying on hard-coded toolkit routing.",
     "",
-    "COMPOSIO NAMESPACE:",
+    "COMPOSIO SESSION:",
     `- Active namespace: ${args.userId}`,
+    "- session.tools() returns Composio meta tools for discovery, auth, and execution.",
+    "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app tool slug.",
+    "- Use COMPOSIO_MANAGE_CONNECTIONS when auth may be missing or the user asks to connect an app.",
+    "- Use COMPOSIO_MULTI_EXECUTE_TOOL or COMPOSIO_EXECUTE_TOOL to run Composio actions after discovery.",
     "",
     "FILESYSTEM:",
     "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
