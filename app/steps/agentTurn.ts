@@ -3228,8 +3228,8 @@ async function getComposioToolsForUser(
 ): Promise<ToolSet> {
   if (!getComposioProjectApiKey(composioConfig)) return {};
 
-  const session = await createComposioSessionForUser(userId, overrides, composioConfig);
-  return (await session.tools()) as ToolSet;
+const session = await createComposioSessionForUser(userId, overrides, composioConfig);
+return (await session.tools()) as unknown as ToolSet;
 }
 
 // ============================================================
