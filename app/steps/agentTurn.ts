@@ -4225,8 +4225,14 @@ function createNativeAgentTools(args: {
           ? await session.authorize(resolved.match.slug, { callbackUrl } as any)
           : await session.authorize(resolved.match.slug);
 
-        const redirectUrl =
-          String(connectionRequest?.redirectUrl ?? connectionRequest?.redirect_url ?? "").trim() || null;
+        const requestWithLegacyFields = connectionRequest as { redirectUrl?: string } & Record<string, unknown>;
+        const redirectUrl = (() => {
+          const legacyRedirectUrl =
+            typeof requestWithLegacyFields["redirect_url"] === "string"
+              ? requestWithLegacyFields["redirect_url"]
+              : undefined;
+          return String(requestWithLegacyFields.redirectUrl ?? legacyRedirectUrl ?? "").trim() || null;
+        })();
 
         return {
           ok: Boolean(redirectUrl),
@@ -4294,8 +4300,14 @@ function createNativeAgentTools(args: {
             ok: true,
             alreadyConnected: false,
             toolkit: resolved.match,
-            redirectUrl:
-              String(connectionRequest?.redirectUrl ?? connectionRequest?.redirect_url ?? "").trim() || null,
+            redirectUrl: (() => {
+              const requestWithLegacyFields = connectionRequest as { redirectUrl?: string } & Record<string, unknown>;
+              const legacyRedirectUrl =
+                typeof requestWithLegacyFields["redirect_url"] === "string"
+                  ? requestWithLegacyFields["redirect_url"]
+                  : undefined;
+              return String(requestWithLegacyFields.redirectUrl ?? legacyRedirectUrl ?? "").trim() || null;
+            })(),
           });
         }
 
