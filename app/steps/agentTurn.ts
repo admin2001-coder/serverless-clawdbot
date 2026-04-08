@@ -3267,7 +3267,7 @@ function createEditCoalescer(opts: {
   }
 
   function nextTypewriterFrame(target: string): string {
-    const charsPerTick = 12;
+    const charsPerTick = 1;
 
     if (!displayedTypewriterText) {
       return target.slice(0, charsPerTick);
