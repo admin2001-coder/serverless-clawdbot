@@ -3245,6 +3245,20 @@ function coerceComposioToolsToToolSet(sessionTools: unknown): ToolSet {
   return sessionTools as unknown as ToolSet;
 }
 
+function extractComposioConnectionRedirectUrl(connectionRequest: unknown): string | null {
+  if (!connectionRequest || typeof connectionRequest !== "object") {
+    return null;
+  }
+
+  const requestObject = connectionRequest as { redirectUrl?: unknown; redirect_url?: unknown };
+  const modernRedirectUrl =
+    typeof requestObject.redirectUrl === "string" ? requestObject.redirectUrl : undefined;
+  const legacyRedirectUrl =
+    typeof requestObject.redirect_url === "string" ? requestObject.redirect_url : undefined;
+
+  return String(modernRedirectUrl ?? legacyRedirectUrl ?? "").trim() || null;
+}
+
 async function getComposioToolsForUser(
   userId: string,
   overrides?: ComposioSessionOverrides,
@@ -4225,14 +4239,7 @@ function createNativeAgentTools(args: {
           ? await session.authorize(resolved.match.slug, { callbackUrl } as any)
           : await session.authorize(resolved.match.slug);
 
-        const requestWithLegacyFields = connectionRequest as { redirectUrl?: string } & Record<string, unknown>;
-        const redirectUrl = (() => {
-          const legacyRedirectUrl =
-            typeof requestWithLegacyFields["redirect_url"] === "string"
-              ? requestWithLegacyFields["redirect_url"]
-              : undefined;
-          return String(requestWithLegacyFields.redirectUrl ?? legacyRedirectUrl ?? "").trim() || null;
-        })();
+        const redirectUrl = extractComposioConnectionRedirectUrl(connectionRequest);
 
         return {
           ok: Boolean(redirectUrl),
@@ -4300,14 +4307,7 @@ function createNativeAgentTools(args: {
             ok: true,
             alreadyConnected: false,
             toolkit: resolved.match,
-            redirectUrl: (() => {
-              const requestWithLegacyFields = connectionRequest as { redirectUrl?: string } & Record<string, unknown>;
-              const legacyRedirectUrl =
-                typeof requestWithLegacyFields["redirect_url"] === "string"
-                  ? requestWithLegacyFields["redirect_url"]
-                  : undefined;
-              return String(requestWithLegacyFields.redirectUrl ?? legacyRedirectUrl ?? "").trim() || null;
-            })(),
+            redirectUrl: extractComposioConnectionRedirectUrl(connectionRequest),
           });
         }
 
