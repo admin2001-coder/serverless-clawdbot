@@ -34,7 +34,7 @@ export const dynamic = "force-dynamic";
 // ============================================================
 // Utilities
 // ============================================================
-function jsonOk(extra: any = {}) {
+function jsonOk(extra: Record<string, unknown> = {}) {
   return NextResponse.json({ ok: true, ...extra });
 }
 
@@ -78,6 +78,285 @@ function safeDecodeMediaUrlParam(raw: string): string {
   } catch {
     return raw;
   }
+}
+
+// ============================================================
+// Telegram webhook handling
+// ============================================================
+type JsonObject = Record<string, unknown>;
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getObjectProp(obj: unknown, key: string): JsonObject | null {
+  if (!isJsonObject(obj)) return null;
+  const value = obj[key];
+  return isJsonObject(value) ? value : null;
+}
+
+function getScalarId(value: unknown): string | null {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  return null;
+}
+
+function getStringProp(obj: unknown, key: string): string | null {
+  if (!isJsonObject(obj)) return null;
+  const value = obj[key];
+  return typeof value === "string" ? value : null;
+}
+
+function getNumberProp(obj: unknown, key: string): number | null {
+  if (!isJsonObject(obj)) return null;
+  const value = obj[key];
+  return typeof value === "number" ? value : null;
+}
+
+/**
+ * Keep this list in sync with Telegram's Update object and reuse it when
+ * setting webhook allowed_updates from your admin/UI route if desired.
+ */
+const TELEGRAM_ALL_ALLOWED_UPDATES = [
+  "message",
+  "edited_message",
+  "channel_post",
+  "edited_channel_post",
+  "business_connection",
+  "business_message",
+  "edited_business_message",
+  "deleted_business_messages",
+  "message_reaction",
+  "message_reaction_count",
+  "inline_query",
+  "chosen_inline_result",
+  "callback_query",
+  "shipping_query",
+  "pre_checkout_query",
+  "purchased_paid_media",
+  "poll",
+  "poll_answer",
+  "my_chat_member",
+  "chat_member",
+  "chat_join_request",
+  "chat_boost",
+  "removed_chat_boost",
+  "managed_bot",
+] as const;
+
+type TelegramUpdateType = (typeof TELEGRAM_ALL_ALLOWED_UPDATES)[number] | "unknown";
+
+const TELEGRAM_MESSAGEISH_UPDATES = [
+  "message",
+  "edited_message",
+  "channel_post",
+  "edited_channel_post",
+  "business_message",
+  "edited_business_message",
+] as const;
+
+type TelegramMessageishUpdateType = (typeof TELEGRAM_MESSAGEISH_UPDATES)[number];
+
+function getTelegramUpdateType(update: unknown): TelegramUpdateType {
+  if (!isJsonObject(update)) return "unknown";
+
+  for (const key of TELEGRAM_ALL_ALLOWED_UPDATES) {
+    if (update[key] != null) return key;
+  }
+
+  return "unknown";
+}
+
+function isTelegramMessageishUpdateType(
+  updateType: TelegramUpdateType
+): updateType is TelegramMessageishUpdateType {
+  return (TELEGRAM_MESSAGEISH_UPDATES as readonly string[]).includes(updateType);
+}
+
+function coerceTelegramUpdateForNormalizer(
+  update: unknown,
+  updateType: TelegramUpdateType
+): unknown {
+  if (!isJsonObject(update)) return update;
+
+  // Preserve your current normalizeTelegram() flow without forcing changes in normalize.ts.
+  if (updateType === "business_message") {
+    return { ...update, message: update.business_message };
+  }
+
+  if (updateType === "edited_business_message") {
+    return { ...update, edited_message: update.edited_business_message };
+  }
+
+  return update;
+}
+
+function getTelegramUpdateId(update: unknown): number | null {
+  return getNumberProp(update, "update_id");
+}
+
+async function callTelegramBotApi(
+  method: string,
+  payload: Record<string, unknown>
+): Promise<boolean> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return false;
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function answerTelegramCallbackQuery(callbackQueryId: string): Promise<void> {
+  await callTelegramBotApi("answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+  });
+}
+
+async function answerTelegramInlineQueryEmpty(inlineQueryId: string): Promise<void> {
+  await callTelegramBotApi("answerInlineQuery", {
+    inline_query_id: inlineQueryId,
+    results: [],
+    cache_time: 0,
+    is_personal: true,
+  });
+}
+
+async function rejectTelegramShippingQuery(
+  shippingQueryId: string,
+  errorMessage = "Shipping is not configured for this bot."
+): Promise<void> {
+  await callTelegramBotApi("answerShippingQuery", {
+    shipping_query_id: shippingQueryId,
+    ok: false,
+    error_message: errorMessage,
+  });
+}
+
+async function rejectTelegramPreCheckoutQuery(
+  preCheckoutQueryId: string,
+  errorMessage = "Payments are not configured for this bot."
+): Promise<void> {
+  await callTelegramBotApi("answerPreCheckoutQuery", {
+    pre_checkout_query_id: preCheckoutQueryId,
+    ok: false,
+    error_message: errorMessage,
+  });
+}
+
+function buildInboundFromTelegramCallbackQuery(update: unknown): InboundMessage | null {
+  const callbackQuery = getObjectProp(update, "callback_query");
+  if (!callbackQuery) return null;
+
+  const from = getObjectProp(callbackQuery, "from");
+  const senderId = getScalarId(from?.id);
+  if (!senderId) return null;
+
+  const senderUsername = getStringProp(from, "username") ?? undefined;
+  const message = getObjectProp(callbackQuery, "message");
+  const chat = getObjectProp(message, "chat");
+
+  const sessionId =
+    getScalarId(chat?.id) ??
+    (() => {
+      const inlineMessageId = getStringProp(callbackQuery, "inline_message_id");
+      if (inlineMessageId) return `telegram:inline:${inlineMessageId}`;
+      return `telegram:user:${senderId}`;
+    })();
+
+  const data = getStringProp(callbackQuery, "data");
+  const gameShortName = getStringProp(callbackQuery, "game_short_name");
+  const text = data ?? gameShortName ?? "/callback";
+
+  return {
+    channel: "telegram",
+    sessionId,
+    senderId,
+    senderUsername,
+    text,
+    ts: Date.now(),
+    raw: {
+      source: "telegram_callback_query",
+      update,
+    },
+  };
+}
+
+async function handleTelegramWebhook(req: Request): Promise<Response> {
+  if (!(await telegramValidateWebhook(req))) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const update = await req.json().catch(() => null);
+  if (!update) return new Response("Bad JSON", { status: 400 });
+
+  const updateId = getTelegramUpdateId(update);
+  if (typeof updateId === "number") {
+    const store = getStore();
+    const key = `dedupe:telegram:update:${updateId}`;
+    const inserted = await store.set(key, "1", { exSeconds: 600, nx: true });
+    if (!inserted) return jsonOk({ telegram: true, deduped: true });
+  }
+
+  const updateType = getTelegramUpdateType(update);
+
+  // callback_query needs a fast ack so the Telegram client button spinner clears.
+  if (updateType === "callback_query") {
+    const callbackQuery = getObjectProp(update, "callback_query");
+    const callbackQueryId = getStringProp(callbackQuery, "id");
+    if (callbackQueryId) await answerTelegramCallbackQuery(callbackQueryId);
+
+    const synthetic = buildInboundFromTelegramCallbackQuery(update);
+    if (synthetic) {
+      await handleInbound(synthetic);
+      return jsonOk({ telegram: true, updateType, routed: true });
+    }
+
+    return jsonOk({ telegram: true, updateType, routed: false });
+  }
+
+  // Preserve your existing message/session workflow behavior.
+  if (isTelegramMessageishUpdateType(updateType)) {
+    const msg = await normalizeTelegram(
+      coerceTelegramUpdateForNormalizer(update, updateType)
+    );
+    if (msg) await handleInbound(msg);
+    return jsonOk({ telegram: true, updateType, routed: Boolean(msg) });
+  }
+
+  // Safe, explicit handling for webhook event families that otherwise hang or fall through.
+  if (updateType === "inline_query") {
+    const inlineQuery = getObjectProp(update, "inline_query");
+    const inlineQueryId = getStringProp(inlineQuery, "id");
+    if (inlineQueryId) await answerTelegramInlineQueryEmpty(inlineQueryId);
+    return jsonOk({ telegram: true, updateType, routed: false });
+  }
+
+  if (updateType === "shipping_query") {
+    const shippingQuery = getObjectProp(update, "shipping_query");
+    const shippingQueryId = getStringProp(shippingQuery, "id");
+    if (shippingQueryId) await rejectTelegramShippingQuery(shippingQueryId);
+    return jsonOk({ telegram: true, updateType, routed: false });
+  }
+
+  if (updateType === "pre_checkout_query") {
+    const preCheckoutQuery = getObjectProp(update, "pre_checkout_query");
+    const preCheckoutQueryId = getStringProp(preCheckoutQuery, "id");
+    if (preCheckoutQueryId) await rejectTelegramPreCheckoutQuery(preCheckoutQueryId);
+    return jsonOk({ telegram: true, updateType, routed: false });
+  }
+
+  // The rest of Telegram's Update types are now explicitly classified and acknowledged.
+  return jsonOk({ telegram: true, updateType, routed: false });
 }
 
 // ============================================================
@@ -322,24 +601,7 @@ export async function GET(req: Request) {
   }
 
   if (op === "telegram") {
-    if (!(await telegramValidateWebhook(req))) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    const update = await req.json().catch(() => null);
-    if (!update) return new Response("Bad JSON", { status: 400 });
-
-    const updateId = (update as any)?.update_id;
-    if (typeof updateId === "number") {
-      const store = getStore();
-      const key = `dedupe:telegram:update:${updateId}`;
-      const inserted = await store.set(key, "1", { exSeconds: 600, nx: true });
-      if (!inserted) return jsonOk({ deduped: true });
-    }
-
-    const msg = await normalizeTelegram(update);
-    if (msg) await handleInbound(msg);
-    return jsonOk();
+    return handleTelegramWebhook(req);
   }
 
   return new Response("Not found", { status: 404 });
@@ -415,24 +677,7 @@ export async function POST(req: Request) {
   }
 
   if (op === "telegram") {
-    if (!(await telegramValidateWebhook(req))) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    const update = await req.json().catch(() => null);
-    if (!update) return new Response("Bad JSON", { status: 400 });
-
-    const updateId = (update as any)?.update_id;
-    if (typeof updateId === "number") {
-      const store = getStore();
-      const key = `dedupe:telegram:update:${updateId}`;
-      const inserted = await store.set(key, "1", { exSeconds: 600, nx: true });
-      if (!inserted) return jsonOk({ deduped: true });
-    }
-
-    const msg = await normalizeTelegram(update);
-    if (msg) await handleInbound(msg);
-    return jsonOk();
+    return handleTelegramWebhook(req);
   }
 
   if (op === "sms") {
