@@ -77,6 +77,8 @@ type VirtualRuntime = {
   userId: string;
   channel: Channel;
   redis: RedisClient;
+  storageSessionId: string;
+  storageUserId: string;
 };
 
 let redisClientPromise: Promise<RedisClient | null> | null = null;
@@ -111,6 +113,134 @@ function vfsNodeKey(userId: string, sessionId: string, path: string): string {
 
 function vfsMetaKey(userId: string, sessionId: string): string {
   return `${vfsNamespace(userId, sessionId)}:meta`;
+}
+
+function vfsScopeUserId(rt: VirtualRuntime): string {
+  return rt.storageUserId || rt.userId;
+}
+
+function vfsScopeSessionId(rt: VirtualRuntime): string {
+  return rt.storageSessionId || rt.sessionId;
+}
+
+function vfsPathsSetKeyForRuntime(rt: VirtualRuntime): string {
+  return vfsPathsKey(vfsScopeUserId(rt), vfsScopeSessionId(rt));
+}
+
+function vfsNodeStorageKeyForRuntime(rt: VirtualRuntime, path: string): string {
+  return vfsNodeKey(vfsScopeUserId(rt), vfsScopeSessionId(rt), path);
+}
+
+function vfsMetaStorageKeyForRuntime(rt: VirtualRuntime): string {
+  return vfsMetaKey(vfsScopeUserId(rt), vfsScopeSessionId(rt));
+}
+
+async function scanRedisKeys(redis: RedisClient, match: string, count = 200, maxKeys = 500): Promise<string[]> {
+  const keys: string[] = [];
+  let cursor = "0";
+
+  do {
+    const scanned = await redis.scan(cursor, { match, count });
+    const nextCursor = String(Array.isArray(scanned) ? scanned[0] ?? "0" : (scanned as any)?.[0] ?? "0");
+    const batch = Array.isArray(scanned) ? scanned[1] : (scanned as any)?.[1];
+
+    if (Array.isArray(batch)) {
+      for (const key of batch) {
+        keys.push(String(key));
+        if (keys.length >= maxKeys) return keys;
+      }
+    }
+
+    cursor = nextCursor;
+  } while (cursor !== "0");
+
+  return keys;
+}
+
+type DiscoveredVfsScope = {
+  storageUserId: string;
+  storageSessionId: string;
+  reason: "exact" | "session_match" | "user_match" | "fallback";
+};
+
+async function discoverExistingVfsScope(args: {
+  redis: RedisClient;
+  userId: string;
+  sessionId: string;
+  channel: Channel;
+}): Promise<DiscoveredVfsScope> {
+  const exactMeta = await args.redis.get(vfsMetaKey(args.userId, args.sessionId));
+  if (exactMeta) {
+    return {
+      storageUserId: args.userId,
+      storageSessionId: args.sessionId,
+      reason: "exact",
+    };
+  }
+
+  const metaKeys = await scanRedisKeys(args.redis, "vfs:*:meta", 200, 500).catch(() => [] as string[]);
+  let best: { score: number; updatedAt: number; scope: DiscoveredVfsScope } | null = null;
+
+  for (const metaKey of metaKeys) {
+    const meta: any = await args.redis.get(metaKey).catch(() => null);
+    if (!meta || typeof meta !== "object") continue;
+
+    const metaUserId = typeof meta.userId === "string" ? meta.userId : undefined;
+    const metaSessionId = typeof meta.sessionId === "string" ? meta.sessionId : undefined;
+    const metaChannel = typeof meta.channel === "string" ? meta.channel : undefined;
+    if (!metaUserId || !metaSessionId) continue;
+
+    let score = 0;
+    if (metaSessionId === args.sessionId) score += 100;
+    if (metaUserId === args.userId) score += 50;
+    if (metaChannel === args.channel) score += 10;
+    if (score <= 0) continue;
+
+    const updatedAt = Number.isFinite(Date.parse(String(meta.updatedAt ?? "")))
+      ? Date.parse(String(meta.updatedAt))
+      : 0;
+
+    const scope: DiscoveredVfsScope = {
+      storageUserId: metaUserId,
+      storageSessionId: metaSessionId,
+      reason: metaSessionId === args.sessionId ? "session_match" : "user_match",
+    };
+
+    if (!best || score > best.score || (score === best.score && updatedAt > best.updatedAt)) {
+      best = { score, updatedAt, scope };
+    }
+  }
+
+  return (
+    best?.scope ?? {
+      storageUserId: args.userId,
+      storageSessionId: args.sessionId,
+      reason: "fallback",
+    }
+  );
+}
+
+async function rebuildVfsPathIndex(rt: VirtualRuntime): Promise<string[]> {
+  const keys = await scanRedisKeys(
+    rt.redis,
+    `${vfsNamespace(vfsScopeUserId(rt), vfsScopeSessionId(rt))}:node:*`,
+    200,
+    2000
+  ).catch(() => [] as string[]);
+
+  const discoveredPaths = new Set<string>();
+  for (const key of keys) {
+    const node: any = await rt.redis.get(key).catch(() => null);
+    if (!node || typeof node !== "object" || typeof node.path !== "string") continue;
+    discoveredPaths.add(sanitizePath(node.path));
+  }
+
+  const paths = Array.from(discoveredPaths).sort();
+  if (paths.length) {
+    await rt.redis.sadd(vfsPathsSetKeyForRuntime(rt), ...paths);
+  }
+
+  return paths;
 }
 
 // ============================================================
@@ -1084,27 +1214,37 @@ function renderSingleSkill(skill: InlineSkill): string {
 // Redis VFS primitives
 // ============================================================
 async function vfsAllPaths(rt: VirtualRuntime): Promise<string[]> {
-  const raw = (await rt.redis.smembers(vfsPathsKey(rt.userId, rt.sessionId))) ?? [];
-  return (Array.isArray(raw) ? raw : []).map((x) => sanitizePath(String(x))).sort();
+  const raw = (await rt.redis.smembers(vfsPathsSetKeyForRuntime(rt))) ?? [];
+  let paths = (Array.isArray(raw) ? raw : []).map((x) => sanitizePath(String(x))).sort();
+
+  const looksSparse = paths.length === 0 || (paths.length === 1 && paths[0] === "/workspace");
+  if (looksSparse) {
+    const rebuilt = await rebuildVfsPathIndex(rt);
+    if (rebuilt.length > paths.length) {
+      paths = rebuilt;
+    }
+  }
+
+  return paths;
 }
 
 async function vfsGetNode(rt: VirtualRuntime, path: string): Promise<VfsNode | undefined> {
   const p = sanitizePath(path);
-  const node = await rt.redis.get(vfsNodeKey(rt.userId, rt.sessionId, p));
+  const node = await rt.redis.get(vfsNodeStorageKeyForRuntime(rt, p));
   if (!node) return undefined;
   return node as VfsNode;
 }
 
 async function vfsPutNode(rt: VirtualRuntime, node: VfsNode): Promise<void> {
   const p = sanitizePath(node.path);
-  await rt.redis.set(vfsNodeKey(rt.userId, rt.sessionId, p), { ...node, path: p });
-  await rt.redis.sadd(vfsPathsKey(rt.userId, rt.sessionId), p);
+  await rt.redis.set(vfsNodeStorageKeyForRuntime(rt, p), { ...node, path: p });
+  await rt.redis.sadd(vfsPathsSetKeyForRuntime(rt), p);
 }
 
 async function vfsRemoveNode(rt: VirtualRuntime, path: string): Promise<void> {
   const p = sanitizePath(path);
-  await rt.redis.del(vfsNodeKey(rt.userId, rt.sessionId, p));
-  await rt.redis.srem(vfsPathsKey(rt.userId, rt.sessionId), p);
+  await rt.redis.del(vfsNodeStorageKeyForRuntime(rt, p));
+  await rt.redis.srem(vfsPathsSetKeyForRuntime(rt), p);
 }
 
 async function vfsEnsureDir(rt: VirtualRuntime, path: string): Promise<void> {
@@ -1322,12 +1462,21 @@ async function createVirtualRuntime(args: {
     );
   }
 
+  const discoveredScope = await discoverExistingVfsScope({
+    redis,
+    userId: args.userId,
+    sessionId: args.sessionId,
+    channel: args.channel,
+  });
+
   const rt: VirtualRuntime = {
     cwd: "/workspace",
     sessionId: args.sessionId,
     userId: args.userId,
     channel: args.channel,
     redis,
+    storageSessionId: discoveredScope.storageSessionId,
+    storageUserId: discoveredScope.storageUserId,
   };
 
   await vfsEnsureDir(rt, "/");
@@ -1336,12 +1485,15 @@ async function createVirtualRuntime(args: {
   await vfsEnsureDir(rt, "/workspace/skills");
   await vfsEnsureDir(rt, "/workspace/assets");
 
-  await rt.redis.set(vfsMetaKey(args.userId, args.sessionId), {
-    sessionId: args.sessionId,
-    userId: args.userId,
+  await rt.redis.set(vfsMetaStorageKeyForRuntime(rt), {
+    sessionId: vfsScopeSessionId(rt),
+    userId: vfsScopeUserId(rt),
     channel: args.channel,
     cwd: "/workspace",
     updatedAt: nowIso(),
+    requestedSessionId: args.sessionId,
+    requestedUserId: args.userId,
+    namespaceResolution: discoveredScope.reason,
   });
 
   await vfsWriteFile(
@@ -1464,6 +1616,21 @@ function parseVirtualShell(input: string): { ok: true; result: any } | { ok: fal
   };
 }
 
+function splitShellFlagsAndPositionals(args: string[]): { flags: string[]; positionals: string[] } {
+  const flags: string[] = [];
+  const positionals: string[] = [];
+
+  for (const arg of args) {
+    if (arg.startsWith("-") && positionals.length === 0) {
+      flags.push(arg);
+    } else {
+      positionals.push(arg);
+    }
+  }
+
+  return { flags, positionals };
+}
+
 async function execVirtualShell(rt: VirtualRuntime, input: string) {
   const parsed = parseVirtualShell(input);
   if (parsed.ok === false) {
@@ -1499,33 +1666,35 @@ async function execVirtualShell(rt: VirtualRuntime, input: string) {
     }
 
     const args = spec.args ?? [];
+    const { flags, positionals } = splitShellFlagsAndPositionals(args);
 
     switch (spec.command) {
       case "pwd":
         return { ok: true, stdout: rt.cwd, stderr: "", exitCode: 0 };
 
       case "ls": {
-        const target = args[0] ?? rt.cwd;
-        const items = await vfsList(rt, target, false);
+        const target = positionals[0] ?? rt.cwd;
+        const recursive = flags.includes("-R") || flags.includes("-r") || flags.includes("--recursive");
+        const items = await vfsList(rt, target, recursive);
         return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
       }
 
       case "tree": {
-        const target = args[0] ?? rt.cwd;
+        const target = positionals[0] ?? rt.cwd;
         const items = await vfsList(rt, target, true);
         return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
       }
 
       case "cat": {
-        if (!args[0]) throw new Error("cat requires a path");
-        const content = await vfsReadFile(rt, args[0]);
+        if (!positionals[0]) throw new Error("cat requires a path");
+        const content = await vfsReadFile(rt, positionals[0]);
         return { ok: true, stdout: content, stderr: "", exitCode: 0 };
       }
 
       case "mkdir": {
-        if (!args[0]) throw new Error("mkdir requires a path");
-        await vfsEnsureDir(rt, args[0]);
-        return { ok: true, stdout: `Created ${sanitizePath(args[0])}`, stderr: "", exitCode: 0 };
+        if (!positionals[0]) throw new Error("mkdir requires a path");
+        await vfsEnsureDir(rt, positionals[0]);
+        return { ok: true, stdout: `Created ${sanitizePath(positionals[0])}`, stderr: "", exitCode: 0 };
       }
 
       case "rm": {
@@ -1560,14 +1729,14 @@ async function execVirtualShell(rt: VirtualRuntime, input: string) {
       }
 
       case "find": {
-        if (args.length < 2) throw new Error("find requires <path> <needle>");
-        const items = await vfsFind(rt, args[0], args.slice(1).join(" "));
+        if (positionals.length < 2) throw new Error("find requires <path> <needle>");
+        const items = await vfsFind(rt, positionals[0], positionals.slice(1).join(" "));
         return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
       }
 
       case "grep": {
-        if (args.length < 2) throw new Error("grep requires <path> <needle>");
-        const items = await vfsGrep(rt, args[0], args.slice(1).join(" "));
+        if (positionals.length < 2) throw new Error("grep requires <path> <needle>");
+        const items = await vfsGrep(rt, positionals[0], positionals.slice(1).join(" "));
         return {
           ok: true,
           stdout: items.map((x) => `${x.path}:${x.line}:${x.text}`).join("\n"),
@@ -4470,6 +4639,55 @@ function createNativeAgentTools(args: {
     },
   });
 
+  const listVirtualFiles = tool({
+    description:
+      "List files and directories in the Redis-backed virtual filesystem. Defaults to /workspace and is safer than shell-style ls for inspection.",
+    inputSchema: zodSchema(
+      z.object({
+        path: z.string().optional(),
+        recursive: z.boolean().optional(),
+      })
+    ),
+    execute: async (input: { path?: string; recursive?: boolean }) => {
+      const path = sanitizePath(input.path || "/workspace");
+      try {
+        const items = await vfsList(virtualRuntime, path, input.recursive ?? false);
+        const entries = await Promise.all(
+          items.map(async (itemPath) => {
+            const node = await vfsGetNode(virtualRuntime, itemPath);
+            const filename = basename(itemPath) || "file";
+            return {
+              path: itemPath,
+              type: node?.type ?? "unknown",
+              url:
+                node?.type === "file"
+                  ? await buildSignedVfsUrlForRuntime(virtualRuntime, itemPath, {
+                      filename,
+                      mimeType: inferMimeFromFilename(filename),
+                      encoding: "utf8",
+                    })
+                  : null,
+            };
+          })
+        );
+
+        return {
+          ok: true,
+          path,
+          recursive: input.recursive ?? false,
+          count: entries.length,
+          entries,
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          path,
+          error: String(error?.message ?? error ?? "Unknown list_virtual_files error"),
+        };
+      }
+    },
+  });
+
   const listSessionAssets = tool({
     description:
       "List images, audio, video, and files detected in the current conversation history, including canonical asset refs and signed URLs for follow-up preparation.",
@@ -4965,6 +5183,7 @@ function createNativeAgentTools(args: {
     write_virtual_file: writeVirtualFile,
     get_virtual_file_url: getVirtualFileUrl,
     virtual_shell: virtualShell,
+    list_virtual_files: listVirtualFiles,
     list_session_assets: listSessionAssets,
     prepare_session_asset: prepareSessionAsset,
     materialize_session_asset: materializeSessionAsset,
@@ -5049,9 +5268,10 @@ function buildAgentSystemPrompt(args: {
     "- Use composio_verify_webhook_signature when working with inbound webhook payloads and headers.",
     "",
     "FILESYSTEM:",
-    "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
+    "- Use list_virtual_files first when inspecting what exists in the Redis-backed virtual filesystem.",
+    "- Use read_virtual_file and write_virtual_file for exact file reads and writes.",
     "- Use get_virtual_file_url when an external tool needs a signed APP_BASE_URL URL for a VFS file.",
-    "- Use virtual_shell for shell-like operations on the virtual filesystem only.",
+    "- Use virtual_shell for shell-like operations on the virtual filesystem only, but prefer list_virtual_files over shell ls for discovery.",
     "- Prefer /workspace for drafts, payloads, notes, JSON, and staging.",
     "",
     "MODALITIES:",
