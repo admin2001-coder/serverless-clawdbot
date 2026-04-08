@@ -13,6 +13,7 @@ import { openai } from "@ai-sdk/openai";
 import { Composio } from "@composio/core";
 import { VercelProvider } from "@composio/vercel";
 import { z } from "zod/v4";
+import { assign, createActor, fromPromise, setup, toPromise } from "xstate";
 
 import { env } from "@/app/lib/env";
 import type { Channel } from "@/app/lib/identity";
@@ -28,18 +29,27 @@ import {
 // ============================================================
 // Composio client
 // ============================================================
-const composio = new Composio({
-  apiKey: env("COMPOSIO_API_KEY") || "",
-  provider: new VercelProvider(),
-});
+const composioProvider = new VercelProvider();
+
+type ComposioToolkitSelection = string[] | { enable?: string[]; disable?: string[] };
+type ComposioToolSelection = Record<string, string[] | { enable?: string[]; disable?: string[] }>;
 
 type ComposioSessionOverrides = {
-  toolkits?: string[] | { enable?: string[]; disable?: string[] };
+  toolkits?: ComposioToolkitSelection;
+  tools?: ComposioToolSelection;
   authConfigs?: Record<string, string>;
   connectedAccounts?: Record<string, string>;
   manageConnections?: boolean | { callbackUrl?: string };
+  workbench?: { enable?: boolean };
+  experimental?: Record<string, unknown>;
 };
 
+type AgentTurnComposioConfig = {
+  projectApiKey?: string;
+  orgApiKey?: string;
+  apiBaseUrl?: string;
+  session?: ComposioSessionOverrides;
+};
 
 // ============================================================
 // Upstash Redis-backed VFS
@@ -252,6 +262,81 @@ async function hmacSha256Hex(secret: string, message: string): Promise<string> {
 
   const sig = await subtle.sign("HMAC", key, toWebCryptoBufferSource(utf8ToBytes(message)));
   return hexFromBytes(new Uint8Array(sig));
+}
+
+async function hmacSha256Base64(secret: string, message: string): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new Error("Web Crypto subtle API is not available in this runtime");
+  }
+
+  const key = await subtle.importKey(
+    "raw",
+    toWebCryptoBufferSource(utf8ToBytes(secret)),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const sig = await subtle.sign("HMAC", key, toWebCryptoBufferSource(utf8ToBytes(message)));
+  return bytesToBase64(new Uint8Array(sig));
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const aBytes = utf8ToBytes(a);
+  const bBytes = utf8ToBytes(b);
+
+  if (aBytes.length !== bBytes.length) return false;
+
+  let diff = 0;
+  for (let i = 0; i < aBytes.length; i++) {
+    diff |= aBytes[i] ^ bBytes[i];
+  }
+  return diff === 0;
+}
+
+function parseWebhookTimestampSeconds(value: string): number | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+
+  const asNumber = Number(raw);
+  if (Number.isFinite(asNumber)) {
+    return asNumber > 1_000_000_000_000 ? Math.floor(asNumber / 1000) : Math.floor(asNumber);
+  }
+
+  const asDate = Date.parse(raw);
+  return Number.isFinite(asDate) ? Math.floor(asDate / 1000) : null;
+}
+
+function extractWebhookSignatureValue(signatureHeader: string): string {
+  const raw = String(signatureHeader ?? "").trim();
+  if (!raw) return "";
+
+  const commaParts = raw.split(",").map((part) => part.trim()).filter(Boolean);
+  const candidate = commaParts.length > 1 ? commaParts[commaParts.length - 1] : raw;
+
+  if (candidate.includes("=")) {
+    return candidate.split("=").slice(1).join("=").trim();
+  }
+
+  return candidate.trim();
+}
+
+function detectComposioWebhookVersion(payload: unknown): string {
+  const obj: any = payload;
+  if (!obj || typeof obj !== "object") return "unknown";
+  if (obj.type && obj.metadata && Object.prototype.hasOwnProperty.call(obj, "data")) return "V3";
+  if (Object.prototype.hasOwnProperty.call(obj, "payload") && Object.prototype.hasOwnProperty.call(obj, "triggerName")) return "V2";
+  if (Object.prototype.hasOwnProperty.call(obj, "trigger")) return "V1";
+  return "unknown";
+}
+
+function tryParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
 }
 
 function normalizeHistory(history: ModelMessage[]): ModelMessage[] {
@@ -1914,16 +1999,205 @@ function inferComposioToolkitSlugFromToolSlug(toolSlug: string): string {
   return prefix.toLowerCase();
 }
 
-function getComposioApiBaseUrl(): string {
-  const raw = env("COMPOSIO_API_BASE_URL") || env("COMPOSIO_BASE_URL") || "https://backend.composio.dev";
-  const trimmed = String(raw ?? "").trim().replace(/\/+$/, "");
-  return /\/api\/v3$/i.test(trimmed) ? trimmed : `${trimmed}/api/v3`;
+function getComposioProjectApiKey(config?: AgentTurnComposioConfig): string {
+  return String(config?.projectApiKey ?? env("COMPOSIO_API_KEY") ?? "").trim();
 }
 
-function buildComposioApiUrl(pathname: string): string {
-  const base = getComposioApiBaseUrl();
+function getComposioOrgApiKey(config?: AgentTurnComposioConfig): string {
+  return String(
+    config?.orgApiKey ??
+      env("COMPOSIO_ORG_API_KEY") ??
+      env("COMPOSIO_X_ORG_API_KEY") ??
+      env("COMPOSIO_ORGANIZATION_API_KEY") ??
+      ""
+  ).trim();
+}
+
+function getComposioApiBaseRoot(config?: AgentTurnComposioConfig): string {
+  const raw = String(
+    config?.apiBaseUrl ?? env("COMPOSIO_API_BASE_URL") ?? env("COMPOSIO_BASE_URL") ?? "https://backend.composio.dev"
+  )
+    .trim()
+    .replace(/\/+$/, "");
+
+  return raw.replace(/\/api\/v3$/i, "");
+}
+
+function getComposioApiBaseUrl(config?: AgentTurnComposioConfig): string {
+  return `${getComposioApiBaseRoot(config)}/api/v3`;
+}
+
+function buildComposioApiUrl(pathname: string, config?: AgentTurnComposioConfig): string {
+  const base = getComposioApiBaseUrl(config);
   const path = pathname.startsWith("/") ? pathname : `/${pathname}`;
   return `${base}${path}`;
+}
+
+function getComposioProjectCacheScope(config?: AgentTurnComposioConfig): string {
+  const apiKey = getComposioProjectApiKey(config);
+  return `${getComposioApiBaseRoot(config)}|${apiKey ? apiKey.slice(-12) : "default"}`;
+}
+
+function createComposioClient(config?: AgentTurnComposioConfig): Composio {
+  return new Composio({
+    apiKey: getComposioProjectApiKey(config),
+    provider: composioProvider,
+    baseUrl: getComposioApiBaseRoot(config),
+  } as any);
+}
+
+function normalizeComposioApiPath(path: string, config?: AgentTurnComposioConfig): string {
+  const raw = String(path ?? "").trim();
+  if (!raw) {
+    throw new Error("Composio API path is required");
+  }
+
+  if (/^https?:\/\//i.test(raw)) {
+    const url = new URL(raw);
+    const allowedOrigin = new URL(getComposioApiBaseRoot(config)).origin;
+    if (url.origin !== allowedOrigin) {
+      throw new Error(`Composio API request origin mismatch: expected ${allowedOrigin}, received ${url.origin}`);
+    }
+
+    const normalizedPath = url.pathname.replace(/^\/api\/v3/i, "");
+    return `${normalizedPath.startsWith("/") ? normalizedPath : `/${normalizedPath}`}${url.search}`;
+  }
+
+  const withoutPrefix = raw.replace(/^\/api\/v3/i, "");
+  return withoutPrefix.startsWith("/") ? withoutPrefix : `/${withoutPrefix}`;
+}
+
+function appendComposioQueryValue(searchParams: URLSearchParams, key: string, value: unknown): void {
+  if (value === undefined || value === null) return;
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      appendComposioQueryValue(searchParams, key, item);
+    }
+    return;
+  }
+
+  if (typeof value === "object") {
+    searchParams.append(key, JSON.stringify(value));
+    return;
+  }
+
+  searchParams.append(key, String(value));
+}
+
+function appendComposioQueryParams(url: URL, query?: Record<string, unknown>): void {
+  if (!query) return;
+
+  for (const [key, value] of Object.entries(query)) {
+    appendComposioQueryValue(url.searchParams, key, value);
+  }
+}
+
+function headersToRecord(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    out[key] = value;
+  });
+  return out;
+}
+
+type ComposioApiRequestOptions = {
+  method?: string;
+  path: string;
+  query?: Record<string, unknown>;
+  body?: unknown;
+  rawBody?: string;
+  rawBodyBase64?: string;
+  contentType?: string;
+  headers?: Record<string, string>;
+  authMode?: "project" | "org";
+  config?: AgentTurnComposioConfig;
+};
+
+async function composioApiRequest(options: ComposioApiRequestOptions) {
+  const authMode = options.authMode ?? "project";
+  const apiKey = authMode === "org" ? getComposioOrgApiKey(options.config) : getComposioProjectApiKey(options.config);
+
+  if (!apiKey) {
+    throw new Error(authMode === "org" ? "COMPOSIO_ORG_API_KEY not set" : "COMPOSIO_API_KEY not set");
+  }
+
+  const normalizedPath = normalizeComposioApiPath(options.path, options.config);
+  const [pathname, inlineQuery = ""] = normalizedPath.split("?", 2);
+  const url = new URL(buildComposioApiUrl(pathname, options.config));
+
+  if (inlineQuery) {
+    const inlineParams = new URLSearchParams(inlineQuery);
+    inlineParams.forEach((value, key) => {
+      url.searchParams.append(key, value);
+    });
+  }
+
+  appendComposioQueryParams(url, options.query);
+
+  const method = String(
+    options.method ??
+      (options.body !== undefined || options.rawBody !== undefined || options.rawBodyBase64 !== undefined ? "POST" : "GET")
+  )
+    .trim()
+    .toUpperCase();
+
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    ...(options.headers ?? {}),
+  };
+
+  const authHeaderName = authMode === "org" ? "x-org-api-key" : "x-api-key";
+  if (!Object.keys(headers).some((key) => key.toLowerCase() === authHeaderName)) {
+    headers[authHeaderName] = apiKey;
+  }
+
+  const hasContentTypeHeader = Object.keys(headers).some((key) => key.toLowerCase() === "content-type");
+  let body: BodyInit | undefined;
+
+  if (options.rawBodyBase64 !== undefined) {
+    body = toWebCryptoBufferSource(base64ToBytes(options.rawBodyBase64));
+    if (!hasContentTypeHeader) {
+      headers["content-type"] = options.contentType || "application/octet-stream";
+    }
+  } else if (options.rawBody !== undefined) {
+    body = options.rawBody;
+    if (!hasContentTypeHeader) {
+      headers["content-type"] = options.contentType || "text/plain; charset=utf-8";
+    }
+  } else if (options.body !== undefined && method !== "GET" && method !== "HEAD") {
+    body = JSON.stringify(options.body);
+    if (!hasContentTypeHeader) {
+      headers["content-type"] = options.contentType || "application/json";
+    }
+  }
+
+  const response = await fetch(url.toString(), {
+    method,
+    headers,
+    body,
+  });
+
+  const responseText = await response.text();
+  let parsed: unknown = null;
+
+  try {
+    parsed = responseText ? JSON.parse(responseText) : null;
+  } catch {
+    parsed = responseText;
+  }
+
+  return {
+    ok: response.ok,
+    method,
+    url: url.toString(),
+    status: response.status,
+    statusText: response.statusText,
+    headers: headersToRecord(response.headers),
+    requestId: response.headers.get("x-request-id") ?? response.headers.get("request-id") ?? null,
+    data: parsed,
+    error: response.ok ? null : extractComposioErrorMessage(parsed),
+  };
 }
 
 function extractComposioErrorMessage(payload: unknown): string {
@@ -2091,43 +2365,29 @@ async function requestComposioStorageUpload(args: {
   filename: string;
   mimeType: string;
   md5Hex: string;
+  composioConfig?: AgentTurnComposioConfig;
 }) {
-  const apiKey = env("COMPOSIO_API_KEY") || "";
-  if (!apiKey) {
-    throw new Error("COMPOSIO_API_KEY is not set");
-  }
-
-  const response = await fetch(buildComposioApiUrl("/files/upload/request"), {
+  const response = await composioApiRequest({
+    authMode: "project",
+    config: args.composioConfig,
     method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-    },
-    body: JSON.stringify({
+    path: "/files/upload/request",
+    body: {
       toolkit_slug: args.toolkitSlug,
       tool_slug: normalizeComposioToolSlug(args.toolSlug),
       filename: args.filename,
       mimetype: args.mimeType,
       md5: args.md5Hex,
-    }),
+    },
   });
-
-  const rawText = await response.text();
-  let payload: any = null;
-
-  try {
-    payload = rawText ? JSON.parse(rawText) : null;
-  } catch {
-    payload = rawText;
-  }
 
   if (!response.ok) {
     throw new Error(
-      `Composio upload request failed (${response.status} ${response.statusText}): ${extractComposioErrorMessage(payload)}`
+      `Composio upload request failed (${response.status} ${response.statusText}): ${response.error ?? "Unknown Composio API error"}`
     );
   }
 
+  const payload: any = response.data;
   const key = String(payload?.key ?? payload?.s3key ?? "").trim();
   if (!key) {
     throw new Error("Composio upload request did not return a storage key");
@@ -2169,11 +2429,13 @@ async function stageAssetToComposioStorageForTool(args: {
   toolkitSlug: string;
   toolSlug: string;
   fetchRemote?: boolean;
+  composioConfig?: AgentTurnComposioConfig;
 }): Promise<ComposioStagedAsset> {
   const loaded = await loadSessionAssetContent(args.asset, { fetchRemote: args.fetchRemote ?? true });
   const bytes = base64ToBytes(loaded.base64);
   const md5Hex = md5HexFromBytes(bytes);
   const cacheKey = [
+    getComposioProjectCacheScope(args.composioConfig),
     args.toolkitSlug,
     normalizeComposioToolSlug(args.toolSlug),
     loaded.filename,
@@ -2191,6 +2453,7 @@ async function stageAssetToComposioStorageForTool(args: {
       filename: loaded.filename,
       mimeType: loaded.mimeType,
       md5Hex,
+      composioConfig: args.composioConfig,
     });
 
     if (request.uploadUrl) {
@@ -2239,6 +2502,7 @@ async function resolveAssetForToolExecution(args: {
   toolSlug?: string | null;
   toolkitSlug?: string | null;
   fetchRemote?: boolean;
+  composioConfig?: AgentTurnComposioConfig;
 }): Promise<{
   filename: string;
   mimeType: string;
@@ -2334,6 +2598,7 @@ async function resolveAssetForToolExecution(args: {
       toolSlug,
       toolkitSlug,
       fetchRemote: args.fetchRemote ?? true,
+      composioConfig: args.composioConfig,
     });
 
     return {
@@ -2457,6 +2722,7 @@ async function transformToolInputAssets(
     toolSlug?: string;
     toolkitSlug?: string;
     fetchRemote?: boolean;
+    composioConfig?: AgentTurnComposioConfig;
   }
 ): Promise<unknown> {
   if (typeof value === "string") {
@@ -2476,6 +2742,7 @@ async function transformToolInputAssets(
         toolSlug: ctx.toolSlug,
         toolkitSlug: ctx.toolkitSlug,
         fetchRemote: ctx.fetchRemote ?? true,
+        composioConfig: ctx.composioConfig,
       });
 
       if (mode === "s3key") return resolved.staged?.s3key ?? value;
@@ -2517,6 +2784,7 @@ async function transformToolInputAssets(
         toolSlug: nextCtxBase.toolSlug,
         toolkitSlug: nextCtxBase.toolkitSlug,
         fetchRemote: nextCtxBase.fetchRemote ?? true,
+        composioConfig: nextCtxBase.composioConfig,
       });
 
       if (!resolved.staged) return value;
@@ -2586,6 +2854,7 @@ async function transformToolInputAssets(
         toolSlug: nextCtxBase.toolSlug,
         toolkitSlug: nextCtxBase.toolkitSlug,
         fetchRemote: nextCtxBase.fetchRemote ?? true,
+        composioConfig: nextCtxBase.composioConfig,
       });
 
       const next: Record<string, any> = { ...input };
@@ -2696,6 +2965,7 @@ function wrapComposioToolsWithAssetResolution(
   composioTools: ToolSet,
   deps: {
     sessionAssets: SessionAsset[];
+    composioConfig?: AgentTurnComposioConfig;
   }
 ): ToolSet {
   const wrapped: Record<string, any> = {};
@@ -2719,6 +2989,7 @@ function wrapComposioToolsWithAssetResolution(
           toolSlug: normalizedToolSlug,
           toolkitSlug,
           fetchRemote: true,
+          composioConfig: deps.composioConfig,
         });
         return await toolDef.execute(resolvedInput, ...rest);
       },
@@ -2805,22 +3076,25 @@ function buildComposioSessionOptions(overrides?: ComposioSessionOverrides): Comp
 
 async function createComposioSessionForUser(
   userId: string,
-  overrides?: ComposioSessionOverrides
+  overrides?: ComposioSessionOverrides,
+  composioConfig?: AgentTurnComposioConfig
 ) {
-  if (!env("COMPOSIO_API_KEY")) {
+  if (!getComposioProjectApiKey(composioConfig)) {
     throw new Error("COMPOSIO_API_KEY not set");
   }
 
+  const composio = createComposioClient(composioConfig);
   return await composio.create(userId, buildComposioSessionOptions(overrides) as any);
 }
 
 async function getComposioToolsForUser(
   userId: string,
-  overrides?: ComposioSessionOverrides
+  overrides?: ComposioSessionOverrides,
+  composioConfig?: AgentTurnComposioConfig
 ): Promise<ToolSet> {
-  if (!env("COMPOSIO_API_KEY")) return {};
+  if (!getComposioProjectApiKey(composioConfig)) return {};
 
-  const session = await createComposioSessionForUser(userId, overrides);
+  const session = await createComposioSessionForUser(userId, overrides, composioConfig);
   return (await session.tools()) as ToolSet;
 }
 
@@ -2936,17 +3210,91 @@ function createEditCoalescer(opts: {
 }
 
 // ============================================================
-// MAIN
+// XState-powered orchestration
 // ============================================================
-export async function agentTurn(args: {
+type AgentTurnArgs = {
   sessionId: string;
   userId: string;
   channel: Channel;
   history: ModelMessage[];
   showTyping?: boolean;
-}) {
-  "use step";
+  composio?: AgentTurnComposioConfig;
+};
 
+type AgentTurnResult = {
+  text: string;
+  responseMessages: any[];
+  delivered?: boolean;
+};
+
+type AgentTurnBootstrap = {
+  autonomy: string;
+  normalizedHistory: ModelMessage[];
+  sessionAssets: SessionAsset[];
+  userText: string;
+  hasRichMedia: boolean;
+  primaryMessages: ModelMessage[];
+  retryMessages: ModelMessage[];
+  virtualRuntime: VirtualRuntime;
+  fastModel: string;
+  smartModel: string;
+  forceSmart: boolean;
+  modelName: string;
+  temperature: number;
+  maxToolSteps: number;
+  isTelegram: boolean;
+  telegramStreamingEnabled: boolean;
+  editThrottleMs: number;
+  typingIntervalMs: number;
+  maxEditChars: number;
+  slashCommand: { cmd: string; arg: string } | null;
+};
+
+type AgentToolBundle = {
+  nativeTools: ToolSet;
+  composioTools: ToolSet;
+  tools: ToolSet;
+  retryTools: ToolSet;
+};
+
+type AgentTurnStreamingHandle = {
+  typingLoop: { stop: () => void } | null;
+  placeholderMsgId: number | null;
+};
+
+type AgentTurnMachineInput = {
+  args: AgentTurnArgs;
+};
+
+type AgentTurnMachineContext = {
+  args: AgentTurnArgs;
+  bootstrap: AgentTurnBootstrap | null;
+  toolBundle: AgentToolBundle | null;
+  streamingHandle: AgentTurnStreamingHandle | null;
+  lastError: unknown;
+  result: AgentTurnResult | null;
+};
+
+type AgentTurnMachineEvent = {
+  type: string;
+  output?: unknown;
+  error?: unknown;
+  [key: string]: unknown;
+};
+
+type AgentTurnMachineContextArg = {
+  context: AgentTurnMachineContext;
+};
+
+type AgentTurnMachineInputArg = {
+  input: AgentTurnMachineInput;
+};
+
+type AgentTurnMachineEventArg = {
+  event: AgentTurnMachineEvent;
+};
+
+async function buildAgentTurnBootstrap(args: AgentTurnArgs): Promise<AgentTurnBootstrap> {
   const autonomy = env("AUTONOMOUS_MODE") ?? "assistive";
 
   const normalizedHistory = normalizeHistory(args.history);
@@ -2987,12 +3335,40 @@ export async function agentTurn(args: {
   const typingIntervalMs = Math.max(1000, Number(env("TELEGRAM_TYPING_INTERVAL_MS") ?? 4000));
   const maxEditChars = Math.max(800, Math.min(3800, Number(env("TELEGRAM_STREAM_CHUNK_CHARS") ?? 3500)));
 
-  let typingLoop: { stop: () => void } | null = null;
-  let placeholderMsgId: number | null = null;
+  return {
+    autonomy,
+    normalizedHistory,
+    sessionAssets,
+    userText,
+    hasRichMedia,
+    primaryMessages,
+    retryMessages,
+    virtualRuntime,
+    fastModel,
+    smartModel,
+    forceSmart,
+    modelName,
+    temperature,
+    maxToolSteps,
+    isTelegram,
+    telegramStreamingEnabled,
+    editThrottleMs,
+    typingIntervalMs,
+    maxEditChars,
+    slashCommand: parseSlashCommand(userText),
+  };
+}
 
-  // ============================================================
-  // Native tools
-  // ============================================================
+function createNativeAgentTools(args: {
+  request: AgentTurnArgs;
+  bootstrap: AgentTurnBootstrap;
+}): ToolSet {
+  const requestArgs = args.request;
+  const bootstrap = args.bootstrap;
+  const virtualRuntime = bootstrap.virtualRuntime;
+  const userText = bootstrap.userText;
+  const sessionAssets = bootstrap.sessionAssets;
+
   const scheduleMessage = tool({
     description: "Schedule a message back to this user/session after delaySeconds.",
     inputSchema: zodSchema(
@@ -3006,8 +3382,8 @@ export async function agentTurn(args: {
       const id = await createSendTask({
         type: "send",
         dueAt,
-        channel: args.channel,
-        sessionId: args.sessionId,
+        channel: requestArgs.channel,
+        sessionId: requestArgs.sessionId,
         text: input.text,
         createdBy: "agent",
       } as any);
@@ -3288,30 +3664,199 @@ export async function agentTurn(args: {
     },
   });
 
-  // ============================================================
-  // Fast-path /ssh
-  // ============================================================
-  const slash = parseSlashCommand(userText);
-  if (slash?.cmd === "/ssh") {
-    const cmd = slash.arg;
-    const out = cmd ? await sshExec(cmd) : "Usage: /ssh <command>";
-    return { text: String(out), responseMessages: [] as any[] };
-  }
+  const composioGetMcpServer = tool({
+    description:
+      "Get the Composio MCP server URL and headers for this user session. Use when an MCP-compatible client needs connection details.",
+    inputSchema: zodSchema(z.object({})),
+    execute: async () => {
+      try {
+        const session = await createComposioSessionForUser(requestArgs.userId, requestArgs.composio?.session, requestArgs.composio);
+        const mcp: any = (session as any)?.mcp ?? null;
+        return {
+          ok: Boolean(mcp?.url),
+          userId: requestArgs.userId,
+          url: mcp?.url ?? null,
+          headers: mcp?.headers ?? null,
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          error: String(error?.message ?? error ?? "Unknown composio_get_mcp_server error"),
+        };
+      }
+    },
+  });
 
-  // ============================================================
-  // Load Composio session meta tools and wrap them with deterministic asset resolution
-  // ============================================================
-  let composioTools: ToolSet = {};
-  if (env("COMPOSIO_API_KEY")) {
-    const rawTools = await getComposioToolsForUser(args.userId).catch(() => ({} as ToolSet));
-    composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
-      sessionAssets,
-    });
-  }
+  const composioProjectApiRequest = tool({
+    description:
+      "Call any project-scoped Composio REST API v3 endpoint dynamically. Use for platform/admin operations not exposed by the session meta tools, such as webhook subscriptions, trigger lifecycle, connected accounts, auth configs, toolkits, tools, files, MCP, tool_router session endpoints, and project config.",
+    inputSchema: zodSchema(
+      z.object({
+        method: z.string().min(1).max(10).optional(),
+        path: z.string().min(1).max(2000),
+        query: z.record(z.string(), z.any()).optional(),
+        body: z.any().optional(),
+        rawBody: z.string().optional(),
+        rawBodyBase64: z.string().optional(),
+        contentType: z.string().optional(),
+        headers: z.record(z.string(), z.string()).optional(),
+      })
+    ),
+    execute: async (input: {
+      method?: string;
+      path: string;
+      query?: Record<string, unknown>;
+      body?: unknown;
+      rawBody?: string;
+      rawBodyBase64?: string;
+      contentType?: string;
+      headers?: Record<string, string>;
+    }) => {
+      try {
+        return await composioApiRequest({
+          ...input,
+          authMode: "project",
+          config: requestArgs.composio,
+        });
+      } catch (error: any) {
+        return {
+          ok: false,
+          status: null,
+          statusText: null,
+          error: String(error?.message ?? error ?? "Unknown composio_api_request error"),
+          data: null,
+        };
+      }
+    },
+  });
 
-  const nativeTools: ToolSet = {
+  const composioOrgApiRequest = tool({
+    description:
+      "Call any org-scoped Composio REST API v3 endpoint dynamically. Use only for organization-level operations such as listing or creating projects. Requires COMPOSIO_ORG_API_KEY or an orgApiKey override.",
+    inputSchema: zodSchema(
+      z.object({
+        method: z.string().min(1).max(10).optional(),
+        path: z.string().min(1).max(2000),
+        query: z.record(z.string(), z.any()).optional(),
+        body: z.any().optional(),
+        rawBody: z.string().optional(),
+        rawBodyBase64: z.string().optional(),
+        contentType: z.string().optional(),
+        headers: z.record(z.string(), z.string()).optional(),
+      })
+    ),
+    execute: async (input: {
+      method?: string;
+      path: string;
+      query?: Record<string, unknown>;
+      body?: unknown;
+      rawBody?: string;
+      rawBodyBase64?: string;
+      contentType?: string;
+      headers?: Record<string, string>;
+    }) => {
+      try {
+        return await composioApiRequest({
+          ...input,
+          authMode: "org",
+          config: requestArgs.composio,
+        });
+      } catch (error: any) {
+        return {
+          ok: false,
+          status: null,
+          statusText: null,
+          error: String(error?.message ?? error ?? "Unknown composio_org_api_request error"),
+          data: null,
+        };
+      }
+    },
+  });
+
+  const composioVerifyWebhookSignature = tool({
+    description:
+      "Verify a Composio webhook signature using the webhook id, timestamp, raw payload string, and signature header. Use when debugging or implementing webhook handlers.",
+    inputSchema: zodSchema(
+      z.object({
+        id: z.string().min(1),
+        timestamp: z.string().min(1),
+        signature: z.string().min(1),
+        payload: z.string().min(1),
+        secret: z.string().optional(),
+        toleranceSeconds: z.number().int().min(0).max(86_400).optional(),
+      })
+    ),
+    execute: async (input: {
+      id: string;
+      timestamp: string;
+      signature: string;
+      payload: string;
+      secret?: string;
+      toleranceSeconds?: number;
+    }) => {
+      try {
+        const secret = String(input.secret ?? env("COMPOSIO_WEBHOOK_SECRET") ?? "").trim();
+        if (!secret) {
+          return {
+            ok: false,
+            error: "COMPOSIO_WEBHOOK_SECRET not set and no secret provided",
+          };
+        }
+
+        const toleranceSeconds = input.toleranceSeconds ?? 300;
+        const parsedTimestamp = parseWebhookTimestampSeconds(input.timestamp);
+        if (parsedTimestamp == null) {
+          return {
+            ok: false,
+            error: "Invalid webhook timestamp",
+          };
+        }
+
+        if (toleranceSeconds > 0) {
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          if (Math.abs(nowSeconds - parsedTimestamp) > toleranceSeconds) {
+            return {
+              ok: false,
+              error: `Webhook timestamp outside tolerance (${toleranceSeconds}s)`,
+              parsedTimestamp,
+            };
+          }
+        }
+
+        const signingString = `${input.id}.${input.timestamp}.${input.payload}`;
+        const expected = await hmacSha256Base64(secret, signingString);
+        const received = extractWebhookSignatureValue(input.signature);
+        const verified = constantTimeEquals(expected, received);
+        const parsedPayload = tryParseJson(input.payload);
+
+        return {
+          ok: verified,
+          verified,
+          expectedSignatureBase64: expected,
+          receivedSignatureBase64: received,
+          version: detectComposioWebhookVersion(parsedPayload),
+          parsedTimestamp,
+          eventType: (parsedPayload as any)?.type ?? null,
+          triggerSlug: (parsedPayload as any)?.metadata?.trigger_slug ?? (parsedPayload as any)?.trigger_slug ?? null,
+          payload: parsedPayload,
+          error: verified ? null : "Invalid webhook signature",
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          error: String(error?.message ?? error ?? "Unknown composio_verify_webhook_signature error"),
+        };
+      }
+    },
+  });
+
+  return {
     schedule_message: scheduleMessage,
     ssh_exec: sshTool,
+    composio_get_mcp_server: composioGetMcpServer,
+    composio_api_request: composioProjectApiRequest,
+    composio_org_api_request: composioOrgApiRequest,
+    composio_verify_webhook_signature: composioVerifyWebhookSignature,
     list_skills: listSkills,
     read_skill: readSkill,
     read_virtual_file: readVirtualFile,
@@ -3321,185 +3866,45 @@ export async function agentTurn(args: {
     prepare_session_asset: prepareSessionAsset,
     materialize_session_asset: materializeSessionAsset,
   };
+}
 
+async function loadAgentToolBundle(args: {
+  request: AgentTurnArgs;
+  bootstrap: AgentTurnBootstrap;
+}): Promise<AgentToolBundle> {
+  let composioTools: ToolSet = {};
+  if (getComposioProjectApiKey(args.request.composio)) {
+    const rawTools = await getComposioToolsForUser(
+      args.request.userId,
+      args.request.composio?.session,
+      args.request.composio
+    ).catch(() => ({} as ToolSet));
+
+    composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
+      sessionAssets: args.bootstrap.sessionAssets,
+      composioConfig: args.request.composio,
+    });
+  }
+
+  const nativeTools = createNativeAgentTools(args);
   const tools: ToolSet = {
     ...composioTools,
     ...nativeTools,
   };
 
-  const retryTools: ToolSet = tools;
+  return {
+    nativeTools,
+    composioTools,
+    tools,
+    retryTools: tools,
+  };
+}
 
-  // ============================================================
-  // Telegram streaming helpers
-  // ============================================================
-  async function deliverFinalTelegram(text: string) {
-    const chunks = splitForTelegram(text, maxEditChars);
-
-    if (placeholderMsgId != null) {
-      try {
-        await telegramEditMessageText(args.sessionId, placeholderMsgId, chunks[0]);
-      } catch {
-        placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
-      }
-    } else {
-      placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
-    }
-
-    for (let i = 1; i < chunks.length; i++) {
-      await telegramSendMessage(args.sessionId, chunks[i], { disableNotification: true });
-    }
-
-    return { delivered: true };
-  }
-
-  async function streamToTelegram(fullStream: AsyncIterable<any>): Promise<string> {
-    let full = "";
-    let stepNumber = 0;
-    let sawReasoning = false;
-
-    const toolStates = new Map<string, TelegramLiveToolState>();
-
-    const editor = createEditCoalescer({
-      sessionId: args.sessionId,
-      messageId: placeholderMsgId!,
-      throttleMs: editThrottleMs,
-    });
-
-    const requestRender = () => {
-      if (full.length > 0) {
-        editor.requestTypewriter(truncateForTelegramLive(full, maxEditChars));
-        return;
-      }
-
-      editor.requestStatus(
-        truncateForTelegramLive(
-          renderTelegramStatus({
-            stepNumber,
-            sawReasoning,
-            tools: Array.from(toolStates.values()),
-          }),
-          maxEditChars
-        )
-      );
-    };
-
-    const upsertToolState = (part: any, patch: Partial<TelegramLiveToolState>) => {
-      const toolCallId = String(part?.toolCallId ?? part?.id ?? "");
-      const prev = toolStates.get(toolCallId) ?? {
-        toolCallId,
-        toolName: String(part?.toolName ?? "tool"),
-        status: "running" as const,
-      };
-
-      toolStates.set(toolCallId, {
-        ...prev,
-        ...patch,
-        toolCallId,
-        toolName: String(part?.toolName ?? patch.toolName ?? prev.toolName ?? "tool"),
-      });
-    };
-
-    requestRender();
-
-    for await (const part of fullStream) {
-      const type = String(part?.type ?? "");
-
-      switch (type) {
-        case "start-step": {
-          stepNumber += 1;
-          requestRender();
-          break;
-        }
-
-        case "reasoning":
-        case "reasoning-start":
-        case "reasoning-delta": {
-          sawReasoning = true;
-          requestRender();
-          break;
-        }
-
-        case "tool-input-start":
-        case "tool-call-streaming-start": {
-          upsertToolState(part, {
-            status: "running",
-          });
-          requestRender();
-          break;
-        }
-
-        case "tool-input-delta":
-        case "tool-call-delta": {
-          const previousId = String(part?.toolCallId ?? part?.id ?? "");
-          const previous = toolStates.get(previousId);
-          const delta = String(part?.delta ?? part?.argsTextDelta ?? "");
-          const nextArgs = `${previous?.argsPreview ?? ""}${delta}`;
-
-          upsertToolState(part, {
-            status: "running",
-            argsPreview: singleLineStatus(nextArgs, 220),
-          });
-          requestRender();
-          break;
-        }
-
-        case "tool-input-end": {
-          requestRender();
-          break;
-        }
-
-        case "tool-call": {
-          upsertToolState(part, {
-            status: "running",
-            argsPreview: summarizeToolPayloadForTelegram(part?.input ?? part?.args, 220),
-          });
-          requestRender();
-          break;
-        }
-
-        case "tool-result": {
-          upsertToolState(part, {
-            status: "done",
-            resultPreview: summarizeToolPayloadForTelegram(part?.output ?? part?.result, 180),
-          });
-          requestRender();
-          break;
-        }
-
-        case "text": {
-          full += String(part?.text ?? "");
-          requestRender();
-          break;
-        }
-
-        case "text-delta": {
-          full += String(part?.delta ?? part?.textDelta ?? "");
-          requestRender();
-          break;
-        }
-
-        case "text-start":
-        case "text-end":
-        case "finish-step":
-        case "finish":
-        case "error": {
-          requestRender();
-          break;
-        }
-
-        default:
-          break;
-      }
-    }
-
-    await editor.flush();
-    return full;
-  }
-
-  // ============================================================
-  // System prompt
-  // ============================================================
-  const system = [
+function buildAgentSystemPrompt(args: {
+  request: AgentTurnArgs;
+  bootstrap: AgentTurnBootstrap;
+}): string {
+  return [
     "You are an Agentic Operating System assistant running in Telegram/WhatsApp/SMS with Composio tools.",
     "",
     "CRITICAL TOOL RULES:",
@@ -3509,11 +3914,17 @@ export async function agentTurn(args: {
     "- Let Composio search, authenticate, and execute dynamically at runtime instead of relying on hard-coded toolkit routing.",
     "",
     "COMPOSIO SESSION:",
-    `- Active namespace: ${args.userId}`,
-    "- session.tools() returns Composio meta tools for discovery, auth, and execution.",
-    "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app tool slug.",
+    `- Active namespace: ${args.request.userId}`,
+    "- session.tools() returns Composio meta tools for discovery, auth, execution, browser automation toolkit discovery, and the persistent workbench sandbox.",
+    "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app/tool slug or need browser automation or other dynamic toolkit discovery.",
+    "- Use COMPOSIO_GET_TOOL_SCHEMAS to inspect exact tool inputs before execution.",
     "- Use COMPOSIO_MANAGE_CONNECTIONS when auth may be missing or the user asks to connect an app.",
     "- Use COMPOSIO_MULTI_EXECUTE_TOOL or COMPOSIO_EXECUTE_TOOL to run Composio actions after discovery.",
+    "- Use COMPOSIO_REMOTE_WORKBENCH or COMPOSIO_REMOTE_BASH_TOOL for the Composio code sandbox/workbench.",
+    "- Use composio_api_request for project-scoped Composio platform APIs that are outside session meta tools, including /webhook_subscriptions, /trigger_instances, /triggers_types, /connected_accounts, /auth_configs, /toolkits, /tools, /files, /mcp, /tool_router, and /org/project/config.",
+    "- Use composio_org_api_request only for org-level project administration endpoints such as /org/owner/project/list or /org/owner/project/new when an org key is configured.",
+    "- Use composio_get_mcp_server to retrieve MCP connection info for this user session.",
+    "- Use composio_verify_webhook_signature when working with inbound webhook payloads and headers.",
     "",
     "FILESYSTEM:",
     "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
@@ -3521,7 +3932,7 @@ export async function agentTurn(args: {
     "- Prefer /workspace for drafts, payloads, notes, JSON, and staging.",
     "",
     "MODALITIES:",
-    `- Session asset count available via tools: ${sessionAssets.length}`,
+    `- Session asset count available via tools: ${args.bootstrap.sessionAssets.length}`,
     "- Use list_session_assets to inspect assets.",
     "- Use prepare_session_asset first for metadata and upload hints.",
     "- When calling external tools, pass asset references like asset://asset_m6_p2.",
@@ -3535,83 +3946,630 @@ export async function agentTurn(args: {
     "SKILLS:",
     "- Use list_skills or read_skill only when needed.",
     "",
-    `Mode: ${autonomy}`,
+    `Mode: ${args.bootstrap.autonomy}`,
     "Be concise, accurate, and tool-grounded.",
   ].join("\n");
+}
 
-  async function runStreamingAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
-    const s = streamText(
-      buildModelCallArgs({
-        modelName,
-        system,
-        messages: attemptMessages,
-        tools: attemptTools,
-        temperature,
-        maxToolSteps,
-      })
-    );
-
-    const streamedText = await streamToTelegram(s.fullStream as AsyncIterable<any>);
-
-    const maybeText = (s as any).text;
-    const fallbackText =
-      typeof maybeText === "string"
-        ? maybeText
-        : maybeText && typeof maybeText.then === "function"
-          ? await maybeText
-          : "";
-
-    const text = String(streamedText || fallbackText || "").trim();
-
-    if (!text) {
-      throw new Error("Streaming completed without assistant text");
-    }
-
-    await deliverFinalTelegram(text);
-
-    const responseMessages = Array.isArray((await (s as any).response)?.messages)
-      ? ((await (s as any).response).messages as any[])
-      : [];
-
-    return { text, responseMessages, delivered: true };
-  }
-
-
-  async function runGenerateAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
-    const r = await generateText(
-      buildModelCallArgs({
-        modelName,
-        system,
-        messages: attemptMessages,
-        tools: attemptTools,
-        temperature,
-        maxToolSteps,
-      })
-    );
-
-    return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
-  }
+async function prepareTelegramStreamingHandle(
+  request: AgentTurnArgs,
+  bootstrap: AgentTurnBootstrap
+): Promise<AgentTurnStreamingHandle> {
+  const typingLoop = telegramStartChatActionLoop(request.sessionId, "typing", {
+    intervalMs: bootstrap.typingIntervalMs,
+  });
 
   try {
-    if (telegramStreamingEnabled) {
-      typingLoop = telegramStartChatActionLoop(args.sessionId, "typing", { intervalMs: typingIntervalMs });
-      placeholderMsgId = await telegramSendMessage(args.sessionId, "Thinking…", { disableNotification: true });
+    const placeholderMsgId = await telegramSendMessage(request.sessionId, "Thinking…", {
+      disableNotification: true,
+    });
 
-      try {
-        return await runStreamingAttempt(primaryMessages, tools);
-      } catch (error) {
-        if (!isPromptBudgetRetryableError(error)) throw error;
-        return await runStreamingAttempt(retryMessages, retryTools);
+    return {
+      typingLoop,
+      placeholderMsgId,
+    };
+  } catch (error) {
+    typingLoop?.stop();
+    throw error;
+  }
+}
+
+async function deliverFinalTelegram(args: {
+  sessionId: string;
+  placeholderMsgId: number | null;
+  text: string;
+  maxEditChars: number;
+}) {
+  const chunks = splitForTelegram(args.text, args.maxEditChars);
+
+  let messageId = args.placeholderMsgId;
+
+  if (messageId != null) {
+    try {
+      await telegramEditMessageText(args.sessionId, messageId, chunks[0]);
+    } catch {
+      messageId = await telegramSendMessage(args.sessionId, chunks[0]);
+    }
+  } else {
+    messageId = await telegramSendMessage(args.sessionId, chunks[0]);
+  }
+
+  for (let i = 1; i < chunks.length; i++) {
+    await telegramSendMessage(args.sessionId, chunks[i], { disableNotification: true });
+  }
+
+  return { delivered: true, messageId };
+}
+
+async function streamToTelegram(args: {
+  sessionId: string;
+  placeholderMsgId: number;
+  fullStream: AsyncIterable<any>;
+  editThrottleMs: number;
+  maxEditChars: number;
+}): Promise<string> {
+  let full = "";
+  let stepNumber = 0;
+  let sawReasoning = false;
+
+  const toolStates = new Map<string, TelegramLiveToolState>();
+
+  const editor = createEditCoalescer({
+    sessionId: args.sessionId,
+    messageId: args.placeholderMsgId,
+    throttleMs: args.editThrottleMs,
+  });
+
+  const requestRender = () => {
+    if (full.length > 0) {
+      editor.requestTypewriter(truncateForTelegramLive(full, args.maxEditChars));
+      return;
+    }
+
+    editor.requestStatus(
+      truncateForTelegramLive(
+        renderTelegramStatus({
+          stepNumber,
+          sawReasoning,
+          tools: Array.from(toolStates.values()),
+        }),
+        args.maxEditChars
+      )
+    );
+  };
+
+  const upsertToolState = (part: any, patch: Partial<TelegramLiveToolState>) => {
+    const toolCallId = String(part?.toolCallId ?? part?.id ?? "");
+    const prev = toolStates.get(toolCallId) ?? {
+      toolCallId,
+      toolName: String(part?.toolName ?? "tool"),
+      status: "running" as const,
+    };
+
+    toolStates.set(toolCallId, {
+      ...prev,
+      ...patch,
+      toolCallId,
+      toolName: String(part?.toolName ?? patch.toolName ?? prev.toolName ?? "tool"),
+    });
+  };
+
+  requestRender();
+
+  for await (const part of args.fullStream) {
+    const type = String(part?.type ?? "");
+
+    switch (type) {
+      case "start-step": {
+        stepNumber += 1;
+        requestRender();
+        break;
       }
+
+      case "reasoning":
+      case "reasoning-start":
+      case "reasoning-delta": {
+        sawReasoning = true;
+        requestRender();
+        break;
+      }
+
+      case "tool-input-start":
+      case "tool-call-streaming-start": {
+        upsertToolState(part, {
+          status: "running",
+        });
+        requestRender();
+        break;
+      }
+
+      case "tool-input-delta":
+      case "tool-call-delta": {
+        const previousId = String(part?.toolCallId ?? part?.id ?? "");
+        const previous = toolStates.get(previousId);
+        const delta = String(part?.delta ?? part?.argsTextDelta ?? "");
+        const nextArgs = `${previous?.argsPreview ?? ""}${delta}`;
+
+        upsertToolState(part, {
+          status: "running",
+          argsPreview: singleLineStatus(nextArgs, 220),
+        });
+        requestRender();
+        break;
+      }
+
+      case "tool-input-end": {
+        requestRender();
+        break;
+      }
+
+      case "tool-call": {
+        upsertToolState(part, {
+          status: "running",
+          argsPreview: summarizeToolPayloadForTelegram(part?.input ?? part?.args, 220),
+        });
+        requestRender();
+        break;
+      }
+
+      case "tool-result": {
+        upsertToolState(part, {
+          status: "done",
+          resultPreview: summarizeToolPayloadForTelegram(part?.output ?? part?.result, 180),
+        });
+        requestRender();
+        break;
+      }
+
+      case "text": {
+        full += String(part?.text ?? "");
+        requestRender();
+        break;
+      }
+
+      case "text-delta": {
+        full += String(part?.delta ?? part?.textDelta ?? "");
+        requestRender();
+        break;
+      }
+
+      case "text-start":
+      case "text-end":
+      case "finish-step":
+      case "finish":
+      case "error": {
+        requestRender();
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  await editor.flush();
+  return full;
+}
+
+async function runStreamingAttempt(args: {
+  request: AgentTurnArgs;
+  bootstrap: AgentTurnBootstrap;
+  messages: ModelMessage[];
+  tools: ToolSet;
+  system: string;
+  placeholderMsgId: number | null;
+}): Promise<AgentTurnResult> {
+  const placeholderMsgId =
+    args.placeholderMsgId ??
+    (await telegramSendMessage(args.request.sessionId, "Thinking…", { disableNotification: true }));
+
+  const streamResult = streamText(
+    buildModelCallArgs({
+      modelName: args.bootstrap.modelName,
+      system: args.system,
+      messages: args.messages,
+      tools: args.tools,
+      temperature: args.bootstrap.temperature,
+      maxToolSteps: args.bootstrap.maxToolSteps,
+    })
+  );
+
+  const streamedText = await streamToTelegram({
+    sessionId: args.request.sessionId,
+    placeholderMsgId,
+    fullStream: streamResult.fullStream as AsyncIterable<any>,
+    editThrottleMs: args.bootstrap.editThrottleMs,
+    maxEditChars: args.bootstrap.maxEditChars,
+  });
+
+  const maybeText = (streamResult as any).text;
+  const fallbackText =
+    typeof maybeText === "string"
+      ? maybeText
+      : maybeText && typeof maybeText.then === "function"
+        ? await maybeText
+        : "";
+
+  const text = String(streamedText || fallbackText || "").trim();
+  if (!text) {
+    throw new Error("Streaming completed without assistant text");
+  }
+
+  await deliverFinalTelegram({
+    sessionId: args.request.sessionId,
+    placeholderMsgId,
+    text,
+    maxEditChars: args.bootstrap.maxEditChars,
+  });
+
+  const response = await (streamResult as any).response;
+  const responseMessages = Array.isArray(response?.messages) ? (response.messages as any[]) : [];
+
+  return {
+    text,
+    responseMessages,
+    delivered: true,
+  };
+}
+
+async function runGenerateAttempt(args: {
+  bootstrap: AgentTurnBootstrap;
+  messages: ModelMessage[];
+  tools: ToolSet;
+  system: string;
+}): Promise<AgentTurnResult> {
+  const result = await generateText(
+    buildModelCallArgs({
+      modelName: args.bootstrap.modelName,
+      system: args.system,
+      messages: args.messages,
+      tools: args.tools,
+      temperature: args.bootstrap.temperature,
+      maxToolSteps: args.bootstrap.maxToolSteps,
+    })
+  );
+
+  return {
+    text: result.text,
+    responseMessages: (result.response?.messages as any[]) ?? [],
+  };
+}
+
+const agentTurnMachine = setup({
+  types: {
+    input: {} as AgentTurnMachineInput,
+    context: {} as AgentTurnMachineContext,
+    events: {} as AgentTurnMachineEvent,
+    output: {} as AgentTurnResult,
+  },
+  guards: {
+    hasSlashSsh: ({ context }: AgentTurnMachineContextArg) => context.bootstrap?.slashCommand?.cmd === "/ssh",
+    shouldPrepareStreaming: ({ context }: AgentTurnMachineContextArg) => Boolean(context.bootstrap?.telegramStreamingEnabled),
+    canRetryPromptBudget: ({ event }: AgentTurnMachineEventArg) => isPromptBudgetRetryableError((event as any)?.error),
+  },
+  actions: {
+    storeBootstrap: assign({
+      bootstrap: ({ event }: AgentTurnMachineEventArg) => ((event as any)?.output ?? null) as AgentTurnBootstrap | null,
+    }),
+    storeToolBundle: assign({
+      toolBundle: ({ event }: AgentTurnMachineEventArg) => ((event as any)?.output ?? null) as AgentToolBundle | null,
+    }),
+    storeStreamingHandle: assign({
+      streamingHandle: ({ event }: AgentTurnMachineEventArg) => ((event as any)?.output ?? null) as AgentTurnStreamingHandle | null,
+    }),
+    storeResult: assign({
+      result: ({ event }: AgentTurnMachineEventArg) => ((event as any)?.output ?? null) as AgentTurnResult | null,
+      lastError: () => null,
+    }),
+    storeError: assign({
+      lastError: ({ event }: AgentTurnMachineEventArg) => (event as any)?.error ?? new Error("Unknown agentTurn error"),
+    }),
+    stopTypingLoop: ({ context }: AgentTurnMachineContextArg) => {
+      context.streamingHandle?.typingLoop?.stop();
+    },
+    throwLastError: ({ context }: AgentTurnMachineContextArg) => {
+      throw context.lastError ?? new Error("agentTurn failed");
+    },
+  },
+  actors: {
+    bootstrap: fromPromise(async ({ input }: { input: AgentTurnMachineInput }) => {
+      return await buildAgentTurnBootstrap(input.args);
+    }),
+    slashSsh: fromPromise(async ({ input }: { input: { args: AgentTurnArgs; bootstrap: AgentTurnBootstrap | null } }) => {
+      const cmd = input.bootstrap?.slashCommand?.arg ?? "";
+      const out = cmd ? await sshExec(cmd) : "Usage: /ssh <command>";
+      return { text: String(out), responseMessages: [] as any[] } satisfies AgentTurnResult;
+    }),
+    loadTools: fromPromise(
+      async ({
+        input,
+      }: {
+        input: { args: AgentTurnArgs; bootstrap: AgentTurnBootstrap | null };
+      }) => {
+        if (!input.bootstrap) {
+          throw new Error("Cannot load tools before bootstrap is initialized");
+        }
+        return await loadAgentToolBundle({
+          request: input.args,
+          bootstrap: input.bootstrap,
+        });
+      }
+    ),
+    prepareStreaming: fromPromise(
+      async ({
+        input,
+      }: {
+        input: { args: AgentTurnArgs; bootstrap: AgentTurnBootstrap | null };
+      }) => {
+        if (!input.bootstrap) {
+          throw new Error("Cannot prepare Telegram streaming before bootstrap is initialized");
+        }
+        return await prepareTelegramStreamingHandle(input.args, input.bootstrap);
+      }
+    ),
+    executePrimary: fromPromise(
+      async ({
+        input,
+      }: {
+        input: {
+          args: AgentTurnArgs;
+          bootstrap: AgentTurnBootstrap | null;
+          toolBundle: AgentToolBundle | null;
+          streamingHandle: AgentTurnStreamingHandle | null;
+        };
+      }) => {
+        if (!input.bootstrap || !input.toolBundle) {
+          throw new Error("Cannot execute agent turn before bootstrap and tools are initialized");
+        }
+
+        const system = buildAgentSystemPrompt({
+          request: input.args,
+          bootstrap: input.bootstrap,
+        });
+
+        if (input.bootstrap.telegramStreamingEnabled) {
+          return await runStreamingAttempt({
+            request: input.args,
+            bootstrap: input.bootstrap,
+            messages: input.bootstrap.primaryMessages,
+            tools: input.toolBundle.tools,
+            system,
+            placeholderMsgId: input.streamingHandle?.placeholderMsgId ?? null,
+          });
+        }
+
+        return await runGenerateAttempt({
+          bootstrap: input.bootstrap,
+          messages: input.bootstrap.primaryMessages,
+          tools: input.toolBundle.tools,
+          system,
+        });
+      }
+    ),
+    executeRetry: fromPromise(
+      async ({
+        input,
+      }: {
+        input: {
+          args: AgentTurnArgs;
+          bootstrap: AgentTurnBootstrap | null;
+          toolBundle: AgentToolBundle | null;
+          streamingHandle: AgentTurnStreamingHandle | null;
+        };
+      }) => {
+        if (!input.bootstrap || !input.toolBundle) {
+          throw new Error("Cannot retry agent turn before bootstrap and tools are initialized");
+        }
+
+        const system = buildAgentSystemPrompt({
+          request: input.args,
+          bootstrap: input.bootstrap,
+        });
+
+        if (input.bootstrap.telegramStreamingEnabled) {
+          return await runStreamingAttempt({
+            request: input.args,
+            bootstrap: input.bootstrap,
+            messages: input.bootstrap.retryMessages,
+            tools: input.toolBundle.retryTools,
+            system,
+            placeholderMsgId: input.streamingHandle?.placeholderMsgId ?? null,
+          });
+        }
+
+        return await runGenerateAttempt({
+          bootstrap: input.bootstrap,
+          messages: input.bootstrap.retryMessages,
+          tools: input.toolBundle.retryTools,
+          system,
+        });
+      }
+    ),
+  },
+}).createMachine({
+  id: "agentTurn",
+  output: ({ context }: AgentTurnMachineContextArg) => {
+    if (!context.result) {
+      throw new Error("agentTurn completed without a result");
+    }
+    return context.result;
+  },
+  context: ({ input }: AgentTurnMachineInputArg) => ({
+    args: input.args,
+    bootstrap: null,
+    toolBundle: null,
+    streamingHandle: null,
+    lastError: null,
+    result: null,
+  }),
+  initial: "bootstrapping",
+  states: {
+    bootstrapping: {
+      invoke: {
+        src: "bootstrap",
+        input: ({ context }: AgentTurnMachineContextArg) => ({ args: context.args }),
+        onDone: {
+          target: "route",
+          actions: "storeBootstrap",
+        },
+        onError: {
+          target: "failure",
+          actions: "storeError",
+        },
+      },
+    },
+    route: {
+      always: [
+        {
+          guard: "hasSlashSsh",
+          target: "slashSsh",
+        },
+        {
+          target: "loadTools",
+        },
+      ],
+    },
+    slashSsh: {
+      invoke: {
+        src: "slashSsh",
+        input: ({ context }: AgentTurnMachineContextArg) => ({
+          args: context.args,
+          bootstrap: context.bootstrap,
+        }),
+        onDone: {
+          target: "success",
+          actions: "storeResult",
+        },
+        onError: {
+          target: "failure",
+          actions: "storeError",
+        },
+      },
+    },
+    loadTools: {
+      invoke: {
+        src: "loadTools",
+        input: ({ context }: AgentTurnMachineContextArg) => ({
+          args: context.args,
+          bootstrap: context.bootstrap,
+        }),
+        onDone: {
+          target: "maybePrepareStreaming",
+          actions: "storeToolBundle",
+        },
+        onError: {
+          target: "failure",
+          actions: "storeError",
+        },
+      },
+    },
+    maybePrepareStreaming: {
+      always: [
+        {
+          guard: "shouldPrepareStreaming",
+          target: "prepareStreaming",
+        },
+        {
+          target: "executePrimary",
+        },
+      ],
+    },
+    prepareStreaming: {
+      invoke: {
+        src: "prepareStreaming",
+        input: ({ context }: AgentTurnMachineContextArg) => ({
+          args: context.args,
+          bootstrap: context.bootstrap,
+        }),
+        onDone: {
+          target: "executePrimary",
+          actions: "storeStreamingHandle",
+        },
+        onError: {
+          target: "failure",
+          actions: "storeError",
+        },
+      },
+    },
+    executePrimary: {
+      invoke: {
+        src: "executePrimary",
+        input: ({ context }: AgentTurnMachineContextArg) => ({
+          args: context.args,
+          bootstrap: context.bootstrap,
+          toolBundle: context.toolBundle,
+          streamingHandle: context.streamingHandle,
+        }),
+        onDone: {
+          target: "success",
+          actions: "storeResult",
+        },
+        onError: [
+          {
+            guard: "canRetryPromptBudget",
+            target: "executeRetry",
+            actions: "storeError",
+          },
+          {
+            target: "failure",
+            actions: "storeError",
+          },
+        ],
+      },
+    },
+    executeRetry: {
+      invoke: {
+        src: "executeRetry",
+        input: ({ context }: AgentTurnMachineContextArg) => ({
+          args: context.args,
+          bootstrap: context.bootstrap,
+          toolBundle: context.toolBundle,
+          streamingHandle: context.streamingHandle,
+        }),
+        onDone: {
+          target: "success",
+          actions: "storeResult",
+        },
+        onError: {
+          target: "failure",
+          actions: "storeError",
+        },
+      },
+    },
+    success: {
+      type: "final",
+      entry: "stopTypingLoop",
+    },
+    failure: {
+      entry: ["stopTypingLoop", "throwLastError"],
+    },
+  },
+});
+
+// ============================================================
+// MAIN
+// ============================================================
+export async function agentTurn(args: AgentTurnArgs) {
+  "use step";
+
+  const actor = createActor(agentTurnMachine, {
+    input: { args },
+  });
+
+  try {
+    actor.start();
+    return await toPromise(actor);
+  } finally {
+    try {
+      actor.getSnapshot().context.streamingHandle?.typingLoop?.stop();
+    } catch {
+      // best effort only
     }
 
     try {
-      return await runGenerateAttempt(primaryMessages, tools);
-    } catch (error) {
-      if (!isPromptBudgetRetryableError(error)) throw error;
-      return await runGenerateAttempt(retryMessages, retryTools);
+      actor.stop();
+    } catch {
+      // best effort only
     }
-  } finally {
-    typingLoop?.stop();
   }
 }
