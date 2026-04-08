@@ -3491,7 +3491,7 @@ async function buildAgentTurnBootstrap(args: AgentTurnArgs): Promise<AgentTurnBo
 
   const editThrottleMs = 120;
   const typingIntervalMs = Math.max(1000, Number(env("TELEGRAM_TYPING_INTERVAL_MS") ?? 4000));
-  const maxEditChars = Math.max(800, Math.min(3800, Number(env("TELEGRAM_STREAM_CHUNK_CHARS") ?? 3500)));
+  const maxEditChars = Math.max(800, Math.min(3800, Number(env("TELEGRAM_STREAM_CHUNK_CHARS") ?? 3000)));
 
   return {
     autonomy,
@@ -3561,7 +3561,7 @@ function createNativeAgentTools(args: {
     inputSchema: zodSchema(z.object({ command: z.string().min(1).max(2000) })),
     execute: async (input: { command: string }) => {
       if (!allowModelSsh) {
-        const explicit = userText.startsWith("/ssh") || /ssh|run this command/i.test(userText);
+        const explicit = userText.startsWith("/ssh") || /\bssh\b|\brun this command\b/i.test(userText);
         if (!explicit) return { ok: false, blocked: true, message: "Use /ssh <command> to run SSH." };
       }
       const output = await sshExec(input.command);
@@ -4204,6 +4204,10 @@ function buildAgentSystemPrompt(args: {
     "",
     "SKILLS:",
     "- Use list_skills or read_skill only when needed.",
+    "",
+    "FORMATTING:",
+    "- When returning code, JSON, logs, stack traces, or terminal output, prefer fenced code blocks with an explicit language, for example ```typescript, ```json, ```bash, or ```text.",
+    "- Keep code fences balanced and do not emit raw HTML.",
     "",
     `Mode: ${args.bootstrap.autonomy}`,
     "Be concise, accurate, and tool-grounded.",
