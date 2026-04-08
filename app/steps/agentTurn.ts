@@ -419,6 +419,13 @@ function dirname(p: string): string {
   return s.slice(0, idx);
 }
 
+function basename(p: string): string {
+  const s = sanitizePath(p);
+  if (s === "/") return "";
+  const idx = s.lastIndexOf("/");
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
 function parentDirs(p: string): string[] {
   const s = sanitizePath(p);
   const parts = s.split("/").filter(Boolean);
@@ -1689,17 +1696,19 @@ async function loadSessionAssetContent(
 async function materializeSessionAssetToVfs(
   rt: VirtualRuntime,
   asset: SessionAsset,
-  opts?: { fetchRemote?: boolean; includeBase64?: boolean }
+  opts?: { fetchRemote?: boolean; includeBase64?: boolean; ttlSeconds?: number }
 ) {
   const includeBase64 = opts?.includeBase64 ?? false;
   const loaded = await loadSessionAssetContent(asset, { fetchRemote: opts?.fetchRemote ?? true });
   const assetRoot = sanitizePath(`/workspace/assets/${asset.id}`);
   const metaPath = sanitizePath(`${assetRoot}/meta.json`);
+  const binaryPath = sanitizePath(`${assetRoot}/content.base64`);
   const rawBase64Path = sanitizePath(`${assetRoot}/${asset.filename}.base64.txt`);
   const textPath = sanitizePath(`${assetRoot}/${asset.filename}.txt`);
   const infoPath = sanitizePath(`${assetRoot}/composio_payload.json`);
 
   await vfsEnsureDir(rt, assetRoot);
+  await vfsWriteFile(rt, binaryPath, loaded.base64);
 
   await vfsWriteFile(
     rt,
@@ -1709,6 +1718,7 @@ async function materializeSessionAssetToVfs(
       loadedMimeType: loaded.mimeType,
       loadedSizeBytes: loaded.sizeBytes,
       loadedSource: loaded.source,
+      binaryPath,
       createdAt: nowIso(),
     })
   );
@@ -1721,18 +1731,28 @@ async function materializeSessionAssetToVfs(
     await vfsWriteFile(rt, textPath, loaded.textPreview);
   }
 
+  const publicUrl = await buildSignedVfsUrlForRuntime(rt, binaryPath, {
+    filename: loaded.filename,
+    mimeType: loaded.mimeType,
+    encoding: "base64",
+    ttlSeconds: opts?.ttlSeconds ?? 900,
+  });
+
   await vfsWriteFile(
     rt,
     infoPath,
     toSafeJson({
       filename: loaded.filename,
       mimeType: loaded.mimeType,
-      url: asset.url ?? null,
+      url: publicUrl ?? asset.url ?? null,
+      sourceUrl: asset.url ?? null,
+      binaryPath,
       dataUrl: includeBase64 ? loaded.dataUrl ?? null : null,
       base64Path: includeBase64 ? rawBase64Path : null,
       textPath: loaded.textPreview != null ? textPath : null,
       notes: [
         "Prefer url when a target Composio tool accepts URL-based file ingestion.",
+        "These signed URLs are served from the Redis-backed VFS via APP_BASE_URL.",
         "Otherwise request inline content only when the target tool truly requires it.",
         "Not all Composio tools share the same schema; adapt to the declared tool input schema.",
       ],
@@ -1744,6 +1764,8 @@ async function materializeSessionAssetToVfs(
     assetId: asset.id,
     assetRoot,
     metaPath,
+    binaryPath,
+    publicUrl,
     base64Path: includeBase64 ? rawBase64Path : null,
     textPath: loaded.textPreview != null ? textPath : null,
     infoPath,
@@ -1763,27 +1785,126 @@ function getPublicBaseUrl(): string | null {
 }
 
 function getAssetSigningSecret(): string | null {
-  const v = env("ASSET_URL_SIGNING_SECRET") || env("SESSION_ASSET_SIGNING_SECRET") || "";
+  const v =
+    env("VFS_URL_SIGNING_SECRET") ||
+    env("ASSET_URL_SIGNING_SECRET") ||
+    env("SESSION_ASSET_SIGNING_SECRET") ||
+    "";
   return v.trim() || null;
 }
 
-async function buildSignedAssetUrl(asset: SessionAsset, ttlSeconds = 900): Promise<string | null> {
+type VfsUrlEncoding = "utf8" | "base64";
+
+type BuildSignedVfsUrlOptions = {
+  filename?: string;
+  mimeType?: string;
+  encoding?: VfsUrlEncoding;
+  ttlSeconds?: number;
+  download?: boolean;
+};
+
+function buildSignedVfsPayload(args: {
+  userId: string;
+  sessionId: string;
+  path: string;
+  expiresAt: number;
+  filename: string;
+  mimeType: string;
+  encoding: VfsUrlEncoding;
+  download: boolean;
+}): string {
+  return [
+    "v1",
+    `userId=${args.userId}`,
+    `sessionId=${args.sessionId}`,
+    `path=${sanitizePath(args.path)}`,
+    `expires=${args.expiresAt}`,
+    `filename=${args.filename}`,
+    `mimeType=${args.mimeType}`,
+    `encoding=${args.encoding}`,
+    `download=${args.download ? "1" : "0"}`,
+  ].join("\n");
+}
+
+async function buildSignedVfsUrl(args: {
+  userId: string;
+  sessionId: string;
+  path: string;
+} & BuildSignedVfsUrlOptions): Promise<string | null> {
   const baseUrl = getPublicBaseUrl();
   const secret = getAssetSigningSecret();
   const subtle = globalThis.crypto?.subtle;
 
   if (!baseUrl || !secret || !subtle) return null;
 
-  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, ttlSeconds);
-  const payload = `${asset.id}.${expiresAt}.${asset.filename}.${asset.mimeType}`;
-  const sig = await hmacSha256Hex(secret, payload);
+  const path = sanitizePath(args.path);
+  const filename = safeFilenameSegment(args.filename || basename(path) || "file");
+  const mimeType = String(args.mimeType || inferMimeFromFilename(filename) || "application/octet-stream")
+    .trim()
+    .toLowerCase();
+  const encoding: VfsUrlEncoding = args.encoding === "base64" ? "base64" : "utf8";
+  const download = args.download === true;
+  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, args.ttlSeconds ?? 900);
+  const sig = await hmacSha256Hex(
+    secret,
+    buildSignedVfsPayload({
+      userId: args.userId,
+      sessionId: args.sessionId,
+      path,
+      expiresAt,
+      filename,
+      mimeType,
+      encoding,
+      download,
+    })
+  );
 
-  const url = new URL(`${baseUrl}/api/assets/${encodeURIComponent(asset.id)}`);
+  const encodedPath = path.split("/").filter(Boolean).map((part) => encodeURIComponent(part)).join("/");
+  const url = new URL(`${baseUrl}/api/vfs/${encodedPath}`);
+  url.searchParams.set("userId", args.userId);
+  url.searchParams.set("sessionId", args.sessionId);
   url.searchParams.set("expires", String(expiresAt));
-  url.searchParams.set("filename", asset.filename);
-  url.searchParams.set("mimeType", asset.mimeType);
+  url.searchParams.set("filename", filename);
+  url.searchParams.set("mimeType", mimeType);
+  url.searchParams.set("encoding", encoding);
+  if (download) url.searchParams.set("download", "1");
   url.searchParams.set("sig", sig);
   return url.toString();
+}
+
+async function buildSignedVfsUrlForRuntime(
+  rt: VirtualRuntime,
+  path: string,
+  opts?: BuildSignedVfsUrlOptions
+): Promise<string | null> {
+  return await buildSignedVfsUrl({
+    userId: rt.userId,
+    sessionId: rt.sessionId,
+    path,
+    ...opts,
+  });
+}
+
+async function buildSignedAssetUrl(
+  rt: VirtualRuntime | undefined,
+  asset: SessionAsset,
+  ttlSeconds = 900
+): Promise<string | null> {
+  if (!rt) {
+    return asset.url ?? null;
+  }
+
+  try {
+    const materialized = await materializeSessionAssetToVfs(rt, asset, {
+      fetchRemote: true,
+      includeBase64: false,
+      ttlSeconds,
+    });
+
+    return materialized.publicUrl ?? asset.url ?? null;
+  } catch {
+    return asset.url ?? null;
+  }
 }
 
 function buildPreparedAssetPayload(
@@ -1793,9 +1914,11 @@ function buildPreparedAssetPayload(
     materialized?: {
       assetRoot: string;
       metaPath: string;
+      binaryPath?: string | null;
       base64Path: string | null;
       textPath: string | null;
       infoPath: string;
+      publicUrl?: string | null;
     } | null;
     includeInlineData?: boolean;
     signedUrl?: string | null;
@@ -1804,7 +1927,7 @@ function buildPreparedAssetPayload(
   const loaded = opts?.loaded ?? null;
   const materialized = opts?.materialized ?? null;
   const includeInlineData = opts?.includeInlineData ?? false;
-  const signedUrl = opts?.signedUrl ?? null;
+  const signedUrl = opts?.signedUrl ?? materialized?.publicUrl ?? null;
 
   const mimeType = loaded?.mimeType ?? asset.mimeType;
   const filename = loaded?.filename ?? asset.filename;
@@ -1843,7 +1966,8 @@ function buildPreparedAssetPayload(
       },
       guidance: [
         "Inspect the target Composio tool schema first.",
-        "For URL-style parameters, pass asset://<assetId> and let the execution wrapper resolve it. For upload-style Composio tools, the wrapper stages bytes and supplies the resulting s3key automatically.",
+        "For URL-style parameters, pass asset://<assetId> and let the execution wrapper resolve it to a signed APP_BASE_URL VFS URL.",
+        "For upload-style Composio tools, the wrapper stages bytes and supplies the resulting s3key automatically.",
         "For inline file parameters, use asset://<assetId> or an object with assetId and the wrapper will materialize data deterministically.",
       ],
     },
@@ -1851,9 +1975,11 @@ function buildPreparedAssetPayload(
       ? {
           assetRoot: materialized.assetRoot,
           metaPath: materialized.metaPath,
+          binaryPath: materialized.binaryPath ?? null,
           base64Path: materialized.base64Path,
           textPath: materialized.textPath,
           infoPath: materialized.infoPath,
+          url: materialized.publicUrl ?? null,
         }
       : null,
   };
@@ -2503,6 +2629,7 @@ async function resolveAssetForToolExecution(args: {
   toolkitSlug?: string | null;
   fetchRemote?: boolean;
   composioConfig?: AgentTurnComposioConfig;
+  virtualRuntime?: VirtualRuntime;
 }): Promise<{
   filename: string;
   mimeType: string;
@@ -2515,9 +2642,11 @@ async function resolveAssetForToolExecution(args: {
 }> {
   const mode = args.mode;
   const asset = args.asset;
-  const signedUrl = await buildSignedAssetUrl(asset);
+  const signedUrl = await buildSignedAssetUrl(args.virtualRuntime, asset);
   const toolSlug = normalizeComposioToolSlug(args.toolSlug ?? "");
-  const toolkitSlug = String(args.toolkitSlug ?? "").trim().toLowerCase() || (toolSlug ? inferComposioToolkitSlugFromToolSlug(toolSlug) : "");
+  const toolkitSlug =
+    String(args.toolkitSlug ?? "").trim().toLowerCase() ||
+    (toolSlug ? inferComposioToolkitSlugFromToolSlug(toolSlug) : "");
 
   if (mode === "url") {
     if (signedUrl || asset.url) {
@@ -2723,6 +2852,7 @@ async function transformToolInputAssets(
     toolkitSlug?: string;
     fetchRemote?: boolean;
     composioConfig?: AgentTurnComposioConfig;
+    virtualRuntime?: VirtualRuntime;
   }
 ): Promise<unknown> {
   if (typeof value === "string") {
@@ -2743,6 +2873,7 @@ async function transformToolInputAssets(
         toolkitSlug: ctx.toolkitSlug,
         fetchRemote: ctx.fetchRemote ?? true,
         composioConfig: ctx.composioConfig,
+        virtualRuntime: ctx.virtualRuntime,
       });
 
       if (mode === "s3key") return resolved.staged?.s3key ?? value;
@@ -2785,6 +2916,7 @@ async function transformToolInputAssets(
         toolkitSlug: nextCtxBase.toolkitSlug,
         fetchRemote: nextCtxBase.fetchRemote ?? true,
         composioConfig: nextCtxBase.composioConfig,
+        virtualRuntime: nextCtxBase.virtualRuntime,
       });
 
       if (!resolved.staged) return value;
@@ -2855,6 +2987,7 @@ async function transformToolInputAssets(
         toolkitSlug: nextCtxBase.toolkitSlug,
         fetchRemote: nextCtxBase.fetchRemote ?? true,
         composioConfig: nextCtxBase.composioConfig,
+        virtualRuntime: nextCtxBase.virtualRuntime,
       });
 
       const next: Record<string, any> = { ...input };
@@ -2966,6 +3099,7 @@ function wrapComposioToolsWithAssetResolution(
   deps: {
     sessionAssets: SessionAsset[];
     composioConfig?: AgentTurnComposioConfig;
+    virtualRuntime: VirtualRuntime;
   }
 ): ToolSet {
   const wrapped: Record<string, any> = {};
@@ -2990,6 +3124,7 @@ function wrapComposioToolsWithAssetResolution(
           toolkitSlug,
           fetchRemote: true,
           composioConfig: deps.composioConfig,
+          virtualRuntime: deps.virtualRuntime,
         });
         return await toolDef.execute(resolvedInput, ...rest);
       },
@@ -2998,6 +3133,7 @@ function wrapComposioToolsWithAssetResolution(
 
   return wrapped as ToolSet;
 }
+
 
 function isReasoningModel(modelName: string): boolean {
   const name = String(modelName ?? "").trim().toLowerCase();
@@ -3114,6 +3250,7 @@ async function getComposioToolsForUser(
 
   const session = await createComposioSessionForUser(userId, overrides, composioConfig);
   const sessionTools = await session.tools();
+  
   return coerceComposioToolsToToolSet(sessionTools);
 }
 
@@ -3388,6 +3525,10 @@ function createNativeAgentTools(args: {
   const userText = bootstrap.userText;
   const sessionAssets = bootstrap.sessionAssets;
 
+  async function buildAssetReference(asset: SessionAsset): Promise<string> {
+    return (await buildSignedAssetUrl(virtualRuntime, asset)) ?? asset.url ?? `asset://${asset.id}`;
+  }
+
   const scheduleMessage = tool({
     description: "Schedule a message back to this user/session after delaySeconds.",
     inputSchema: zodSchema(
@@ -3418,7 +3559,7 @@ function createNativeAgentTools(args: {
     inputSchema: zodSchema(z.object({ command: z.string().min(1).max(2000) })),
     execute: async (input: { command: string }) => {
       if (!allowModelSsh) {
-        const explicit = userText.startsWith("/ssh") || /\bssh\b|\brun this command\b/i.test(userText);
+        const explicit = userText.startsWith("/ssh") || /ssh|run this command/i.test(userText);
         if (!explicit) return { ok: false, blocked: true, message: "Use /ssh <command> to run SSH." };
       }
       const output = await sshExec(input.command);
@@ -3473,11 +3614,18 @@ function createNativeAgentTools(args: {
     ),
     execute: async (input: { path: string }) => {
       try {
-        const content = await vfsReadFile(virtualRuntime, input.path);
+        const path = sanitizePath(input.path);
+        const content = await vfsReadFile(virtualRuntime, path);
+        const filename = basename(path) || "file";
         return {
           ok: true,
-          path: sanitizePath(input.path),
+          path,
           content: truncateText(content, 30000),
+          url: await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
+            filename,
+            mimeType: inferMimeFromFilename(filename),
+            encoding: "utf8",
+          }),
         };
       } catch (error: any) {
         return {
@@ -3499,11 +3647,18 @@ function createNativeAgentTools(args: {
     ),
     execute: async (input: { path: string; content: string }) => {
       try {
-        await vfsWriteFile(virtualRuntime, input.path, input.content);
+        const path = sanitizePath(input.path);
+        await vfsWriteFile(virtualRuntime, path, input.content);
+        const filename = basename(path) || "file";
         return {
           ok: true,
-          path: sanitizePath(input.path),
+          path,
           bytes: utf8ByteLength(input.content),
+          url: await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
+            filename,
+            mimeType: inferMimeFromFilename(filename),
+            encoding: "utf8",
+          }),
         };
       } catch (error: any) {
         return {
@@ -3515,9 +3670,67 @@ function createNativeAgentTools(args: {
     },
   });
 
+  const getVirtualFileUrl = tool({
+    description:
+      "Return a signed APP_BASE_URL URL for a file in the Redis-backed virtual filesystem so external systems can fetch it.",
+    inputSchema: zodSchema(
+      z.object({
+        path: z.string().min(1).max(4000),
+        mimeType: z.string().optional(),
+        filename: z.string().optional(),
+        encoding: z.enum(["utf8", "base64"]).optional(),
+        download: z.boolean().optional(),
+        ttlSeconds: z.number().int().min(60).max(86_400).optional(),
+      })
+    ),
+    execute: async (input: {
+      path: string;
+      mimeType?: string;
+      filename?: string;
+      encoding?: "utf8" | "base64";
+      download?: boolean;
+      ttlSeconds?: number;
+    }) => {
+      try {
+        const path = sanitizePath(input.path);
+        const node = await vfsGetNode(virtualRuntime, path);
+        if (!node) throw new Error(`No such path: ${path}`);
+        if (node.type !== "file") throw new Error(`Not a file: ${path}`);
+
+        const filename = safeFilenameSegment(input.filename || basename(path) || "file");
+        const mimeType = String(input.mimeType || inferMimeFromFilename(filename) || "application/octet-stream")
+          .trim()
+          .toLowerCase();
+        const encoding = input.encoding ?? "utf8";
+        const url = await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
+          filename,
+          mimeType,
+          encoding,
+          download: input.download ?? false,
+          ttlSeconds: input.ttlSeconds ?? 900,
+        });
+
+        return {
+          ok: Boolean(url),
+          path,
+          filename,
+          mimeType,
+          encoding,
+          url,
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          path: sanitizePath(input.path),
+          error: String(error?.message ?? error ?? "Unknown get_virtual_file_url error"),
+        };
+      }
+    },
+  });
+
   const virtualShell = tool({
     description:
-      "Run shell-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep.",
+      "Run bash-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep.",
     inputSchema: zodSchema(
       z.object({
         command: z.string().min(1).max(120000),
@@ -3537,23 +3750,27 @@ function createNativeAgentTools(args: {
 
   const listSessionAssets = tool({
     description:
-      "List images, audio, video, and files detected in the current conversation history, including canonical IDs for follow-up asset preparation.",
+      "List images, audio, video, and files detected in the current conversation history, including canonical IDs and signed APP_BASE_URL URLs for follow-up asset preparation.",
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
+      const assets = await Promise.all(
+        sessionAssets.map(async (asset) => ({
+          ...describeSessionAsset(asset),
+          ref: await buildAssetReference(asset),
+        }))
+      );
+
       return {
         ok: true,
         count: sessionAssets.length,
-        assets: sessionAssets.map((asset) => ({
-          ...describeSessionAsset(asset),
-          ref: `asset://${asset.id}`,
-        })),
+        assets,
       };
     },
   });
 
   const prepareSessionAsset = tool({
     description:
-      "Prepare a session asset for external tool usage. By default returns metadata and upload hints only. Set includeInlineData=true only when the target tool truly needs inline content.",
+      "Prepare a session asset for external tool usage. Returns a signed APP_BASE_URL VFS URL plus optional inline data when requested.",
     inputSchema: zodSchema(
       z.object({
         assetId: z.string().min(1),
@@ -3585,9 +3802,11 @@ function createNativeAgentTools(args: {
         | {
             assetRoot: string;
             metaPath: string;
+            binaryPath: string | null;
             base64Path: string | null;
             textPath: string | null;
             infoPath: string;
+            publicUrl: string | null;
           }
         | null = null;
 
@@ -3604,21 +3823,25 @@ function createNativeAgentTools(args: {
           materialized = {
             assetRoot: result.assetRoot,
             metaPath: result.metaPath,
+            binaryPath: result.binaryPath ?? null,
             base64Path: result.base64Path,
             textPath: result.textPath,
             infoPath: result.infoPath,
+            publicUrl: result.publicUrl ?? null,
           };
           loaded = result.loaded;
         }
 
+        const signedUrl = await buildAssetReference(asset);
+
         return {
           ok: true,
-          ref: `asset://${asset.id}`,
+          ref: signedUrl,
           ...buildPreparedAssetPayload(asset, {
             loaded,
             materialized,
             includeInlineData,
-            signedUrl: await buildSignedAssetUrl(asset),
+            signedUrl,
           }),
         };
       } catch (error: any) {
@@ -3633,7 +3856,7 @@ function createNativeAgentTools(args: {
 
   const materializeSessionAsset = tool({
     description:
-      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/. Does not include base64 unless explicitly requested.",
+      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/ and return its signed APP_BASE_URL URL.",
     inputSchema: zodSchema(
       z.object({
         assetId: z.string().min(1),
@@ -3657,12 +3880,15 @@ function createNativeAgentTools(args: {
           includeBase64: input.includeBase64 ?? false,
         });
 
+        const signedUrl = await buildAssetReference(asset);
+
         return {
           ok: true,
           asset: describeSessionAsset(asset),
-          ref: `asset://${asset.id}`,
+          ref: signedUrl,
           assetRoot: result.assetRoot,
           metaPath: result.metaPath,
+          binaryPath: result.binaryPath ?? null,
           base64Path: result.base64Path,
           textPath: result.textPath,
           infoPath: result.infoPath,
@@ -3689,7 +3915,11 @@ function createNativeAgentTools(args: {
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
       try {
-        const session = await createComposioSessionForUser(requestArgs.userId, requestArgs.composio?.session, requestArgs.composio);
+        const session = await createComposioSessionForUser(
+          requestArgs.userId,
+          requestArgs.composio?.session,
+          requestArgs.composio
+        );
         const mcp: any = (session as any)?.mcp ?? null;
         return {
           ok: Boolean(mcp?.url),
@@ -3856,7 +4086,8 @@ function createNativeAgentTools(args: {
           version: detectComposioWebhookVersion(parsedPayload),
           parsedTimestamp,
           eventType: (parsedPayload as any)?.type ?? null,
-          triggerSlug: (parsedPayload as any)?.metadata?.trigger_slug ?? (parsedPayload as any)?.trigger_slug ?? null,
+          triggerSlug:
+            (parsedPayload as any)?.metadata?.trigger_slug ?? (parsedPayload as any)?.trigger_slug ?? null,
           payload: parsedPayload,
           error: verified ? null : "Invalid webhook signature",
         };
@@ -3880,12 +4111,14 @@ function createNativeAgentTools(args: {
     read_skill: readSkill,
     read_virtual_file: readVirtualFile,
     write_virtual_file: writeVirtualFile,
+    get_virtual_file_url: getVirtualFileUrl,
     virtual_shell: virtualShell,
     list_session_assets: listSessionAssets,
     prepare_session_asset: prepareSessionAsset,
     materialize_session_asset: materializeSessionAsset,
   };
 }
+
 
 async function loadAgentToolBundle(args: {
   request: AgentTurnArgs;
@@ -3902,6 +4135,7 @@ async function loadAgentToolBundle(args: {
     composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
       sessionAssets: args.bootstrap.sessionAssets,
       composioConfig: args.request.composio,
+      virtualRuntime: args.bootstrap.virtualRuntime,
     });
   }
 
@@ -3919,12 +4153,13 @@ async function loadAgentToolBundle(args: {
   };
 }
 
+
 function buildAgentSystemPrompt(args: {
   request: AgentTurnArgs;
   bootstrap: AgentTurnBootstrap;
 }): string {
   return [
-    "You are an Agentic Operating System assistant running in Telegram/WhatsApp/SMS with Composio tools.",
+    "You are an Agentic Operating System similar to OpenClaw running in Telegram/WhatsApp/SMS with over 1000 Composio-based API toolkits (Slack, Discord, LinkedIn, Google Drive, Google Docs, GitHub, etc).",
     "",
     "CRITICAL TOOL RULES:",
     "- If the user asks for an external action, use the appropriate tool.",
@@ -3934,12 +4169,13 @@ function buildAgentSystemPrompt(args: {
     "",
     "COMPOSIO SESSION:",
     `- Active namespace: ${args.request.userId}`,
+    "- Namespaces identify active connections in an auth config instance scoped to that user's credentials for that specific toolkit or API integration.",
     "- session.tools() returns Composio meta tools for discovery, auth, execution, browser automation toolkit discovery, and the persistent workbench sandbox.",
     "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app/tool slug or need browser automation or other dynamic toolkit discovery.",
     "- Use COMPOSIO_GET_TOOL_SCHEMAS to inspect exact tool inputs before execution.",
     "- Use COMPOSIO_MANAGE_CONNECTIONS when auth may be missing or the user asks to connect an app.",
     "- Use COMPOSIO_MULTI_EXECUTE_TOOL or COMPOSIO_EXECUTE_TOOL to run Composio actions after discovery.",
-    "- Use COMPOSIO_REMOTE_WORKBENCH or COMPOSIO_REMOTE_BASH_TOOL for the Composio code sandbox/workbench.",
+    "- Use COMPOSIO_REMOTE_WORKBENCH or COMPOSIO_REMOTE_BASH_TOOL for the Composio code sandbox or workbench.",
     "- Use composio_api_request for project-scoped Composio platform APIs that are outside session meta tools, including /webhook_subscriptions, /trigger_instances, /triggers_types, /connected_accounts, /auth_configs, /toolkits, /tools, /files, /mcp, /tool_router, and /org/project/config.",
     "- Use composio_org_api_request only for org-level project administration endpoints such as /org/owner/project/list or /org/owner/project/new when an org key is configured.",
     "- Use composio_get_mcp_server to retrieve MCP connection info for this user session.",
@@ -3947,14 +4183,16 @@ function buildAgentSystemPrompt(args: {
     "",
     "FILESYSTEM:",
     "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
+    "- Use get_virtual_file_url when an external tool needs a signed APP_BASE_URL URL for a VFS file.",
     "- Use virtual_shell for shell-like operations on the virtual filesystem only.",
     "- Prefer /workspace for drafts, payloads, notes, JSON, and staging.",
     "",
     "MODALITIES:",
     `- Session asset count available via tools: ${args.bootstrap.sessionAssets.length}`,
     "- Use list_session_assets to inspect assets.",
-    "- Use prepare_session_asset first for metadata and upload hints.",
+    "- Use prepare_session_asset first for metadata, signed APP_BASE_URL URLs, and upload hints.",
     "- When calling external tools, pass asset references like asset://asset_m6_p2.",
+    "- The asset wrapper can resolve those refs to signed APP_BASE_URL VFS URLs for URL-style tools or s3keys for upload-style tools.",
     "- The execution wrapper resolves asset references deterministically before the external tool runs, staging asset bytes into Composio storage when a tool expects an s3key-backed upload.",
     "- Only request inline content when the target tool really needs it.",
     "",
@@ -3969,6 +4207,7 @@ function buildAgentSystemPrompt(args: {
     "Be concise, accurate, and tool-grounded.",
   ].join("\n");
 }
+
 
 async function prepareTelegramStreamingHandle(
   request: AgentTurnArgs,
