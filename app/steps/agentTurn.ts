@@ -77,8 +77,6 @@ type VirtualRuntime = {
   userId: string;
   channel: Channel;
   redis: RedisClient;
-  storageSessionId: string;
-  storageUserId: string;
 };
 
 let redisClientPromise: Promise<RedisClient | null> | null = null;
@@ -113,134 +111,6 @@ function vfsNodeKey(userId: string, sessionId: string, path: string): string {
 
 function vfsMetaKey(userId: string, sessionId: string): string {
   return `${vfsNamespace(userId, sessionId)}:meta`;
-}
-
-function vfsScopeUserId(rt: VirtualRuntime): string {
-  return rt.storageUserId || rt.userId;
-}
-
-function vfsScopeSessionId(rt: VirtualRuntime): string {
-  return rt.storageSessionId || rt.sessionId;
-}
-
-function vfsPathsSetKeyForRuntime(rt: VirtualRuntime): string {
-  return vfsPathsKey(vfsScopeUserId(rt), vfsScopeSessionId(rt));
-}
-
-function vfsNodeStorageKeyForRuntime(rt: VirtualRuntime, path: string): string {
-  return vfsNodeKey(vfsScopeUserId(rt), vfsScopeSessionId(rt), path);
-}
-
-function vfsMetaStorageKeyForRuntime(rt: VirtualRuntime): string {
-  return vfsMetaKey(vfsScopeUserId(rt), vfsScopeSessionId(rt));
-}
-
-async function scanRedisKeys(redis: RedisClient, match: string, count = 200, maxKeys = 500): Promise<string[]> {
-  const keys: string[] = [];
-  let cursor = "0";
-
-  do {
-    const scanned = await redis.scan(cursor, { match, count });
-    const nextCursor = String(Array.isArray(scanned) ? scanned[0] ?? "0" : (scanned as any)?.[0] ?? "0");
-    const batch = Array.isArray(scanned) ? scanned[1] : (scanned as any)?.[1];
-
-    if (Array.isArray(batch)) {
-      for (const key of batch) {
-        keys.push(String(key));
-        if (keys.length >= maxKeys) return keys;
-      }
-    }
-
-    cursor = nextCursor;
-  } while (cursor !== "0");
-
-  return keys;
-}
-
-type DiscoveredVfsScope = {
-  storageUserId: string;
-  storageSessionId: string;
-  reason: "exact" | "session_match" | "user_match" | "fallback";
-};
-
-async function discoverExistingVfsScope(args: {
-  redis: RedisClient;
-  userId: string;
-  sessionId: string;
-  channel: Channel;
-}): Promise<DiscoveredVfsScope> {
-  const exactMeta = await args.redis.get(vfsMetaKey(args.userId, args.sessionId));
-  if (exactMeta) {
-    return {
-      storageUserId: args.userId,
-      storageSessionId: args.sessionId,
-      reason: "exact",
-    };
-  }
-
-  const metaKeys = await scanRedisKeys(args.redis, "vfs:*:meta", 200, 500).catch(() => [] as string[]);
-  let best: { score: number; updatedAt: number; scope: DiscoveredVfsScope } | null = null;
-
-  for (const metaKey of metaKeys) {
-    const meta: any = await args.redis.get(metaKey).catch(() => null);
-    if (!meta || typeof meta !== "object") continue;
-
-    const metaUserId = typeof meta.userId === "string" ? meta.userId : undefined;
-    const metaSessionId = typeof meta.sessionId === "string" ? meta.sessionId : undefined;
-    const metaChannel = typeof meta.channel === "string" ? meta.channel : undefined;
-    if (!metaUserId || !metaSessionId) continue;
-
-    let score = 0;
-    if (metaSessionId === args.sessionId) score += 100;
-    if (metaUserId === args.userId) score += 50;
-    if (metaChannel === args.channel) score += 10;
-    if (score <= 0) continue;
-
-    const updatedAt = Number.isFinite(Date.parse(String(meta.updatedAt ?? "")))
-      ? Date.parse(String(meta.updatedAt))
-      : 0;
-
-    const scope: DiscoveredVfsScope = {
-      storageUserId: metaUserId,
-      storageSessionId: metaSessionId,
-      reason: metaSessionId === args.sessionId ? "session_match" : "user_match",
-    };
-
-    if (!best || score > best.score || (score === best.score && updatedAt > best.updatedAt)) {
-      best = { score, updatedAt, scope };
-    }
-  }
-
-  return (
-    best?.scope ?? {
-      storageUserId: args.userId,
-      storageSessionId: args.sessionId,
-      reason: "fallback",
-    }
-  );
-}
-
-async function rebuildVfsPathIndex(rt: VirtualRuntime): Promise<string[]> {
-  const keys = await scanRedisKeys(
-    rt.redis,
-    `${vfsNamespace(vfsScopeUserId(rt), vfsScopeSessionId(rt))}:node:*`,
-    200,
-    2000
-  ).catch(() => [] as string[]);
-
-  const discoveredPaths = new Set<string>();
-  for (const key of keys) {
-    const node: any = await rt.redis.get(key).catch(() => null);
-    if (!node || typeof node !== "object" || typeof node.path !== "string") continue;
-    discoveredPaths.add(sanitizePath(node.path));
-  }
-
-  const paths = Array.from(discoveredPaths).sort();
-  if (paths.length) {
-    await rt.redis.sadd(vfsPathsSetKeyForRuntime(rt), ...paths);
-  }
-
-  return paths;
 }
 
 // ============================================================
@@ -1191,6 +1061,7 @@ const INLINE_SKILLS: Record<string, InlineSkill> = {
     whenToUse: "Use when the user message includes images, audio, video, or files that need staging or upload.",
     guidance: [
       "Use list_session_assets to inspect available assets.",
+      "Use inspect_session_asset when the user wants to know what an uploaded image, file, PDF, code file, or log contains.",
       "Use prepare_session_asset first for metadata and upload hints.",
       "Use asset references like asset://asset_m6_p2 when calling external tools.",
       "The tool execution wrapper resolves asset references deterministically before the external tool runs.",
@@ -1214,37 +1085,27 @@ function renderSingleSkill(skill: InlineSkill): string {
 // Redis VFS primitives
 // ============================================================
 async function vfsAllPaths(rt: VirtualRuntime): Promise<string[]> {
-  const raw = (await rt.redis.smembers(vfsPathsSetKeyForRuntime(rt))) ?? [];
-  let paths = (Array.isArray(raw) ? raw : []).map((x) => sanitizePath(String(x))).sort();
-
-  const looksSparse = paths.length === 0 || (paths.length === 1 && paths[0] === "/workspace");
-  if (looksSparse) {
-    const rebuilt = await rebuildVfsPathIndex(rt);
-    if (rebuilt.length > paths.length) {
-      paths = rebuilt;
-    }
-  }
-
-  return paths;
+  const raw = (await rt.redis.smembers(vfsPathsKey(rt.userId, rt.sessionId))) ?? [];
+  return (Array.isArray(raw) ? raw : []).map((x) => sanitizePath(String(x))).sort();
 }
 
 async function vfsGetNode(rt: VirtualRuntime, path: string): Promise<VfsNode | undefined> {
   const p = sanitizePath(path);
-  const node = await rt.redis.get(vfsNodeStorageKeyForRuntime(rt, p));
+  const node = await rt.redis.get(vfsNodeKey(rt.userId, rt.sessionId, p));
   if (!node) return undefined;
   return node as VfsNode;
 }
 
 async function vfsPutNode(rt: VirtualRuntime, node: VfsNode): Promise<void> {
   const p = sanitizePath(node.path);
-  await rt.redis.set(vfsNodeStorageKeyForRuntime(rt, p), { ...node, path: p });
-  await rt.redis.sadd(vfsPathsSetKeyForRuntime(rt), p);
+  await rt.redis.set(vfsNodeKey(rt.userId, rt.sessionId, p), { ...node, path: p });
+  await rt.redis.sadd(vfsPathsKey(rt.userId, rt.sessionId), p);
 }
 
 async function vfsRemoveNode(rt: VirtualRuntime, path: string): Promise<void> {
   const p = sanitizePath(path);
-  await rt.redis.del(vfsNodeStorageKeyForRuntime(rt, p));
-  await rt.redis.srem(vfsPathsSetKeyForRuntime(rt), p);
+  await rt.redis.del(vfsNodeKey(rt.userId, rt.sessionId, p));
+  await rt.redis.srem(vfsPathsKey(rt.userId, rt.sessionId), p);
 }
 
 async function vfsEnsureDir(rt: VirtualRuntime, path: string): Promise<void> {
@@ -1462,21 +1323,12 @@ async function createVirtualRuntime(args: {
     );
   }
 
-  const discoveredScope = await discoverExistingVfsScope({
-    redis,
-    userId: args.userId,
-    sessionId: args.sessionId,
-    channel: args.channel,
-  });
-
   const rt: VirtualRuntime = {
     cwd: "/workspace",
     sessionId: args.sessionId,
     userId: args.userId,
     channel: args.channel,
     redis,
-    storageSessionId: discoveredScope.storageSessionId,
-    storageUserId: discoveredScope.storageUserId,
   };
 
   await vfsEnsureDir(rt, "/");
@@ -1485,15 +1337,12 @@ async function createVirtualRuntime(args: {
   await vfsEnsureDir(rt, "/workspace/skills");
   await vfsEnsureDir(rt, "/workspace/assets");
 
-  await rt.redis.set(vfsMetaStorageKeyForRuntime(rt), {
-    sessionId: vfsScopeSessionId(rt),
-    userId: vfsScopeUserId(rt),
+  await rt.redis.set(vfsMetaKey(args.userId, args.sessionId), {
+    sessionId: args.sessionId,
+    userId: args.userId,
     channel: args.channel,
     cwd: "/workspace",
     updatedAt: nowIso(),
-    requestedSessionId: args.sessionId,
-    requestedUserId: args.userId,
-    namespaceResolution: discoveredScope.reason,
   });
 
   await vfsWriteFile(
@@ -1616,21 +1465,6 @@ function parseVirtualShell(input: string): { ok: true; result: any } | { ok: fal
   };
 }
 
-function splitShellFlagsAndPositionals(args: string[]): { flags: string[]; positionals: string[] } {
-  const flags: string[] = [];
-  const positionals: string[] = [];
-
-  for (const arg of args) {
-    if (arg.startsWith("-") && positionals.length === 0) {
-      flags.push(arg);
-    } else {
-      positionals.push(arg);
-    }
-  }
-
-  return { flags, positionals };
-}
-
 async function execVirtualShell(rt: VirtualRuntime, input: string) {
   const parsed = parseVirtualShell(input);
   if (parsed.ok === false) {
@@ -1666,35 +1500,33 @@ async function execVirtualShell(rt: VirtualRuntime, input: string) {
     }
 
     const args = spec.args ?? [];
-    const { flags, positionals } = splitShellFlagsAndPositionals(args);
 
     switch (spec.command) {
       case "pwd":
         return { ok: true, stdout: rt.cwd, stderr: "", exitCode: 0 };
 
       case "ls": {
-        const target = positionals[0] ?? rt.cwd;
-        const recursive = flags.includes("-R") || flags.includes("-r") || flags.includes("--recursive");
-        const items = await vfsList(rt, target, recursive);
+        const target = args[0] ?? rt.cwd;
+        const items = await vfsList(rt, target, false);
         return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
       }
 
       case "tree": {
-        const target = positionals[0] ?? rt.cwd;
+        const target = args[0] ?? rt.cwd;
         const items = await vfsList(rt, target, true);
         return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
       }
 
       case "cat": {
-        if (!positionals[0]) throw new Error("cat requires a path");
-        const content = await vfsReadFile(rt, positionals[0]);
+        if (!args[0]) throw new Error("cat requires a path");
+        const content = await vfsReadFile(rt, args[0]);
         return { ok: true, stdout: content, stderr: "", exitCode: 0 };
       }
 
       case "mkdir": {
-        if (!positionals[0]) throw new Error("mkdir requires a path");
-        await vfsEnsureDir(rt, positionals[0]);
-        return { ok: true, stdout: `Created ${sanitizePath(positionals[0])}`, stderr: "", exitCode: 0 };
+        if (!args[0]) throw new Error("mkdir requires a path");
+        await vfsEnsureDir(rt, args[0]);
+        return { ok: true, stdout: `Created ${sanitizePath(args[0])}`, stderr: "", exitCode: 0 };
       }
 
       case "rm": {
@@ -1729,14 +1561,14 @@ async function execVirtualShell(rt: VirtualRuntime, input: string) {
       }
 
       case "find": {
-        if (positionals.length < 2) throw new Error("find requires <path> <needle>");
-        const items = await vfsFind(rt, positionals[0], positionals.slice(1).join(" "));
+        if (args.length < 2) throw new Error("find requires <path> <needle>");
+        const items = await vfsFind(rt, args[0], args.slice(1).join(" "));
         return { ok: true, stdout: items.join("\n"), stderr: "", exitCode: 0 };
       }
 
       case "grep": {
-        if (positionals.length < 2) throw new Error("grep requires <path> <needle>");
-        const items = await vfsGrep(rt, positionals[0], positionals.slice(1).join(" "));
+        if (args.length < 2) throw new Error("grep requires <path> <needle>");
+        const items = await vfsGrep(rt, args[0], args.slice(1).join(" "));
         return {
           ok: true,
           stdout: items.map((x) => `${x.path}:${x.line}:${x.text}`).join("\n"),
@@ -2138,7 +1970,7 @@ function buildPreparedAssetPayload(
       },
       guidance: [
         "Inspect the target Composio tool schema first.",
-        "For URL-style parameters, pass asset://<assetId> and let the execution wrapper resolve it to the correct signed URL automatically.",
+        "For URL-style parameters, pass asset://<assetId> and let the execution wrapper resolve it to a signed APP_BASE_URL VFS URL.",
         "For upload-style Composio tools, the wrapper stages bytes and supplies the resulting s3key automatically.",
         "For inline file parameters, use asset://<assetId> or an object with assetId and the wrapper will materialize data deterministically.",
       ],
@@ -3425,505 +3257,6 @@ async function getComposioToolsForUser(
   return coerceComposioToolsToToolSet(sessionTools);
 }
 
-
-type ComposioToolkitCatalogEntry = {
-  slug: string;
-  name: string | null;
-  connected: boolean;
-  connectedAccountId: string | null;
-  connectedAccountIds: string[];
-  authConfigId: string | null;
-  authConfigIds: string[];
-  raw: unknown;
-};
-
-type ComposioConnectedAccountSummary = {
-  id: string;
-  toolkitSlug: string;
-  authConfigId: string | null;
-  status: string | null;
-  createdAt: string | null;
-  updatedAt: string | null;
-  raw: unknown;
-};
-
-type ComposioAuthConfigSummary = {
-  id: string;
-  toolkitSlug: string;
-  status: string | null;
-  enabled: boolean;
-  createdAt: string | null;
-  updatedAt: string | null;
-  raw: unknown;
-};
-
-type ResolvedComposioToolkitMatch =
-  | {
-      ok: true;
-      match: ComposioToolkitCatalogEntry;
-      candidates: ComposioToolkitCatalogEntry[];
-    }
-  | {
-      ok: false;
-      reason: "missing" | "ambiguous";
-      query: string;
-      candidates: ComposioToolkitCatalogEntry[];
-    };
-
-function getToolkitResolutionReason(
-  resolution: ResolvedComposioToolkitMatch
-): "missing" | "ambiguous" | null {
-  return "reason" in resolution ? resolution.reason : null;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
-}
-
-function getPathValue(value: unknown, path: string[]): unknown {
-  let current: unknown = value;
-  for (const segment of path) {
-    const rec = asRecord(current);
-    if (!rec) return undefined;
-    current = rec[segment];
-  }
-  return current;
-}
-
-function getFirstStringAtPaths(value: unknown, paths: string[][]): string | null {
-  for (const path of paths) {
-    const candidate = getPathValue(value, path);
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-    if (typeof candidate === "number" && Number.isFinite(candidate)) return String(candidate);
-  }
-  return null;
-}
-
-function getFirstBooleanAtPaths(value: unknown, paths: string[][]): boolean | null {
-  for (const path of paths) {
-    const candidate = getPathValue(value, path);
-    if (typeof candidate === "boolean") return candidate;
-  }
-  return null;
-}
-
-function coerceUnknownCollection(value: unknown): unknown[] {
-  if (Array.isArray(value)) return value;
-
-  const rec = asRecord(value);
-  if (!rec) return [];
-
-  for (const key of [
-    "items",
-    "results",
-    "data",
-    "toolkits",
-    "accounts",
-    "connectedAccounts",
-    "connected_accounts",
-    "authConfigs",
-    "auth_configs",
-  ] as const) {
-    const nested = rec[key];
-    if (Array.isArray(nested)) return nested;
-  }
-
-  for (const key of [
-    "items",
-    "results",
-    "data",
-    "toolkits",
-    "accounts",
-    "connectedAccounts",
-    "connected_accounts",
-    "authConfigs",
-    "auth_configs",
-  ] as const) {
-    const nested = rec[key];
-    const nestedCollection = coerceUnknownCollection(nested);
-    if (nestedCollection.length) return nestedCollection;
-  }
-
-  return [];
-}
-
-function extractStringsFromCollection(items: unknown[], paths: string[][]): string[] {
-  const out: string[] = [];
-  for (const item of items) {
-    const value = getFirstStringAtPaths(item, paths);
-    if (value) out.push(value);
-  }
-  return Array.from(new Set(out));
-}
-
-function normalizeToolkitLookupToken(value: string): string {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "");
-}
-
-const TOOLKIT_SLUG_ALIASES: Record<string, string> = {
-  gdrive: "googledrive",
-  googledrive: "googledrive",
-  gdocs: "googledocs",
-  googledocs: "googledocs",
-  googledoc: "googledocs",
-  googledocument: "googledocs",
-  gsheets: "googlesheets",
-  googlesheets: "googlesheets",
-  googlecalendar: "googlecalendar",
-  gcal: "googlecalendar",
-  googlecal: "googlecalendar",
-  googlemaps: "google_maps",
-  maps: "google_maps",
-  browsertool: "browser_tool",
-  browserbase: "browserbase_tool",
-};
-
-function getToolkitLookupCandidates(raw: string): string[] {
-  const normalized = normalizeToolkitLookupToken(raw);
-  const alias = TOOLKIT_SLUG_ALIASES[normalized];
-  return Array.from(new Set([normalized, alias].filter((value): value is string => Boolean(value))));
-}
-
-function compareIsoDesc(a: string | null, b: string | null): number {
-  const aMs = a ? Date.parse(a) : Number.NaN;
-  const bMs = b ? Date.parse(b) : Number.NaN;
-  const safeA = Number.isFinite(aMs) ? aMs : 0;
-  const safeB = Number.isFinite(bMs) ? bMs : 0;
-  return safeB - safeA;
-}
-
-function mergeComposioSessionOverrides(
-  discovered?: ComposioSessionOverrides,
-  explicit?: ComposioSessionOverrides
-): ComposioSessionOverrides {
-  return {
-    ...(discovered ?? {}),
-    ...(explicit ?? {}),
-    authConfigs: {
-      ...(discovered?.authConfigs ?? {}),
-      ...(explicit?.authConfigs ?? {}),
-    },
-    connectedAccounts: {
-      ...(discovered?.connectedAccounts ?? {}),
-      ...(explicit?.connectedAccounts ?? {}),
-    },
-  };
-}
-
-function normalizeComposioToolkitCatalog(raw: unknown): ComposioToolkitCatalogEntry[] {
-  const items = coerceUnknownCollection(raw);
-  const merged = new Map<string, ComposioToolkitCatalogEntry>();
-
-  for (const item of items) {
-    const slug = getFirstStringAtPaths(item, [
-      ["slug"],
-      ["toolkitSlug"],
-      ["toolkit_slug"],
-      ["toolkit", "slug"],
-    ]);
-    if (!slug) continue;
-
-    const name =
-      getFirstStringAtPaths(item, [["name"], ["displayName"], ["display_name"], ["toolkit", "name"]]) ?? null;
-
-    const accountItems = [
-      ...coerceUnknownCollection(getPathValue(item, ["connectedAccounts"])),
-      ...coerceUnknownCollection(getPathValue(item, ["connected_accounts"])),
-      ...coerceUnknownCollection(getPathValue(item, ["connection", "connectedAccounts"])),
-      ...coerceUnknownCollection(getPathValue(item, ["connection", "connected_accounts"])),
-      ...coerceUnknownCollection(getPathValue(item, ["accounts"])),
-    ];
-
-    const connectedAccountIds = Array.from(
-      new Set(
-        [
-          getFirstStringAtPaths(item, [
-            ["connectedAccountId"],
-            ["connected_account_id"],
-            ["connectedAccount", "id"],
-            ["connected_account", "id"],
-            ["connection", "connectedAccountId"],
-            ["connection", "connected_account_id"],
-            ["connection", "connectedAccount", "id"],
-            ["connection", "connected_account", "id"],
-          ]),
-          ...extractStringsFromCollection(accountItems, [
-            ["id"],
-            ["nanoid"],
-            ["connectedAccountId"],
-            ["connected_account_id"],
-          ]),
-        ].filter((value): value is string => Boolean(value))
-      )
-    );
-
-    const authConfigIds = Array.from(
-      new Set(
-        [
-          getFirstStringAtPaths(item, [
-            ["authConfigId"],
-            ["auth_config_id"],
-            ["authConfig", "id"],
-            ["auth_config", "id"],
-            ["connection", "authConfigId"],
-            ["connection", "auth_config_id"],
-            ["connection", "authConfig", "id"],
-            ["connection", "auth_config", "id"],
-          ]),
-          ...extractStringsFromCollection(accountItems, [
-            ["authConfigId"],
-            ["auth_config_id"],
-            ["authConfig", "id"],
-            ["auth_config", "id"],
-          ]),
-        ].filter((value): value is string => Boolean(value))
-      )
-    );
-
-    const connected =
-      Boolean(
-        getFirstBooleanAtPaths(item, [
-          ["connected"],
-          ["isConnected"],
-          ["connection", "connected"],
-          ["connection", "isConnected"],
-        ]) ?? false
-      ) || connectedAccountIds.length > 0;
-
-    const existing = merged.get(slug);
-    if (existing) {
-      merged.set(slug, {
-        ...existing,
-        name: existing.name ?? name,
-        connected: existing.connected || connected,
-        connectedAccountId: existing.connectedAccountId ?? connectedAccountIds[0] ?? null,
-        connectedAccountIds: Array.from(new Set([...existing.connectedAccountIds, ...connectedAccountIds])),
-        authConfigId: existing.authConfigId ?? authConfigIds[0] ?? null,
-        authConfigIds: Array.from(new Set([...existing.authConfigIds, ...authConfigIds])),
-      });
-      continue;
-    }
-
-    merged.set(slug, {
-      slug,
-      name,
-      connected,
-      connectedAccountId: connectedAccountIds[0] ?? null,
-      connectedAccountIds,
-      authConfigId: authConfigIds[0] ?? null,
-      authConfigIds,
-      raw: item,
-    });
-  }
-
-  return Array.from(merged.values()).sort((a, b) => a.slug.localeCompare(b.slug));
-}
-
-async function listComposioToolkitsForUser(
-  userId: string,
-  overrides?: ComposioSessionOverrides,
-  composioConfig?: AgentTurnComposioConfig,
-  options?: { search?: string; toolkits?: string[]; isConnected?: boolean; limit?: number; nextCursor?: string }
-): Promise<ComposioToolkitCatalogEntry[]> {
-  if (!getComposioProjectApiKey(composioConfig)) return [];
-
-  const session = await createComposioSessionForUser(userId, overrides, composioConfig);
-  const raw = typeof (session as any)?.toolkits === "function"
-    ? await (session as any).toolkits({
-        limit: options?.limit ?? 200,
-        ...(options?.search ? { search: options.search } : {}),
-        ...(options?.toolkits?.length ? { toolkits: options.toolkits } : {}),
-        ...(options?.isConnected !== undefined ? { isConnected: options.isConnected } : {}),
-        ...(options?.nextCursor ? { nextCursor: options.nextCursor } : {}),
-      })
-    : [];
-
-  return normalizeComposioToolkitCatalog(raw);
-}
-
-function normalizeConnectedAccountsList(raw: unknown): ComposioConnectedAccountSummary[] {
-  const items = coerceUnknownCollection(raw);
-  const out: ComposioConnectedAccountSummary[] = [];
-
-  for (const item of items) {
-    const id = getFirstStringAtPaths(item, [["id"], ["nanoid"], ["connectedAccountId"], ["connected_account_id"]]);
-    const toolkitSlug = getFirstStringAtPaths(item, [["toolkit", "slug"], ["toolkitSlug"], ["toolkit_slug"]]);
-    if (!id || !toolkitSlug) continue;
-
-    out.push({
-      id,
-      toolkitSlug,
-      authConfigId:
-        getFirstStringAtPaths(item, [["authConfigId"], ["auth_config_id"], ["authConfig", "id"], ["auth_config", "id"]]) ??
-        null,
-      status: getFirstStringAtPaths(item, [["status"]]) ?? null,
-      createdAt: getFirstStringAtPaths(item, [["createdAt"], ["created_at"]]) ?? null,
-      updatedAt: getFirstStringAtPaths(item, [["updatedAt"], ["updated_at"], ["modifiedAt"], ["modified_at"]]) ?? null,
-      raw: item,
-    });
-  }
-
-  return out.sort((a, b) => compareIsoDesc(a.updatedAt ?? a.createdAt, b.updatedAt ?? b.createdAt));
-}
-
-async function listActiveComposioConnectedAccountsForUser(
-  userId: string,
-  composioConfig?: AgentTurnComposioConfig
-): Promise<ComposioConnectedAccountSummary[]> {
-  if (!getComposioProjectApiKey(composioConfig)) return [];
-
-  try {
-    const composio = createComposioClient(composioConfig) as any;
-    if (typeof composio?.connectedAccounts?.list !== "function") return [];
-    const raw = await composio.connectedAccounts.list({
-      userIds: [userId],
-      statuses: ["ACTIVE"],
-    });
-    return normalizeConnectedAccountsList(raw);
-  } catch {
-    return [];
-  }
-}
-
-function normalizeComposioAuthConfigs(raw: unknown): ComposioAuthConfigSummary[] {
-  const items = coerceUnknownCollection(raw);
-  const out: ComposioAuthConfigSummary[] = [];
-
-  for (const item of items) {
-    const id = getFirstStringAtPaths(item, [["id"], ["nanoid"]]);
-    const toolkitSlug = getFirstStringAtPaths(item, [["toolkit", "slug"], ["toolkitSlug"], ["toolkit_slug"]]);
-    if (!id || !toolkitSlug) continue;
-
-    const status = getFirstStringAtPaths(item, [["status"]]) ?? null;
-    const enabledField = getFirstBooleanAtPaths(item, [
-      ["enabled"],
-      ["isEnabled"],
-      ["is_enabled"],
-      ["isEnabledForToolRouter"],
-      ["is_enabled_for_tool_router"],
-    ]);
-    const enabled =
-      enabledField !== null
-        ? enabledField
-        : !["DISABLED", "INACTIVE", "ARCHIVED"].includes(String(status ?? "").toUpperCase());
-
-    out.push({
-      id,
-      toolkitSlug,
-      status,
-      enabled,
-      createdAt: getFirstStringAtPaths(item, [["createdAt"], ["created_at"]]) ?? null,
-      updatedAt: getFirstStringAtPaths(item, [["updatedAt"], ["updated_at"], ["modifiedAt"], ["modified_at"]]) ?? null,
-      raw: item,
-    });
-  }
-
-  return out.sort((a, b) => compareIsoDesc(a.updatedAt ?? a.createdAt, b.updatedAt ?? b.createdAt));
-}
-
-async function listComposioAuthConfigs(
-  composioConfig?: AgentTurnComposioConfig
-): Promise<ComposioAuthConfigSummary[]> {
-  if (!getComposioProjectApiKey(composioConfig)) return [];
-
-  try {
-    const response = await composioApiRequest({
-      authMode: "project",
-      config: composioConfig,
-      method: "GET",
-      path: "/auth_configs",
-      query: { limit: 200 },
-    });
-
-    if (!response.ok) return [];
-    return normalizeComposioAuthConfigs(response.data);
-  } catch {
-    return [];
-  }
-}
-
-function discoverComposioSessionOverridesFromConnectedAccounts(
-  accounts: ComposioConnectedAccountSummary[]
-): ComposioSessionOverrides {
-  const authConfigs: Record<string, string> = {};
-  const connectedAccounts: Record<string, string> = {};
-
-  for (const account of accounts) {
-    if (!connectedAccounts[account.toolkitSlug]) {
-      connectedAccounts[account.toolkitSlug] = account.id;
-    }
-    if (account.authConfigId && !authConfigs[account.toolkitSlug]) {
-      authConfigs[account.toolkitSlug] = account.authConfigId;
-    }
-  }
-
-  return {
-    authConfigs,
-    connectedAccounts,
-  };
-}
-
-function pickPreferredAuthConfigId(
-  toolkitSlug: string,
-  authConfigs: ComposioAuthConfigSummary[]
-): string | null {
-  const match = authConfigs.find((config) => config.toolkitSlug === toolkitSlug && config.enabled);
-  return match?.id ?? null;
-}
-
-function resolveComposioToolkitMatch(
-  catalog: ComposioToolkitCatalogEntry[],
-  query: string
-): ResolvedComposioToolkitMatch {
-  const candidates = getToolkitLookupCandidates(query);
-  const normalizedEntries = catalog.map((entry) => ({
-    entry,
-    slugToken: normalizeToolkitLookupToken(entry.slug),
-    nameToken: normalizeToolkitLookupToken(entry.name ?? ""),
-  }));
-
-  const exact = normalizedEntries
-    .filter((candidate) =>
-      candidates.some((token) => token === candidate.slugToken || (candidate.nameToken && token === candidate.nameToken))
-    )
-    .map((candidate) => candidate.entry);
-
-  if (exact.length === 1) {
-    return { ok: true, match: exact[0], candidates: exact };
-  }
-  if (exact.length > 1) {
-    return { ok: false, reason: "ambiguous", query, candidates: exact };
-  }
-
-  const fuzzy = normalizedEntries
-    .filter((candidate) =>
-      candidates.some(
-        (token) =>
-          candidate.slugToken.includes(token) ||
-          token.includes(candidate.slugToken) ||
-          (candidate.nameToken && (candidate.nameToken.includes(token) || token.includes(candidate.nameToken)))
-      )
-    )
-    .map((candidate) => candidate.entry);
-
-  if (fuzzy.length === 1) {
-    return { ok: true, match: fuzzy[0], candidates: fuzzy };
-  }
-  if (fuzzy.length > 1) {
-    return { ok: false, reason: "ambiguous", query, candidates: fuzzy };
-  }
-
-  return { ok: false, reason: "missing", query, candidates: [] };
-}
-
-function extractComposioConnectionRedirectUrl(connectionRequest: unknown): string | null {
-  const redirectUrl = getFirstStringAtPaths(connectionRequest, [["redirectUrl"], ["redirect_url"]]);
-  return redirectUrl ? redirectUrl.trim() : null;
-}
-
 // ============================================================
 // Telegram streaming coalescer
 // ============================================================
@@ -4081,7 +3414,6 @@ type AgentToolBundle = {
   composioTools: ToolSet;
   tools: ToolSet;
   retryTools: ToolSet;
-  sessionOverrides: ComposioSessionOverrides;
 };
 
 type AgentTurnStreamingHandle = {
@@ -4189,235 +3521,79 @@ async function buildAgentTurnBootstrap(args: AgentTurnArgs): Promise<AgentTurnBo
 function createNativeAgentTools(args: {
   request: AgentTurnArgs;
   bootstrap: AgentTurnBootstrap;
-  sessionOverrides: ComposioSessionOverrides;
 }): ToolSet {
   const requestArgs = args.request;
   const bootstrap = args.bootstrap;
-  const sessionOverrides = args.sessionOverrides;
   const virtualRuntime = bootstrap.virtualRuntime;
   const userText = bootstrap.userText;
   const sessionAssets = bootstrap.sessionAssets;
 
-  async function buildAssetReference(asset: SessionAsset): Promise<string> {
+  function buildAssetReference(asset: SessionAsset): string {
     return `asset://${asset.id}`;
   }
 
   async function buildAssetSignedUrl(asset: SessionAsset): Promise<string | null> {
-    return await buildSignedAssetUrl(virtualRuntime, asset);
+    return (await buildSignedAssetUrl(virtualRuntime, asset)) ?? asset.url ?? null;
   }
 
-  async function getToolkitCatalog(search?: string, connectedOnly?: boolean): Promise<ComposioToolkitCatalogEntry[]> {
-    return await listComposioToolkitsForUser(requestArgs.userId, sessionOverrides, requestArgs.composio, {
-      search,
-      isConnected: connectedOnly,
-      limit: 200,
-    });
+  function isTextLikeAssetFilename(filename: string): boolean {
+    const ext = String(filename ?? "").split(".").pop()?.toLowerCase() ?? "";
+    return [
+      "txt", "md", "markdown", "json", "jsonl", "csv", "ts", "tsx", "js", "jsx", "mjs", "cjs",
+      "py", "rb", "go", "java", "kt", "swift", "php", "rs", "cpp", "cc", "cxx", "c", "h", "hpp",
+      "cs", "html", "css", "scss", "less", "xml", "yaml", "yml", "ini", "conf", "toml", "env",
+      "log", "sql", "sh", "bash", "zsh", "ps1", "dockerfile",
+    ].includes(ext);
   }
 
-  async function getActiveConnectedAccounts(): Promise<ComposioConnectedAccountSummary[]> {
-    return await listActiveComposioConnectedAccountsForUser(requestArgs.userId, requestArgs.composio);
-  }
+  function isProbablyReadableText(textValue: string | null | undefined): boolean {
+    const value = String(textValue ?? "");
+    if (!value.trim()) return false;
 
-  async function getKnownAuthConfigs(): Promise<ComposioAuthConfigSummary[]> {
-    return await listComposioAuthConfigs(requestArgs.composio);
-  }
+    const sample = value.slice(0, 4000);
+    if (!sample) return false;
 
-  async function resolveToolkitState(toolkitQuery: string): Promise<{
-    resolution: ResolvedComposioToolkitMatch;
-    match: ComposioToolkitCatalogEntry | null;
-    catalog: ComposioToolkitCatalogEntry[];
-    activeAccounts: ComposioConnectedAccountSummary[];
-    authConfigs: ComposioAuthConfigSummary[];
-    preferredConnectedAccountId: string | null;
-    preferredAuthConfigId: string | null;
-    resolvedSessionOverrides: ComposioSessionOverrides;
-  }> {
-    let catalog = await getToolkitCatalog(toolkitQuery);
-    if (!catalog.length) {
-      catalog = await getToolkitCatalog();
+    let readable = 0;
+    for (const char of sample) {
+      const code = char.charCodeAt(0);
+      const isCommonWhitespace = char === "\n" || char === "\r" || char === "\t";
+      const isPrintable = code >= 32 && code !== 65533;
+      if (isCommonWhitespace || isPrintable) readable += 1;
     }
 
-    let resolution = resolveComposioToolkitMatch(catalog, toolkitQuery);
-    const activeAccounts = await getActiveConnectedAccounts();
-    const authConfigs = await getKnownAuthConfigs();
+    return readable / sample.length >= 0.85;
+  }
 
-    let match = resolution.ok ? resolution.match : null;
-    const resolutionReason = getToolkitResolutionReason(resolution);
+  function inferInspectableTextAsset(asset: SessionAsset, loaded: LoadedSessionAsset): boolean {
+    return (
+      isTextualMimeType(loaded.mimeType) ||
+      isTextLikeAssetFilename(loaded.filename || asset.filename) ||
+      isProbablyReadableText(loaded.textPreview) ||
+      isProbablyReadableText(tryUtf8FromBase64(loaded.base64))
+    );
+  }
 
-    if (resolutionReason === "missing" && !match) {
-      const lookupTokens = getToolkitLookupCandidates(toolkitQuery);
-      const syntheticToolkitSlug =
-        activeAccounts.find((account) => lookupTokens.includes(normalizeToolkitLookupToken(account.toolkitSlug)))?.toolkitSlug ??
-        authConfigs.find((config) => lookupTokens.includes(normalizeToolkitLookupToken(config.toolkitSlug)))?.toolkitSlug ??
-        null;
-
-      if (syntheticToolkitSlug) {
-        match = {
-          slug: syntheticToolkitSlug,
-          name: syntheticToolkitSlug,
-          connected: false,
-          connectedAccountId: null,
-          connectedAccountIds: [],
-          authConfigId: null,
-          authConfigIds: [],
-          raw: null,
-        };
-        resolution = {
-          ok: true,
-          match,
-          candidates: [match],
-        };
-      }
-    }
-
-    const toolkitSlug = resolution.ok ? resolution.match.slug : null;
-    const activeAccountsForToolkit = toolkitSlug
-      ? activeAccounts.filter((account) => account.toolkitSlug === toolkitSlug)
-      : [];
-
-    const preferredConnectedAccountId =
-      (toolkitSlug ? sessionOverrides.connectedAccounts?.[toolkitSlug] : undefined) ??
-      (toolkitSlug ? resolution.ok ? resolution.match.connectedAccountId : null : null) ??
-      activeAccountsForToolkit[0]?.id ??
-      null;
-
-    const preferredAuthConfigId =
-      (toolkitSlug ? sessionOverrides.authConfigs?.[toolkitSlug] : undefined) ??
-      (toolkitSlug ? resolution.ok ? resolution.match.authConfigId : null : null) ??
-      activeAccountsForToolkit[0]?.authConfigId ??
-      (toolkitSlug ? pickPreferredAuthConfigId(toolkitSlug, authConfigs) : null);
-
-    const resolvedSessionOverrides = toolkitSlug
-      ? mergeComposioSessionOverrides(sessionOverrides, {
-          authConfigs: preferredAuthConfigId ? { [toolkitSlug]: preferredAuthConfigId } : undefined,
-          connectedAccounts: preferredConnectedAccountId ? { [toolkitSlug]: preferredConnectedAccountId } : undefined,
-        })
-      : sessionOverrides;
-
-    return {
-      resolution,
-      match: resolution.ok ? resolution.match : match,
-      catalog,
-      activeAccounts,
-      authConfigs,
-      preferredConnectedAccountId,
-      preferredAuthConfigId,
-      resolvedSessionOverrides,
+  async function runAssetInspectionText(args: {
+    modelName: string;
+    prompt?: string;
+    messages?: Array<{ role: string; content: any }>;
+  }): Promise<string> {
+    const request: any = {
+      model: openai(args.modelName),
     };
-  }
 
-  async function listToolkitsExecute(input?: { search?: string; connectedOnly?: boolean; limit?: number }) {
-    const catalog = await listComposioToolkitsForUser(requestArgs.userId, sessionOverrides, requestArgs.composio, {
-      search: input?.search,
-      isConnected: input?.connectedOnly,
-      limit: input?.limit ?? 200,
-    });
-
-    return {
-      ok: true,
-      count: catalog.length,
-      connected: catalog.filter((toolkit) => toolkit.connected),
-      available: catalog.filter((toolkit) => !toolkit.connected),
-      toolkits: catalog,
-    };
-  }
-
-  async function authorizeToolkitExecute(input: {
-    toolkit: string;
-    callbackUrl?: string;
-    authConfigId?: string;
-    connectedAccountId?: string;
-  }) {
-    const resolved = await resolveToolkitState(input.toolkit);
-    const authorizationResolutionReason = getToolkitResolutionReason(resolved.resolution);
-
-    if (authorizationResolutionReason || !resolved.match) {
-      return {
-        ok: false,
-        toolkitQuery: input.toolkit,
-        reason: authorizationResolutionReason ?? "missing",
-        candidates: resolved.resolution.candidates.map((candidate) => candidate.slug),
-        message:
-          (authorizationResolutionReason ?? "missing") === "ambiguous"
-            ? `Toolkit query "${input.toolkit}" matched multiple toolkits. Use an exact slug.`
-            : `Toolkit "${input.toolkit}" was not found in the current Composio catalog.`,
-      };
+    if (args.messages) {
+      request.messages = args.messages;
+    } else {
+      request.prompt = args.prompt;
     }
 
-    const toolkitSlug = resolved.match.slug;
-    const authConfigId = input.authConfigId ?? resolved.preferredAuthConfigId ?? undefined;
-    const connectedAccountId = input.connectedAccountId ?? resolved.preferredConnectedAccountId ?? undefined;
-    const callbackUrl =
-      input.callbackUrl || env("COMPOSIO_CALLBACK_URL") || env("COMPOSIO_MANAGE_CONNECTIONS_CALLBACK_URL") || undefined;
-
-    const toolkitSessionOverrides = mergeComposioSessionOverrides(resolved.resolvedSessionOverrides, {
-      authConfigs: authConfigId ? { [toolkitSlug]: authConfigId } : undefined,
-      connectedAccounts: connectedAccountId ? { [toolkitSlug]: connectedAccountId } : undefined,
-    });
-
-    if (connectedAccountId || resolved.match.connected) {
-      return {
-        ok: true,
-        toolkit: toolkitSlug,
-        alreadyConnected: true,
-        connectedAccountId: connectedAccountId ?? resolved.match.connectedAccountId,
-        authConfigId: authConfigId ?? null,
-        redirectUrl: null,
-        message: `${toolkitSlug} is already connected for this user.`,
-        sessionOverrides: {
-          authConfigs: toolkitSessionOverrides.authConfigs ?? {},
-          connectedAccounts: toolkitSessionOverrides.connectedAccounts ?? {},
-        },
-      };
+    if (shouldSendTemperature(args.modelName, 0.2)) {
+      request.temperature = 0.2;
     }
 
-    if (!authConfigId) {
-      return {
-        ok: false,
-        toolkit: toolkitSlug,
-        alreadyConnected: false,
-        connectedAccountId: null,
-        authConfigId: null,
-        redirectUrl: null,
-        error:
-          `No auth config is currently available for toolkit ${toolkitSlug}. ` +
-          `Create or enable an auth config for this toolkit, or pass authConfigId explicitly.`,
-      };
-    }
-
-    try {
-      const session = await createComposioSessionForUser(
-        requestArgs.userId,
-        toolkitSessionOverrides,
-        requestArgs.composio
-      );
-      const connectionRequest = callbackUrl
-        ? await (session as any).authorize(toolkitSlug, { callbackUrl })
-        : await (session as any).authorize(toolkitSlug);
-      const redirectUrl = extractComposioConnectionRedirectUrl(connectionRequest);
-
-      return {
-        ok: Boolean(redirectUrl),
-        toolkit: toolkitSlug,
-        alreadyConnected: false,
-        connectedAccountId: null,
-        authConfigId,
-        redirectUrl,
-        message: redirectUrl
-          ? `Use the provided connect link to authenticate ${toolkitSlug}.`
-          : `Authorization request created for ${toolkitSlug}, but no redirect URL was returned.`,
-      };
-    } catch (error: any) {
-      return {
-        ok: false,
-        toolkit: toolkitSlug,
-        alreadyConnected: false,
-        connectedAccountId: null,
-        authConfigId,
-        redirectUrl: null,
-        error: String(error?.message ?? error ?? "Unknown composio_authorize_toolkit error"),
-      };
-    }
+    const result = await generateText(request);
+    return String(result.text ?? "").trim();
   }
 
   const scheduleMessage = tool({
@@ -4450,7 +3626,7 @@ function createNativeAgentTools(args: {
     inputSchema: zodSchema(z.object({ command: z.string().min(1).max(2000) })),
     execute: async (input: { command: string }) => {
       if (!allowModelSsh) {
-        const explicit = userText.startsWith("/ssh") || /ssh|run this command/i.test(userText);
+        const explicit = userText.startsWith("/ssh") || /\bssh\b|\brun this command\b/i.test(userText);
         if (!explicit) return { ok: false, blocked: true, message: "Use /ssh <command> to run SSH." };
       }
       const output = await sshExec(input.command);
@@ -4639,50 +3815,194 @@ function createNativeAgentTools(args: {
     },
   });
 
-  const listVirtualFiles = tool({
+
+  const inspectSessionAsset = tool({
     description:
-      "List files and directories in the Redis-backed virtual filesystem. Defaults to /workspace and is safer than shell-style ls for inspection.",
+      "Inspect the contents of the most recent uploaded asset or a specific session asset. Use this when the user asks what an image, screenshot, PDF, file, JSON, code file, or log contains.",
     inputSchema: zodSchema(
       z.object({
-        path: z.string().optional(),
-        recursive: z.boolean().optional(),
+        assetId: z.string().optional(),
+        question: z.string().max(4000).optional(),
+        fetchRemote: z.boolean().optional(),
+        maxTextChars: z.number().int().min(500).max(40000).optional(),
       })
     ),
-    execute: async (input: { path?: string; recursive?: boolean }) => {
-      const path = sanitizePath(input.path || "/workspace");
+    execute: async (input: {
+      assetId?: string;
+      question?: string;
+      fetchRemote?: boolean;
+      maxTextChars?: number;
+    }) => {
+      const selectedAsset = input.assetId
+        ? sessionAssets.find((x) => x.id === input.assetId)
+        : sessionAssets[sessionAssets.length - 1];
+
+      if (!selectedAsset) {
+        return {
+          ok: false,
+          error: "No session assets are available to inspect.",
+        };
+      }
+
+      const fetchRemote = input.fetchRemote ?? true;
+      const maxTextChars = input.maxTextChars ?? 16000;
+      const question = String(input.question ?? "").trim();
+      const signedUrl = await buildAssetSignedUrl(selectedAsset);
+      const inspectionModelName = env("ASSET_INSPECTION_MODEL_NAME") ?? bootstrap.smartModel ?? "gpt-5";
+
       try {
-        const items = await vfsList(virtualRuntime, path, input.recursive ?? false);
-        const entries = await Promise.all(
-          items.map(async (itemPath) => {
-            const node = await vfsGetNode(virtualRuntime, itemPath);
-            const filename = basename(itemPath) || "file";
-            return {
-              path: itemPath,
-              type: node?.type ?? "unknown",
-              url:
-                node?.type === "file"
-                  ? await buildSignedVfsUrlForRuntime(virtualRuntime, itemPath, {
-                      filename,
-                      mimeType: inferMimeFromFilename(filename),
-                      encoding: "utf8",
-                    })
-                  : null,
-            };
-          })
-        );
+        const loaded = await loadSessionAssetContent(selectedAsset, { fetchRemote });
+        const base = {
+          ok: true,
+          asset: describeSessionAsset(selectedAsset),
+          ref: buildAssetReference(selectedAsset),
+          url: signedUrl,
+          filename: loaded.filename,
+          mimeType: loaded.mimeType,
+          sizeBytes: loaded.sizeBytes,
+          question: question || null,
+        };
+
+        if (inferInspectableTextAsset(selectedAsset, loaded)) {
+          const decodedText = loaded.textPreview ?? tryUtf8FromBase64(loaded.base64) ?? "";
+          const preview = truncateForModelContext(decodedText, maxTextChars);
+          const analysis = await runAssetInspectionText({
+            modelName: inspectionModelName,
+            prompt: [
+              "You are inspecting a user-uploaded text file.",
+              "Explain what it contains and answer the user's question if one is provided.",
+              "If the file looks like code, mention the language and summarize what it does.",
+              "If the file looks like JSON, CSV, logs, or config, describe the structure and important contents.",
+              "Do not invent content beyond the provided text.",
+              "",
+              `Filename: ${loaded.filename}`,
+              `MIME Type: ${loaded.mimeType}`,
+              question ? `User question: ${question}` : "User question: Describe what this file contains.",
+              "",
+              "File content:",
+              preview,
+            ].join("\n"),
+          });
+
+          return {
+            ...base,
+            inspectionMode: "text",
+            textPreview: truncateText(decodedText, 6000),
+            analysis,
+          };
+        }
+
+        if (loaded.mimeType.startsWith("image/")) {
+          const imageInput = signedUrl ?? base64ToBytes(loaded.base64);
+          const analysis = await runAssetInspectionText({
+            modelName: inspectionModelName,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: [
+                      "Inspect this uploaded image and describe what it contains.",
+                      "Include visible text, UI elements, objects, people, charts, diagrams, and other important details.",
+                      question ? `User question: ${question}` : "User question: Describe exactly what you see.",
+                    ].join("\n"),
+                  },
+                  {
+                    type: "image",
+                    image: imageInput,
+                  },
+                ],
+              },
+            ],
+          });
+
+          return {
+            ...base,
+            inspectionMode: "image",
+            analysis,
+          };
+        }
+
+        if (loaded.mimeType === "application/pdf") {
+          const pdfInput = signedUrl ?? base64ToBytes(loaded.base64);
+          const analysis = await runAssetInspectionText({
+            modelName: inspectionModelName,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: [
+                      "Inspect this uploaded PDF and explain what it contains.",
+                      "Summarize the document, mention major sections, and answer the user's question if one is provided.",
+                      question ? `User question: ${question}` : "User question: What does this PDF contain?",
+                    ].join("\n"),
+                  },
+                  {
+                    type: "file",
+                    data: pdfInput,
+                    mediaType: "application/pdf",
+                    filename: loaded.filename,
+                  },
+                ],
+              },
+            ],
+          });
+
+          return {
+            ...base,
+            inspectionMode: "pdf",
+            analysis,
+          };
+        }
+
+        if (loaded.mimeType.startsWith("audio/")) {
+          const audioModelName = env("AUDIO_INSPECTION_MODEL_NAME") ?? "gpt-4o-audio-preview";
+          const audioInput = signedUrl ?? base64ToBytes(loaded.base64);
+          const audioResult = await generateText({
+            model: openai.chat(audioModelName),
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: question || "Transcribe this audio and summarize what it says.",
+                  },
+                  {
+                    type: "file",
+                    data: audioInput,
+                    mediaType: loaded.mimeType,
+                    filename: loaded.filename,
+                  },
+                ],
+              },
+            ],
+          });
+
+          return {
+            ...base,
+            inspectionMode: "audio",
+            analysis: String(audioResult.text ?? "").trim(),
+          };
+        }
 
         return {
-          ok: true,
-          path,
-          recursive: input.recursive ?? false,
-          count: entries.length,
-          entries,
+          ...base,
+          inspectionMode: "metadata",
+          analysis:
+            `I could not directly inspect the binary contents of ${loaded.filename} (${loaded.mimeType}). ` +
+            `I can still provide metadata and a signed URL for an external tool if needed.`,
         };
       } catch (error: any) {
         return {
           ok: false,
-          path,
-          error: String(error?.message ?? error ?? "Unknown list_virtual_files error"),
+          asset: describeSessionAsset(selectedAsset),
+          ref: buildAssetReference(selectedAsset),
+          url: signedUrl,
+          error: String(error?.message ?? error ?? "Unknown inspect_session_asset error"),
         };
       }
     },
@@ -4690,13 +4010,13 @@ function createNativeAgentTools(args: {
 
   const listSessionAssets = tool({
     description:
-      "List images, audio, video, and files detected in the current conversation history, including canonical asset refs and signed URLs for follow-up preparation.",
+      "List images, audio, video, and files detected in the current conversation history, including canonical IDs and signed APP_BASE_URL URLs for follow-up asset preparation.",
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
       const assets = await Promise.all(
         sessionAssets.map(async (asset) => ({
           ...describeSessionAsset(asset),
-          ref: await buildAssetReference(asset),
+          ref: buildAssetReference(asset),
           url: await buildAssetSignedUrl(asset),
         }))
       );
@@ -4711,7 +4031,7 @@ function createNativeAgentTools(args: {
 
   const prepareSessionAsset = tool({
     description:
-      "Prepare a session asset for external tool usage. Returns canonical asset refs, signed URLs, and optional inline data when requested.",
+      "Prepare a session asset for external tool usage. Returns a signed APP_BASE_URL VFS URL plus optional inline data when requested.",
     inputSchema: zodSchema(
       z.object({
         assetId: z.string().min(1),
@@ -4777,7 +4097,7 @@ function createNativeAgentTools(args: {
 
         return {
           ok: true,
-          ref: await buildAssetReference(asset),
+          ref: buildAssetReference(asset),
           ...buildPreparedAssetPayload(asset, {
             loaded,
             materialized,
@@ -4797,7 +4117,7 @@ function createNativeAgentTools(args: {
 
   const materializeSessionAsset = tool({
     description:
-      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/ and return both its canonical ref and signed URL.",
+      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/ and return its signed APP_BASE_URL URL.",
     inputSchema: zodSchema(
       z.object({
         assetId: z.string().min(1),
@@ -4821,11 +4141,13 @@ function createNativeAgentTools(args: {
           includeBase64: input.includeBase64 ?? false,
         });
 
+        const signedUrl = await buildAssetSignedUrl(asset);
+
         return {
           ok: true,
           asset: describeSessionAsset(asset),
-          ref: await buildAssetReference(asset),
-          url: await buildAssetSignedUrl(asset),
+          ref: buildAssetReference(asset),
+          url: signedUrl,
           assetRoot: result.assetRoot,
           metaPath: result.metaPath,
           binaryPath: result.binaryPath ?? null,
@@ -4849,132 +4171,6 @@ function createNativeAgentTools(args: {
     },
   });
 
-  const composioListToolkits = tool({
-    description:
-      "List Composio toolkits available in the current user session, including exact slugs, connection status, connected account IDs, and auth config IDs.",
-    inputSchema: zodSchema(
-      z.object({
-        search: z.string().optional(),
-        connectedOnly: z.boolean().optional(),
-        limit: z.number().int().min(1).max(200).optional(),
-      })
-    ),
-    execute: async (input: { search?: string; connectedOnly?: boolean; limit?: number }) => {
-      return await listToolkitsExecute(input);
-    },
-  });
-
-  const composioAuthorizeToolkit = tool({
-    description:
-      "Deterministically check toolkit connection state and, if needed, generate the correct Composio connect link using the live toolkit catalog, connected accounts, and auth configs.",
-    inputSchema: zodSchema(
-      z.object({
-        toolkit: z.string().min(1),
-        callbackUrl: z.string().optional(),
-        authConfigId: z.string().optional(),
-        connectedAccountId: z.string().optional(),
-      })
-    ),
-    execute: async (input: {
-      toolkit: string;
-      callbackUrl?: string;
-      authConfigId?: string;
-      connectedAccountId?: string;
-    }) => {
-      return await authorizeToolkitExecute(input);
-    },
-  });
-
-  const composioManageConnections = tool({
-    description:
-      "Deterministic replacement for generic connection management. List toolkits, inspect whether a toolkit is already connected, and generate a connect link only when needed.",
-    inputSchema: zodSchema(
-      z.object({
-        action: z.enum(["list", "status", "connect"]).optional(),
-        toolkit: z.string().optional(),
-        search: z.string().optional(),
-        callbackUrl: z.string().optional(),
-        authConfigId: z.string().optional(),
-        connectedAccountId: z.string().optional(),
-        limit: z.number().int().min(1).max(200).optional(),
-      })
-    ),
-    execute: async (input: {
-      action?: "list" | "status" | "connect";
-      toolkit?: string;
-      search?: string;
-      callbackUrl?: string;
-      authConfigId?: string;
-      connectedAccountId?: string;
-      limit?: number;
-    }) => {
-      const action = input.action ?? (input.toolkit ? "connect" : "list");
-
-      if (action === "list") {
-        return await listToolkitsExecute({
-          search: input.search,
-          connectedOnly: false,
-          limit: input.limit,
-        });
-      }
-
-      if (!input.toolkit?.trim()) {
-        return {
-          ok: false,
-          error: "toolkit is required for action=status or action=connect",
-        };
-      }
-
-      const resolved = await resolveToolkitState(input.toolkit);
-      const resolution = resolved.resolution;
-      const resolutionReason = getToolkitResolutionReason(resolution);
-      if (resolutionReason) {
-        return {
-          ok: false,
-          toolkitQuery: input.toolkit,
-          reason: resolutionReason,
-          candidates: resolution.candidates.map((candidate) => candidate.slug),
-          message:
-            resolutionReason === "ambiguous"
-              ? `Toolkit query "${input.toolkit}" matched multiple toolkits. Use an exact slug.`
-              : `Toolkit "${input.toolkit}" was not found in the current Composio catalog.`,
-        };
-      }
-
-      if (!resolved.match) {
-        return {
-          ok: false,
-          toolkitQuery: input.toolkit,
-          reason: "missing",
-          candidates: [],
-          message: `Toolkit "${input.toolkit}" was not found in the current Composio catalog.`,
-        };
-      }
-
-      const toolkitSlug = resolved.match.slug;
-      const authConfigId = input.authConfigId ?? resolved.preferredAuthConfigId ?? undefined;
-      const connectedAccountId = input.connectedAccountId ?? resolved.preferredConnectedAccountId ?? undefined;
-
-      if (action === "status") {
-        return {
-          ok: true,
-          toolkit: toolkitSlug,
-          connected: Boolean(connectedAccountId || resolved.match.connected),
-          connectedAccountId,
-          authConfigId,
-          candidates: resolved.resolution.candidates.map((candidate) => candidate.slug),
-        };
-      }
-
-      return await authorizeToolkitExecute({
-        toolkit: toolkitSlug,
-        callbackUrl: input.callbackUrl,
-        authConfigId,
-        connectedAccountId,
-      });
-    },
-  });
-
   const composioGetMcpServer = tool({
     description:
       "Get the Composio MCP server URL and headers for this user session. Use when an MCP-compatible client needs connection details.",
@@ -4983,7 +4179,7 @@ function createNativeAgentTools(args: {
       try {
         const session = await createComposioSessionForUser(
           requestArgs.userId,
-          sessionOverrides,
+          requestArgs.composio?.session,
           requestArgs.composio
         );
         const mcp: any = (session as any)?.mcp ?? null;
@@ -5169,10 +4365,6 @@ function createNativeAgentTools(args: {
   return {
     schedule_message: scheduleMessage,
     ssh_exec: sshTool,
-    composio_list_toolkits: composioListToolkits,
-    COMPOSIO_LIST_TOOLKITS: composioListToolkits,
-    composio_authorize_toolkit: composioAuthorizeToolkit,
-    COMPOSIO_MANAGE_CONNECTIONS: composioManageConnections,
     composio_get_mcp_server: composioGetMcpServer,
     composio_api_request: composioProjectApiRequest,
     composio_org_api_request: composioOrgApiRequest,
@@ -5183,8 +4375,8 @@ function createNativeAgentTools(args: {
     write_virtual_file: writeVirtualFile,
     get_virtual_file_url: getVirtualFileUrl,
     virtual_shell: virtualShell,
-    list_virtual_files: listVirtualFiles,
     list_session_assets: listSessionAssets,
+    inspect_session_asset: inspectSessionAsset,
     prepare_session_asset: prepareSessionAsset,
     materialize_session_asset: materializeSessionAsset,
   };
@@ -5195,21 +4387,11 @@ async function loadAgentToolBundle(args: {
   request: AgentTurnArgs;
   bootstrap: AgentTurnBootstrap;
 }): Promise<AgentToolBundle> {
-  const discoveredConnectedAccounts = await listActiveComposioConnectedAccountsForUser(
-    args.request.userId,
-    args.request.composio
-  );
-  const discoveredSessionOverrides = discoverComposioSessionOverridesFromConnectedAccounts(discoveredConnectedAccounts);
-  const sessionOverrides = mergeComposioSessionOverrides(
-    discoveredSessionOverrides,
-    args.request.composio?.session
-  );
-
   let composioTools: ToolSet = {};
   if (getComposioProjectApiKey(args.request.composio)) {
     const rawTools = await getComposioToolsForUser(
       args.request.userId,
-      sessionOverrides,
+      args.request.composio?.session,
       args.request.composio
     ).catch(() => ({} as ToolSet));
 
@@ -5220,10 +4402,7 @@ async function loadAgentToolBundle(args: {
     });
   }
 
-  const nativeTools = createNativeAgentTools({
-    ...args,
-    sessionOverrides,
-  });
+  const nativeTools = createNativeAgentTools(args);
   const tools: ToolSet = {
     ...composioTools,
     ...nativeTools,
@@ -5234,7 +4413,6 @@ async function loadAgentToolBundle(args: {
     composioTools,
     tools,
     retryTools: tools,
-    sessionOverrides,
   };
 }
 
@@ -5258,30 +4436,30 @@ function buildAgentSystemPrompt(args: {
     "- session.tools() returns Composio meta tools for discovery, auth, execution, browser automation toolkit discovery, and the persistent workbench sandbox.",
     "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app/tool slug or need browser automation or other dynamic toolkit discovery.",
     "- Use COMPOSIO_GET_TOOL_SCHEMAS to inspect exact tool inputs before execution.",
-    "- Use composio_list_toolkits or COMPOSIO_LIST_TOOLKITS to inspect exact toolkit slugs and connection state before connecting anything.",
+    "- Use COMPOSIO_MANAGE_CONNECTIONS when auth may be missing or the user asks to connect an app.",
     "- Use COMPOSIO_MULTI_EXECUTE_TOOL or COMPOSIO_EXECUTE_TOOL to run Composio actions after discovery.",
     "- Use COMPOSIO_REMOTE_WORKBENCH or COMPOSIO_REMOTE_BASH_TOOL for the Composio code sandbox or workbench.",
     "- Use composio_api_request for project-scoped Composio platform APIs that are outside session meta tools, including /webhook_subscriptions, /trigger_instances, /triggers_types, /connected_accounts, /auth_configs, /toolkits, /tools, /files, /mcp, /tool_router, and /org/project/config.",
     "- Use composio_org_api_request only for org-level project administration endpoints such as /org/owner/project/list or /org/owner/project/new when an org key is configured.",
-    "- Use composio_authorize_toolkit or COMPOSIO_MANAGE_CONNECTIONS only after the exact toolkit slug is known.",
-    "- Sessions are pre-seeded with any active connected accounts and auth configs found for this user so existing connections continue to work.",
+    "- Use composio_get_mcp_server to retrieve MCP connection info for this user session.",
     "- Use composio_verify_webhook_signature when working with inbound webhook payloads and headers.",
     "",
     "FILESYSTEM:",
-    "- Use list_virtual_files first when inspecting what exists in the Redis-backed virtual filesystem.",
-    "- Use read_virtual_file and write_virtual_file for exact file reads and writes.",
+    "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
     "- Use get_virtual_file_url when an external tool needs a signed APP_BASE_URL URL for a VFS file.",
-    "- Use virtual_shell for shell-like operations on the virtual filesystem only, but prefer list_virtual_files over shell ls for discovery.",
+    "- Use virtual_shell for shell-like operations on the virtual filesystem only.",
     "- Prefer /workspace for drafts, payloads, notes, JSON, and staging.",
     "",
     "MODALITIES:",
     `- Session asset count available via tools: ${args.bootstrap.sessionAssets.length}`,
     "- Use list_session_assets to inspect assets.",
-    "- Use prepare_session_asset first for metadata, canonical asset refs, signed URLs, and upload hints.",
+    "- Use inspect_session_asset when the user asks what an uploaded image, screenshot, PDF, JSON, code file, log, or document contains.",
+    "- Use prepare_session_asset first for metadata, signed APP_BASE_URL URLs, and upload hints.",
     "- When calling external tools, pass asset references like asset://asset_m6_p2.",
-    "- The asset wrapper can resolve those refs to signed URLs for URL-style tools or s3keys for upload-style tools.",
+    "- The asset wrapper can resolve those refs to signed APP_BASE_URL VFS URLs for URL-style tools or s3keys for upload-style tools.",
     "- The execution wrapper resolves asset references deterministically before the external tool runs, staging asset bytes into Composio storage when a tool expects an s3key-backed upload.",
     "- Only request inline content when the target tool really needs it.",
+    "- After inspect_session_asset returns, answer directly instead of repeatedly calling list_session_assets or prepare_session_asset.",
     "",
     "SSH:",
     "- Use ssh_exec only for real host actions the user wants.",
