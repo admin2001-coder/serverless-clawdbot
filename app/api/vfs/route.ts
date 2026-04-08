@@ -55,6 +55,13 @@ function toWebCryptoBufferSource(bytes: Uint8Array): ArrayBuffer {
   return out.buffer;
 }
 
+function toResponseBodyBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength
+  ) as ArrayBuffer;
+}
+
 function hexFromBytes(bytes: Uint8Array): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -75,7 +82,11 @@ async function hmacSha256Hex(secret: string, message: string): Promise<string> {
     ["sign"]
   );
 
-  const sig = await subtle.sign("HMAC", key, toWebCryptoBufferSource(utf8ToBytes(message)));
+  const sig = await subtle.sign(
+    "HMAC",
+    key,
+    toWebCryptoBufferSource(utf8ToBytes(message))
+  );
   return hexFromBytes(new Uint8Array(sig));
 }
 
@@ -253,7 +264,9 @@ async function handle(
     String(searchParams.get("filename") ?? requestedPath.split("/").pop() ?? "file")
   );
   const mimeType = String(
-    searchParams.get("mimeType") ?? inferMimeFromFilename(filename) ?? "application/octet-stream"
+    searchParams.get("mimeType") ??
+      inferMimeFromFilename(filename) ??
+      "application/octet-stream"
   )
     .trim()
     .toLowerCase();
@@ -320,7 +333,7 @@ async function handle(
   try {
     if (encoding === "base64") {
       const bytes = base64ToBytes(node.content);
-      return new Response(bytes, { status: 200, headers });
+      return new Response(toResponseBodyBuffer(bytes), { status: 200, headers });
     }
 
     return new Response(node.content, { status: 200, headers });
