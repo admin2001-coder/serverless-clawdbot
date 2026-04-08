@@ -3630,7 +3630,7 @@ export async function agentTurn(args: {
         sessionAssets.map(async (asset) => {
           const signedUrl =
             (await buildSignedAssetUrl(virtualRuntime, asset)) ??
-            `${getPublicBaseUrl()}/api/assets/${encodeURIComponent(asset.id)}`;
+            `${getPublicBaseUrl()}/api/vfs/${encodeURIComponent(asset.id)}`;
 
           return {
             ...describeSessionAsset(asset),
@@ -3711,7 +3711,7 @@ export async function agentTurn(args: {
 
         const signedUrl =
           (await buildSignedAssetUrl(virtualRuntime, asset)) ??
-          `${getPublicBaseUrl()}/api/assets/${encodeURIComponent(asset.id)}`;
+          `${getPublicBaseUrl()}/api/vfs/${encodeURIComponent(asset.id)}`;
 
         return {
           ok: true,
@@ -3761,7 +3761,7 @@ export async function agentTurn(args: {
 
         const signedUrl =
           (await buildSignedAssetUrl(virtualRuntime, asset)) ??
-          `${getPublicBaseUrl()}/api/assets/${encodeURIComponent(asset.id)}`;
+          `${getPublicBaseUrl()}/api/vfs/${encodeURIComponent(asset.id)}`;
 
         return {
           ok: true,
