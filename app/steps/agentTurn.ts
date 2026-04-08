@@ -3477,13 +3477,13 @@ async function buildAgentTurnBootstrap(args: AgentTurnArgs): Promise<AgentTurnBo
     sessionAssets,
   });
 
-  const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o-mini";
-  const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o";
+  const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4.1";
+  const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4.1";
   const forceSmart = (env("AGENT_FORCE_SMART_MODEL") ?? "true") !== "false";
   const modelName = forceSmart ? smartModel : hasRichMedia ? smartModel : fastModel;
 
-  const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.7");
-  const maxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 11));
+  const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.4");
+  const maxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 20));
 
   const isTelegram = args.channel === "telegram";
   const telegramStreamingEnabled =
@@ -4177,6 +4177,7 @@ function buildAgentSystemPrompt(args: {
     "- Let Composio search, authenticate, and execute dynamically at runtime instead of relying on hard-coded toolkit routing.",
     "",
     "COMPOSIO SESSION:",
+   `DO NOT HALLUCINATE`,
     `- Active namespace: ${args.request.userId}`,
     "- Namespaces identify active connections in an auth config instance scoped to that user's credentials for that specific toolkit or API integration.",
     "- session.tools() returns Composio meta tools for discovery, auth, execution, browser automation toolkit discovery, and the persistent workbench sandbox.",
