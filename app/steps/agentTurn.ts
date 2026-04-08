@@ -1886,25 +1886,28 @@ async function buildSignedVfsUrlForRuntime(
 }
 
 async function buildSignedAssetUrl(
-  rt: VirtualRuntime | undefined,
+  _rt: VirtualRuntime | undefined,
   asset: SessionAsset,
   ttlSeconds = 900
 ): Promise<string | null> {
-  if (!rt) {
+  const baseUrl = getPublicBaseUrl();
+  const secret = getAssetSigningSecret();
+  const subtle = globalThis.crypto?.subtle;
+
+  if (!baseUrl || !secret || !subtle) {
     return asset.url ?? null;
   }
 
-  try {
-    const materialized = await materializeSessionAssetToVfs(rt, asset, {
-      fetchRemote: true,
-      includeBase64: false,
-      ttlSeconds,
-    });
+  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, ttlSeconds);
+  const payload = `${asset.id}.${expiresAt}.${asset.filename}.${asset.mimeType}`;
+  const sig = await hmacSha256Hex(secret, payload);
 
-    return materialized.publicUrl ?? asset.url ?? null;
-  } catch {
-    return asset.url ?? null;
-  }
+  const url = new URL(`${baseUrl}/api/assets/${encodeURIComponent(asset.id)}`);
+  url.searchParams.set("expires", String(expiresAt));
+  url.searchParams.set("filename", asset.filename);
+  url.searchParams.set("mimeType", asset.mimeType);
+  url.searchParams.set("sig", sig);
+  return url.toString();
 }
 
 function buildPreparedAssetPayload(
@@ -3288,7 +3291,7 @@ function createEditCoalescer(opts: {
   }
 
   function nextTypewriterFrame(target: string): string {
-    const charsPerTick = 1;
+    const charsPerTick = 2;
 
     if (!displayedTypewriterText) {
       return target.slice(0, charsPerTick);
@@ -4190,8 +4193,8 @@ function buildAgentSystemPrompt(args: {
     `- Session asset count available via tools: ${args.bootstrap.sessionAssets.length}`,
     "- Use list_session_assets to inspect assets.",
     "- Use prepare_session_asset first for metadata, signed APP_BASE_URL URLs, and upload hints.",
-    `- When calling external tools, pass asset references like ${process.env.APP_BASE_URL}/api/vfs/asset_m6_p2.`,
-   `- The asset wrapper can resolve those refs to signed APP_BASE_URL VFS URLs for URL-style tools or s3keys for upload-style tools.`,
+    "- When calling external tools, pass asset references like asset://asset_m6_p2.",
+    "- The asset wrapper can resolve those refs to signed APP_BASE_URL VFS URLs for URL-style tools or s3keys for upload-style tools.",
     "- The execution wrapper resolves asset references deterministically before the external tool runs, staging asset bytes into Composio storage when a tool expects an s3key-backed upload.",
     "- Only request inline content when the target tool really needs it.",
     "",
