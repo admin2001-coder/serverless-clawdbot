@@ -28,18 +28,27 @@ import {
 // ============================================================
 // Composio client
 // ============================================================
-const composio = new Composio({
-  apiKey: env("COMPOSIO_API_KEY") || "",
-  provider: new VercelProvider(),
-});
+const composioProvider = new VercelProvider();
+
+type ComposioToolkitSelection = string[] | { enable?: string[]; disable?: string[] };
+type ComposioToolSelection = Record<string, string[] | { enable?: string[]; disable?: string[] }>;
 
 type ComposioSessionOverrides = {
-  toolkits?: string[] | { enable?: string[]; disable?: string[] };
+  toolkits?: ComposioToolkitSelection;
+  tools?: ComposioToolSelection;
   authConfigs?: Record<string, string>;
   connectedAccounts?: Record<string, string>;
   manageConnections?: boolean | { callbackUrl?: string };
+  workbench?: { enable?: boolean };
+  experimental?: Record<string, unknown>;
 };
 
+type AgentTurnComposioConfig = {
+  projectApiKey?: string;
+  orgApiKey?: string;
+  apiBaseUrl?: string;
+  session?: ComposioSessionOverrides;
+};
 
 // ============================================================
 // Upstash Redis-backed VFS
@@ -254,6 +263,81 @@ async function hmacSha256Hex(secret: string, message: string): Promise<string> {
   return hexFromBytes(new Uint8Array(sig));
 }
 
+async function hmacSha256Base64(secret: string, message: string): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new Error("Web Crypto subtle API is not available in this runtime");
+  }
+
+  const key = await subtle.importKey(
+    "raw",
+    toWebCryptoBufferSource(utf8ToBytes(secret)),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const sig = await subtle.sign("HMAC", key, toWebCryptoBufferSource(utf8ToBytes(message)));
+  return bytesToBase64(new Uint8Array(sig));
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const aBytes = utf8ToBytes(a);
+  const bBytes = utf8ToBytes(b);
+
+  if (aBytes.length !== bBytes.length) return false;
+
+  let diff = 0;
+  for (let i = 0; i < aBytes.length; i++) {
+    diff |= aBytes[i] ^ bBytes[i];
+  }
+  return diff === 0;
+}
+
+function parseWebhookTimestampSeconds(value: string): number | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+
+  const asNumber = Number(raw);
+  if (Number.isFinite(asNumber)) {
+    return asNumber > 1_000_000_000_000 ? Math.floor(asNumber / 1000) : Math.floor(asNumber);
+  }
+
+  const asDate = Date.parse(raw);
+  return Number.isFinite(asDate) ? Math.floor(asDate / 1000) : null;
+}
+
+function extractWebhookSignatureValue(signatureHeader: string): string {
+  const raw = String(signatureHeader ?? "").trim();
+  if (!raw) return "";
+
+  const commaParts = raw.split(",").map((part) => part.trim()).filter(Boolean);
+  const candidate = commaParts.length > 1 ? commaParts[commaParts.length - 1] : raw;
+
+  if (candidate.includes("=")) {
+    return candidate.split("=").slice(1).join("=").trim();
+  }
+
+  return candidate.trim();
+}
+
+function detectComposioWebhookVersion(payload: unknown): string {
+  const obj: any = payload;
+  if (!obj || typeof obj !== "object") return "unknown";
+  if (obj.type && obj.metadata && Object.prototype.hasOwnProperty.call(obj, "data")) return "V3";
+  if (Object.prototype.hasOwnProperty.call(obj, "payload") && Object.prototype.hasOwnProperty.call(obj, "triggerName")) return "V2";
+  if (Object.prototype.hasOwnProperty.call(obj, "trigger")) return "V1";
+  return "unknown";
+}
+
+function tryParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
 function normalizeHistory(history: ModelMessage[]): ModelMessage[] {
   return (history ?? []).map((m) => {
     const c: any = (m as any).content;
@@ -332,6 +416,13 @@ function dirname(p: string): string {
   const idx = s.lastIndexOf("/");
   if (idx <= 0) return "/";
   return s.slice(0, idx);
+}
+
+function basename(p: string): string {
+  const s = sanitizePath(p);
+  if (s === "/") return "";
+  const idx = s.lastIndexOf("/");
+  return idx >= 0 ? s.slice(idx + 1) : s;
 }
 
 function parentDirs(p: string): string[] {
@@ -1604,17 +1695,19 @@ async function loadSessionAssetContent(
 async function materializeSessionAssetToVfs(
   rt: VirtualRuntime,
   asset: SessionAsset,
-  opts?: { fetchRemote?: boolean; includeBase64?: boolean }
+  opts?: { fetchRemote?: boolean; includeBase64?: boolean; ttlSeconds?: number }
 ) {
   const includeBase64 = opts?.includeBase64 ?? false;
   const loaded = await loadSessionAssetContent(asset, { fetchRemote: opts?.fetchRemote ?? true });
   const assetRoot = sanitizePath(`/workspace/assets/${asset.id}`);
   const metaPath = sanitizePath(`${assetRoot}/meta.json`);
+  const binaryPath = sanitizePath(`${assetRoot}/content.base64`);
   const rawBase64Path = sanitizePath(`${assetRoot}/${asset.filename}.base64.txt`);
   const textPath = sanitizePath(`${assetRoot}/${asset.filename}.txt`);
   const infoPath = sanitizePath(`${assetRoot}/composio_payload.json`);
 
   await vfsEnsureDir(rt, assetRoot);
+  await vfsWriteFile(rt, binaryPath, loaded.base64);
 
   await vfsWriteFile(
     rt,
@@ -1624,6 +1717,7 @@ async function materializeSessionAssetToVfs(
       loadedMimeType: loaded.mimeType,
       loadedSizeBytes: loaded.sizeBytes,
       loadedSource: loaded.source,
+      binaryPath,
       createdAt: nowIso(),
     })
   );
@@ -1636,18 +1730,28 @@ async function materializeSessionAssetToVfs(
     await vfsWriteFile(rt, textPath, loaded.textPreview);
   }
 
+  const publicUrl = await buildSignedVfsUrlForRuntime(rt, binaryPath, {
+    filename: loaded.filename,
+    mimeType: loaded.mimeType,
+    encoding: "base64",
+    ttlSeconds: opts?.ttlSeconds ?? 900,
+  });
+
   await vfsWriteFile(
     rt,
     infoPath,
     toSafeJson({
       filename: loaded.filename,
       mimeType: loaded.mimeType,
-      url: asset.url ?? null,
+      url: publicUrl ?? asset.url ?? null,
+      sourceUrl: asset.url ?? null,
+      binaryPath,
       dataUrl: includeBase64 ? loaded.dataUrl ?? null : null,
       base64Path: includeBase64 ? rawBase64Path : null,
       textPath: loaded.textPreview != null ? textPath : null,
       notes: [
         "Prefer url when a target Composio tool accepts URL-based file ingestion.",
+        "These signed URLs are served from the Redis-backed VFS via APP_BASE_URL.",
         "Otherwise request inline content only when the target tool truly requires it.",
         "Not all Composio tools share the same schema; adapt to the declared tool input schema.",
       ],
@@ -1659,6 +1763,8 @@ async function materializeSessionAssetToVfs(
     assetId: asset.id,
     assetRoot,
     metaPath,
+    binaryPath,
+    publicUrl,
     base64Path: includeBase64 ? rawBase64Path : null,
     textPath: loaded.textPreview != null ? textPath : null,
     infoPath,
@@ -1678,27 +1784,126 @@ function getPublicBaseUrl(): string | null {
 }
 
 function getAssetSigningSecret(): string | null {
-  const v = env("ASSET_URL_SIGNING_SECRET") || env("SESSION_ASSET_SIGNING_SECRET") || "";
+  const v =
+    env("VFS_URL_SIGNING_SECRET") ||
+    env("ASSET_URL_SIGNING_SECRET") ||
+    env("SESSION_ASSET_SIGNING_SECRET") ||
+    "";
   return v.trim() || null;
 }
 
-async function buildSignedAssetUrl(asset: SessionAsset, ttlSeconds = 900): Promise<string | null> {
+type VfsUrlEncoding = "utf8" | "base64";
+
+type BuildSignedVfsUrlOptions = {
+  filename?: string;
+  mimeType?: string;
+  encoding?: VfsUrlEncoding;
+  ttlSeconds?: number;
+  download?: boolean;
+};
+
+function buildSignedVfsPayload(args: {
+  userId: string;
+  sessionId: string;
+  path: string;
+  expiresAt: number;
+  filename: string;
+  mimeType: string;
+  encoding: VfsUrlEncoding;
+  download: boolean;
+}): string {
+  return [
+    "v1",
+    `userId=${args.userId}`,
+    `sessionId=${args.sessionId}`,
+    `path=${sanitizePath(args.path)}`,
+    `expires=${args.expiresAt}`,
+    `filename=${args.filename}`,
+    `mimeType=${args.mimeType}`,
+    `encoding=${args.encoding}`,
+    `download=${args.download ? "1" : "0"}`,
+  ].join("\n");
+}
+
+async function buildSignedVfsUrl(args: {
+  userId: string;
+  sessionId: string;
+  path: string;
+} & BuildSignedVfsUrlOptions): Promise<string | null> {
   const baseUrl = getPublicBaseUrl();
   const secret = getAssetSigningSecret();
   const subtle = globalThis.crypto?.subtle;
 
   if (!baseUrl || !secret || !subtle) return null;
 
-  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, ttlSeconds);
-  const payload = `${asset.id}.${expiresAt}.${asset.filename}.${asset.mimeType}`;
-  const sig = await hmacSha256Hex(secret, payload);
+  const path = sanitizePath(args.path);
+  const filename = safeFilenameSegment(args.filename || basename(path) || "file");
+  const mimeType = String(args.mimeType || inferMimeFromFilename(filename) || "application/octet-stream")
+    .trim()
+    .toLowerCase();
+  const encoding: VfsUrlEncoding = args.encoding === "base64" ? "base64" : "utf8";
+  const download = args.download === true;
+  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, args.ttlSeconds ?? 900);
+  const sig = await hmacSha256Hex(
+    secret,
+    buildSignedVfsPayload({
+      userId: args.userId,
+      sessionId: args.sessionId,
+      path,
+      expiresAt,
+      filename,
+      mimeType,
+      encoding,
+      download,
+    })
+  );
 
-  const url = new URL(`${baseUrl}/api/assets/${encodeURIComponent(asset.id)}`);
+  const encodedPath = path.split("/").filter(Boolean).map((part) => encodeURIComponent(part)).join("/");
+  const url = new URL(`${baseUrl}/api/vfs/${encodedPath}`);
+  url.searchParams.set("userId", args.userId);
+  url.searchParams.set("sessionId", args.sessionId);
   url.searchParams.set("expires", String(expiresAt));
-  url.searchParams.set("filename", asset.filename);
-  url.searchParams.set("mimeType", asset.mimeType);
+  url.searchParams.set("filename", filename);
+  url.searchParams.set("mimeType", mimeType);
+  url.searchParams.set("encoding", encoding);
+  if (download) url.searchParams.set("download", "1");
   url.searchParams.set("sig", sig);
   return url.toString();
+}
+
+async function buildSignedVfsUrlForRuntime(
+  rt: VirtualRuntime,
+  path: string,
+  opts?: BuildSignedVfsUrlOptions
+): Promise<string | null> {
+  return await buildSignedVfsUrl({
+    userId: rt.userId,
+    sessionId: rt.sessionId,
+    path,
+    ...opts,
+  });
+}
+
+async function buildSignedAssetUrl(
+  rt: VirtualRuntime | undefined,
+  asset: SessionAsset,
+  ttlSeconds = 900
+): Promise<string | null> {
+  if (!rt) {
+    return asset.url ?? null;
+  }
+
+  try {
+    const materialized = await materializeSessionAssetToVfs(rt, asset, {
+      fetchRemote: true,
+      includeBase64: false,
+      ttlSeconds,
+    });
+
+    return materialized.publicUrl ?? asset.url ?? null;
+  } catch {
+    return asset.url ?? null;
+  }
 }
 
 function buildPreparedAssetPayload(
@@ -1708,9 +1913,11 @@ function buildPreparedAssetPayload(
     materialized?: {
       assetRoot: string;
       metaPath: string;
+      binaryPath?: string | null;
       base64Path: string | null;
       textPath: string | null;
       infoPath: string;
+      publicUrl?: string | null;
     } | null;
     includeInlineData?: boolean;
     signedUrl?: string | null;
@@ -1719,7 +1926,7 @@ function buildPreparedAssetPayload(
   const loaded = opts?.loaded ?? null;
   const materialized = opts?.materialized ?? null;
   const includeInlineData = opts?.includeInlineData ?? false;
-  const signedUrl = opts?.signedUrl ?? null;
+  const signedUrl = opts?.signedUrl ?? materialized?.publicUrl ?? null;
 
   const mimeType = loaded?.mimeType ?? asset.mimeType;
   const filename = loaded?.filename ?? asset.filename;
@@ -1758,7 +1965,8 @@ function buildPreparedAssetPayload(
       },
       guidance: [
         "Inspect the target Composio tool schema first.",
-        "For URL-style parameters, pass asset://<assetId> and let the execution wrapper resolve it. For upload-style Composio tools, the wrapper stages bytes and supplies the resulting s3key automatically.",
+        "For URL-style parameters, pass asset://<assetId> and let the execution wrapper resolve it to a signed APP_BASE_URL VFS URL.",
+        "For upload-style Composio tools, the wrapper stages bytes and supplies the resulting s3key automatically.",
         "For inline file parameters, use asset://<assetId> or an object with assetId and the wrapper will materialize data deterministically.",
       ],
     },
@@ -1766,9 +1974,11 @@ function buildPreparedAssetPayload(
       ? {
           assetRoot: materialized.assetRoot,
           metaPath: materialized.metaPath,
+          binaryPath: materialized.binaryPath ?? null,
           base64Path: materialized.base64Path,
           textPath: materialized.textPath,
           infoPath: materialized.infoPath,
+          url: materialized.publicUrl ?? null,
         }
       : null,
   };
@@ -1914,16 +2124,205 @@ function inferComposioToolkitSlugFromToolSlug(toolSlug: string): string {
   return prefix.toLowerCase();
 }
 
-function getComposioApiBaseUrl(): string {
-  const raw = env("COMPOSIO_API_BASE_URL") || env("COMPOSIO_BASE_URL") || "https://backend.composio.dev";
-  const trimmed = String(raw ?? "").trim().replace(/\/+$/, "");
-  return /\/api\/v3$/i.test(trimmed) ? trimmed : `${trimmed}/api/v3`;
+function getComposioProjectApiKey(config?: AgentTurnComposioConfig): string {
+  return String(config?.projectApiKey ?? env("COMPOSIO_API_KEY") ?? "").trim();
 }
 
-function buildComposioApiUrl(pathname: string): string {
-  const base = getComposioApiBaseUrl();
+function getComposioOrgApiKey(config?: AgentTurnComposioConfig): string {
+  return String(
+    config?.orgApiKey ??
+      env("COMPOSIO_ORG_API_KEY") ??
+      env("COMPOSIO_X_ORG_API_KEY") ??
+      env("COMPOSIO_ORGANIZATION_API_KEY") ??
+      ""
+  ).trim();
+}
+
+function getComposioApiBaseRoot(config?: AgentTurnComposioConfig): string {
+  const raw = String(
+    config?.apiBaseUrl ?? env("COMPOSIO_API_BASE_URL") ?? env("COMPOSIO_BASE_URL") ?? "https://backend.composio.dev"
+  )
+    .trim()
+    .replace(/\/+$/, "");
+
+  return raw.replace(/\/api\/v3$/i, "");
+}
+
+function getComposioApiBaseUrl(config?: AgentTurnComposioConfig): string {
+  return `${getComposioApiBaseRoot(config)}/api/v3`;
+}
+
+function buildComposioApiUrl(pathname: string, config?: AgentTurnComposioConfig): string {
+  const base = getComposioApiBaseUrl(config);
   const path = pathname.startsWith("/") ? pathname : `/${pathname}`;
   return `${base}${path}`;
+}
+
+function getComposioProjectCacheScope(config?: AgentTurnComposioConfig): string {
+  const apiKey = getComposioProjectApiKey(config);
+  return `${getComposioApiBaseRoot(config)}|${apiKey ? apiKey.slice(-12) : "default"}`;
+}
+
+function createComposioClient(config?: AgentTurnComposioConfig): Composio {
+  return new Composio({
+    apiKey: getComposioProjectApiKey(config),
+    provider: composioProvider,
+    baseUrl: getComposioApiBaseRoot(config),
+  } as any);
+}
+
+function normalizeComposioApiPath(path: string, config?: AgentTurnComposioConfig): string {
+  const raw = String(path ?? "").trim();
+  if (!raw) {
+    throw new Error("Composio API path is required");
+  }
+
+  if (/^https?:\/\//i.test(raw)) {
+    const url = new URL(raw);
+    const allowedOrigin = new URL(getComposioApiBaseRoot(config)).origin;
+    if (url.origin !== allowedOrigin) {
+      throw new Error(`Composio API request origin mismatch: expected ${allowedOrigin}, received ${url.origin}`);
+    }
+
+    const normalizedPath = url.pathname.replace(/^\/api\/v3/i, "");
+    return `${normalizedPath.startsWith("/") ? normalizedPath : `/${normalizedPath}`}${url.search}`;
+  }
+
+  const withoutPrefix = raw.replace(/^\/api\/v3/i, "");
+  return withoutPrefix.startsWith("/") ? withoutPrefix : `/${withoutPrefix}`;
+}
+
+function appendComposioQueryValue(searchParams: URLSearchParams, key: string, value: unknown): void {
+  if (value === undefined || value === null) return;
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      appendComposioQueryValue(searchParams, key, item);
+    }
+    return;
+  }
+
+  if (typeof value === "object") {
+    searchParams.append(key, JSON.stringify(value));
+    return;
+  }
+
+  searchParams.append(key, String(value));
+}
+
+function appendComposioQueryParams(url: URL, query?: Record<string, unknown>): void {
+  if (!query) return;
+
+  for (const [key, value] of Object.entries(query)) {
+    appendComposioQueryValue(url.searchParams, key, value);
+  }
+}
+
+function headersToRecord(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    out[key] = value;
+  });
+  return out;
+}
+
+type ComposioApiRequestOptions = {
+  method?: string;
+  path: string;
+  query?: Record<string, unknown>;
+  body?: unknown;
+  rawBody?: string;
+  rawBodyBase64?: string;
+  contentType?: string;
+  headers?: Record<string, string>;
+  authMode?: "project" | "org";
+  config?: AgentTurnComposioConfig;
+};
+
+async function composioApiRequest(options: ComposioApiRequestOptions) {
+  const authMode = options.authMode ?? "project";
+  const apiKey = authMode === "org" ? getComposioOrgApiKey(options.config) : getComposioProjectApiKey(options.config);
+
+  if (!apiKey) {
+    throw new Error(authMode === "org" ? "COMPOSIO_ORG_API_KEY not set" : "COMPOSIO_API_KEY not set");
+  }
+
+  const normalizedPath = normalizeComposioApiPath(options.path, options.config);
+  const [pathname, inlineQuery = ""] = normalizedPath.split("?", 2);
+  const url = new URL(buildComposioApiUrl(pathname, options.config));
+
+  if (inlineQuery) {
+    const inlineParams = new URLSearchParams(inlineQuery);
+    inlineParams.forEach((value, key) => {
+      url.searchParams.append(key, value);
+    });
+  }
+
+  appendComposioQueryParams(url, options.query);
+
+  const method = String(
+    options.method ??
+      (options.body !== undefined || options.rawBody !== undefined || options.rawBodyBase64 !== undefined ? "POST" : "GET")
+  )
+    .trim()
+    .toUpperCase();
+
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    ...(options.headers ?? {}),
+  };
+
+  const authHeaderName = authMode === "org" ? "x-org-api-key" : "x-api-key";
+  if (!Object.keys(headers).some((key) => key.toLowerCase() === authHeaderName)) {
+    headers[authHeaderName] = apiKey;
+  }
+
+  const hasContentTypeHeader = Object.keys(headers).some((key) => key.toLowerCase() === "content-type");
+  let body: BodyInit | undefined;
+
+  if (options.rawBodyBase64 !== undefined) {
+    body = toWebCryptoBufferSource(base64ToBytes(options.rawBodyBase64));
+    if (!hasContentTypeHeader) {
+      headers["content-type"] = options.contentType || "application/octet-stream";
+    }
+  } else if (options.rawBody !== undefined) {
+    body = options.rawBody;
+    if (!hasContentTypeHeader) {
+      headers["content-type"] = options.contentType || "text/plain; charset=utf-8";
+    }
+  } else if (options.body !== undefined && method !== "GET" && method !== "HEAD") {
+    body = JSON.stringify(options.body);
+    if (!hasContentTypeHeader) {
+      headers["content-type"] = options.contentType || "application/json";
+    }
+  }
+
+  const response = await fetch(url.toString(), {
+    method,
+    headers,
+    body,
+  });
+
+  const responseText = await response.text();
+  let parsed: unknown = null;
+
+  try {
+    parsed = responseText ? JSON.parse(responseText) : null;
+  } catch {
+    parsed = responseText;
+  }
+
+  return {
+    ok: response.ok,
+    method,
+    url: url.toString(),
+    status: response.status,
+    statusText: response.statusText,
+    headers: headersToRecord(response.headers),
+    requestId: response.headers.get("x-request-id") ?? response.headers.get("request-id") ?? null,
+    data: parsed,
+    error: response.ok ? null : extractComposioErrorMessage(parsed),
+  };
 }
 
 function extractComposioErrorMessage(payload: unknown): string {
@@ -2091,43 +2490,29 @@ async function requestComposioStorageUpload(args: {
   filename: string;
   mimeType: string;
   md5Hex: string;
+  composioConfig?: AgentTurnComposioConfig;
 }) {
-  const apiKey = env("COMPOSIO_API_KEY") || "";
-  if (!apiKey) {
-    throw new Error("COMPOSIO_API_KEY is not set");
-  }
-
-  const response = await fetch(buildComposioApiUrl("/files/upload/request"), {
+  const response = await composioApiRequest({
+    authMode: "project",
+    config: args.composioConfig,
     method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-    },
-    body: JSON.stringify({
+    path: "/files/upload/request",
+    body: {
       toolkit_slug: args.toolkitSlug,
       tool_slug: normalizeComposioToolSlug(args.toolSlug),
       filename: args.filename,
       mimetype: args.mimeType,
       md5: args.md5Hex,
-    }),
+    },
   });
-
-  const rawText = await response.text();
-  let payload: any = null;
-
-  try {
-    payload = rawText ? JSON.parse(rawText) : null;
-  } catch {
-    payload = rawText;
-  }
 
   if (!response.ok) {
     throw new Error(
-      `Composio upload request failed (${response.status} ${response.statusText}): ${extractComposioErrorMessage(payload)}`
+      `Composio upload request failed (${response.status} ${response.statusText}): ${response.error ?? "Unknown Composio API error"}`
     );
   }
 
+  const payload: any = response.data;
   const key = String(payload?.key ?? payload?.s3key ?? "").trim();
   if (!key) {
     throw new Error("Composio upload request did not return a storage key");
@@ -2169,11 +2554,13 @@ async function stageAssetToComposioStorageForTool(args: {
   toolkitSlug: string;
   toolSlug: string;
   fetchRemote?: boolean;
+  composioConfig?: AgentTurnComposioConfig;
 }): Promise<ComposioStagedAsset> {
   const loaded = await loadSessionAssetContent(args.asset, { fetchRemote: args.fetchRemote ?? true });
   const bytes = base64ToBytes(loaded.base64);
   const md5Hex = md5HexFromBytes(bytes);
   const cacheKey = [
+    getComposioProjectCacheScope(args.composioConfig),
     args.toolkitSlug,
     normalizeComposioToolSlug(args.toolSlug),
     loaded.filename,
@@ -2191,6 +2578,7 @@ async function stageAssetToComposioStorageForTool(args: {
       filename: loaded.filename,
       mimeType: loaded.mimeType,
       md5Hex,
+      composioConfig: args.composioConfig,
     });
 
     if (request.uploadUrl) {
@@ -2239,6 +2627,8 @@ async function resolveAssetForToolExecution(args: {
   toolSlug?: string | null;
   toolkitSlug?: string | null;
   fetchRemote?: boolean;
+  composioConfig?: AgentTurnComposioConfig;
+  virtualRuntime?: VirtualRuntime;
 }): Promise<{
   filename: string;
   mimeType: string;
@@ -2251,9 +2641,11 @@ async function resolveAssetForToolExecution(args: {
 }> {
   const mode = args.mode;
   const asset = args.asset;
-  const signedUrl = await buildSignedAssetUrl(asset);
+  const signedUrl = await buildSignedAssetUrl(args.virtualRuntime, asset);
   const toolSlug = normalizeComposioToolSlug(args.toolSlug ?? "");
-  const toolkitSlug = String(args.toolkitSlug ?? "").trim().toLowerCase() || (toolSlug ? inferComposioToolkitSlugFromToolSlug(toolSlug) : "");
+  const toolkitSlug =
+    String(args.toolkitSlug ?? "").trim().toLowerCase() ||
+    (toolSlug ? inferComposioToolkitSlugFromToolSlug(toolSlug) : "");
 
   if (mode === "url") {
     if (signedUrl || asset.url) {
@@ -2334,6 +2726,7 @@ async function resolveAssetForToolExecution(args: {
       toolSlug,
       toolkitSlug,
       fetchRemote: args.fetchRemote ?? true,
+      composioConfig: args.composioConfig,
     });
 
     return {
@@ -2457,6 +2850,8 @@ async function transformToolInputAssets(
     toolSlug?: string;
     toolkitSlug?: string;
     fetchRemote?: boolean;
+    composioConfig?: AgentTurnComposioConfig;
+    virtualRuntime?: VirtualRuntime;
   }
 ): Promise<unknown> {
   if (typeof value === "string") {
@@ -2476,6 +2871,8 @@ async function transformToolInputAssets(
         toolSlug: ctx.toolSlug,
         toolkitSlug: ctx.toolkitSlug,
         fetchRemote: ctx.fetchRemote ?? true,
+        composioConfig: ctx.composioConfig,
+        virtualRuntime: ctx.virtualRuntime,
       });
 
       if (mode === "s3key") return resolved.staged?.s3key ?? value;
@@ -2517,6 +2914,8 @@ async function transformToolInputAssets(
         toolSlug: nextCtxBase.toolSlug,
         toolkitSlug: nextCtxBase.toolkitSlug,
         fetchRemote: nextCtxBase.fetchRemote ?? true,
+        composioConfig: nextCtxBase.composioConfig,
+        virtualRuntime: nextCtxBase.virtualRuntime,
       });
 
       if (!resolved.staged) return value;
@@ -2586,6 +2985,8 @@ async function transformToolInputAssets(
         toolSlug: nextCtxBase.toolSlug,
         toolkitSlug: nextCtxBase.toolkitSlug,
         fetchRemote: nextCtxBase.fetchRemote ?? true,
+        composioConfig: nextCtxBase.composioConfig,
+        virtualRuntime: nextCtxBase.virtualRuntime,
       });
 
       const next: Record<string, any> = { ...input };
@@ -2696,6 +3097,8 @@ function wrapComposioToolsWithAssetResolution(
   composioTools: ToolSet,
   deps: {
     sessionAssets: SessionAsset[];
+    composioConfig?: AgentTurnComposioConfig;
+    virtualRuntime: VirtualRuntime;
   }
 ): ToolSet {
   const wrapped: Record<string, any> = {};
@@ -2719,6 +3122,8 @@ function wrapComposioToolsWithAssetResolution(
           toolSlug: normalizedToolSlug,
           toolkitSlug,
           fetchRemote: true,
+          composioConfig: deps.composioConfig,
+          virtualRuntime: deps.virtualRuntime,
         });
         return await toolDef.execute(resolvedInput, ...rest);
       },
@@ -2805,22 +3210,25 @@ function buildComposioSessionOptions(overrides?: ComposioSessionOverrides): Comp
 
 async function createComposioSessionForUser(
   userId: string,
-  overrides?: ComposioSessionOverrides
+  overrides?: ComposioSessionOverrides,
+  composioConfig?: AgentTurnComposioConfig
 ) {
-  if (!env("COMPOSIO_API_KEY")) {
+  if (!getComposioProjectApiKey(composioConfig)) {
     throw new Error("COMPOSIO_API_KEY not set");
   }
 
+  const composio = createComposioClient(composioConfig);
   return await composio.create(userId, buildComposioSessionOptions(overrides) as any);
 }
 
 async function getComposioToolsForUser(
   userId: string,
-  overrides?: ComposioSessionOverrides
+  overrides?: ComposioSessionOverrides,
+  composioConfig?: AgentTurnComposioConfig
 ): Promise<ToolSet> {
-  if (!env("COMPOSIO_API_KEY")) return {};
+  if (!getComposioProjectApiKey(composioConfig)) return {};
 
-  const session = await createComposioSessionForUser(userId, overrides);
+  const session = await createComposioSessionForUser(userId, overrides, composioConfig);
   return (await session.tools()) as ToolSet;
 }
 
@@ -2944,6 +3352,7 @@ export async function agentTurn(args: {
   channel: Channel;
   history: ModelMessage[];
   showTyping?: boolean;
+  composio?: AgentTurnComposioConfig;
 }) {
   "use step";
 
@@ -3078,11 +3487,18 @@ export async function agentTurn(args: {
     ),
     execute: async (input: { path: string }) => {
       try {
-        const content = await vfsReadFile(virtualRuntime, input.path);
+        const path = sanitizePath(input.path);
+        const content = await vfsReadFile(virtualRuntime, path);
+        const filename = basename(path) || "file";
         return {
           ok: true,
-          path: sanitizePath(input.path),
+          path,
           content: truncateText(content, 30000),
+          url: await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
+            filename,
+            mimeType: inferMimeFromFilename(filename),
+            encoding: "utf8",
+          }),
         };
       } catch (error: any) {
         return {
@@ -3104,11 +3520,18 @@ export async function agentTurn(args: {
     ),
     execute: async (input: { path: string; content: string }) => {
       try {
-        await vfsWriteFile(virtualRuntime, input.path, input.content);
+        const path = sanitizePath(input.path);
+        await vfsWriteFile(virtualRuntime, path, input.content);
+        const filename = basename(path) || "file";
         return {
           ok: true,
-          path: sanitizePath(input.path),
+          path,
           bytes: utf8ByteLength(input.content),
+          url: await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
+            filename,
+            mimeType: inferMimeFromFilename(filename),
+            encoding: "utf8",
+          }),
         };
       } catch (error: any) {
         return {
@@ -3120,9 +3543,67 @@ export async function agentTurn(args: {
     },
   });
 
+  const getVirtualFileUrl = tool({
+    description:
+      "Return a signed APP_BASE_URL URL for a file in the Redis-backed virtual filesystem so external systems can fetch it.",
+    inputSchema: zodSchema(
+      z.object({
+        path: z.string().min(1).max(4000),
+        mimeType: z.string().optional(),
+        filename: z.string().optional(),
+        encoding: z.enum(["utf8", "base64"]).optional(),
+        download: z.boolean().optional(),
+        ttlSeconds: z.number().int().min(60).max(86_400).optional(),
+      })
+    ),
+    execute: async (input: {
+      path: string;
+      mimeType?: string;
+      filename?: string;
+      encoding?: "utf8" | "base64";
+      download?: boolean;
+      ttlSeconds?: number;
+    }) => {
+      try {
+        const path = sanitizePath(input.path);
+        const node = await vfsGetNode(virtualRuntime, path);
+        if (!node) throw new Error(`No such path: ${path}`);
+        if (node.type !== "file") throw new Error(`Not a file: ${path}`);
+
+        const filename = safeFilenameSegment(input.filename || basename(path) || "file");
+        const mimeType = String(input.mimeType || inferMimeFromFilename(filename) || "application/octet-stream")
+          .trim()
+          .toLowerCase();
+        const encoding = input.encoding ?? "utf8";
+        const url = await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
+          filename,
+          mimeType,
+          encoding,
+          download: input.download ?? false,
+          ttlSeconds: input.ttlSeconds ?? 900,
+        });
+
+        return {
+          ok: Boolean(url),
+          path,
+          filename,
+          mimeType,
+          encoding,
+          url,
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          path: sanitizePath(input.path),
+          error: String(error?.message ?? error ?? "Unknown get_virtual_file_url error"),
+        };
+      }
+    },
+  });
+
   const virtualShell = tool({
     description:
-      "Run shell-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep.",
+      "Run bash-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep.",
     inputSchema: zodSchema(
       z.object({
         command: z.string().min(1).max(120000),
@@ -3142,23 +3623,33 @@ export async function agentTurn(args: {
 
   const listSessionAssets = tool({
     description:
-      "List images, audio, video, and files detected in the current conversation history, including canonical IDs for follow-up asset preparation.",
+      "List images, audio, video, and files detected in the current conversation history, including canonical IDs and signed APP_BASE_URL URLs for follow-up asset preparation.",
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
+      const assets = await Promise.all(
+        sessionAssets.map(async (asset) => {
+          const signedUrl =
+            (await buildSignedAssetUrl(virtualRuntime, asset)) ??
+            `${getPublicBaseUrl()}/api/assets/${encodeURIComponent(asset.id)}`;
+
+          return {
+            ...describeSessionAsset(asset),
+            ref: signedUrl,
+          };
+        })
+      );
+
       return {
         ok: true,
         count: sessionAssets.length,
-        assets: sessionAssets.map((asset) => ({
-          ...describeSessionAsset(asset),
-          ref: `asset://${asset.id}`,
-        })),
+        assets,
       };
     },
   });
 
   const prepareSessionAsset = tool({
     description:
-      "Prepare a session asset for external tool usage. By default returns metadata and upload hints only. Set includeInlineData=true only when the target tool truly needs inline content.",
+      "Prepare a session asset for external tool usage. Returns a signed Live URL on vercel.app backed by the Redis VFS plus optional inline data when requested.",
     inputSchema: zodSchema(
       z.object({
         assetId: z.string().min(1),
@@ -3206,6 +3697,7 @@ export async function agentTurn(args: {
             fetchRemote,
             includeBase64: includeInlineData,
           });
+
           materialized = {
             assetRoot: result.assetRoot,
             metaPath: result.metaPath,
@@ -3213,17 +3705,22 @@ export async function agentTurn(args: {
             textPath: result.textPath,
             infoPath: result.infoPath,
           };
+
           loaded = result.loaded;
         }
 
+        const signedUrl =
+          (await buildSignedAssetUrl(virtualRuntime, asset)) ??
+          `${getPublicBaseUrl()}/api/assets/${encodeURIComponent(asset.id)}`;
+
         return {
           ok: true,
-          ref: `asset://${asset.id}`,
+          ref: signedUrl,
           ...buildPreparedAssetPayload(asset, {
             loaded,
             materialized,
             includeInlineData,
-            signedUrl: await buildSignedAssetUrl(asset),
+            signedUrl,
           }),
         };
       } catch (error: any) {
@@ -3238,7 +3735,7 @@ export async function agentTurn(args: {
 
   const materializeSessionAsset = tool({
     description:
-      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/. Does not include base64 unless explicitly requested.",
+      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/ and return its signed APP_BASE_URL URL.",
     inputSchema: zodSchema(
       z.object({
         assetId: z.string().min(1),
@@ -3262,10 +3759,14 @@ export async function agentTurn(args: {
           includeBase64: input.includeBase64 ?? false,
         });
 
+        const signedUrl =
+          (await buildSignedAssetUrl(virtualRuntime, asset)) ??
+          `${getPublicBaseUrl()}/api/assets/${encodeURIComponent(asset.id)}`;
+
         return {
           ok: true,
           asset: describeSessionAsset(asset),
-          ref: `asset://${asset.id}`,
+          ref: signedUrl,
           assetRoot: result.assetRoot,
           metaPath: result.metaPath,
           base64Path: result.base64Path,
@@ -3288,6 +3789,192 @@ export async function agentTurn(args: {
     },
   });
 
+  const composioGetMcpServer = tool({
+    description:
+      "Get the Composio MCP server URL and headers for this user session. Use when an MCP-compatible client needs connection details.",
+    inputSchema: zodSchema(z.object({})),
+    execute: async () => {
+      try {
+        const session = await createComposioSessionForUser(args.userId, args.composio?.session, args.composio);
+        const mcp: any = (session as any)?.mcp ?? null;
+        return {
+          ok: Boolean(mcp?.url),
+          userId: args.userId,
+          url: mcp?.url ?? null,
+          headers: mcp?.headers ?? null,
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          error: String(error?.message ?? error ?? "Unknown composio_get_mcp_server error"),
+        };
+      }
+    },
+  });
+
+  const composioProjectApiRequest = tool({
+    description:
+      "Call any project-scoped Composio REST API v3 endpoint dynamically. Use for platform/admin operations not exposed by the session meta tools, such as webhook subscriptions, trigger lifecycle, connected accounts, auth configs, toolkits, tools, files, MCP, tool_router session endpoints, and project config.",
+    inputSchema: zodSchema(
+      z.object({
+        method: z.string().min(1).max(10).optional(),
+        path: z.string().min(1).max(2000),
+        query: z.record(z.string(), z.any()).optional(),
+        body: z.any().optional(),
+        rawBody: z.string().optional(),
+        rawBodyBase64: z.string().optional(),
+        contentType: z.string().optional(),
+        headers: z.record(z.string(), z.string()).optional(),
+      })
+    ),
+    execute: async (input: {
+      method?: string;
+      path: string;
+      query?: Record<string, unknown>;
+      body?: unknown;
+      rawBody?: string;
+      rawBodyBase64?: string;
+      contentType?: string;
+      headers?: Record<string, string>;
+    }) => {
+      try {
+        return await composioApiRequest({
+          ...input,
+          authMode: "project",
+          config: args.composio,
+        });
+      } catch (error: any) {
+        return {
+          ok: false,
+          status: null,
+          statusText: null,
+          error: String(error?.message ?? error ?? "Unknown composio_api_request error"),
+          data: null,
+        };
+      }
+    },
+  });
+
+  const composioOrgApiRequest = tool({
+    description:
+      "Call any org-scoped Composio REST API v3 endpoint dynamically. Use only for organization-level operations such as listing or creating projects. Requires COMPOSIO_ORG_API_KEY or an orgApiKey override.",
+    inputSchema: zodSchema(
+      z.object({
+        method: z.string().min(1).max(10).optional(),
+        path: z.string().min(1).max(2000),
+        query: z.record(z.string(), z.any()).optional(),
+        body: z.any().optional(),
+        rawBody: z.string().optional(),
+        rawBodyBase64: z.string().optional(),
+        contentType: z.string().optional(),
+        headers: z.record(z.string(), z.string()).optional(),
+      })
+    ),
+    execute: async (input: {
+      method?: string;
+      path: string;
+      query?: Record<string, unknown>;
+      body?: unknown;
+      rawBody?: string;
+      rawBodyBase64?: string;
+      contentType?: string;
+      headers?: Record<string, string>;
+    }) => {
+      try {
+        return await composioApiRequest({
+          ...input,
+          authMode: "org",
+          config: args.composio,
+        });
+      } catch (error: any) {
+        return {
+          ok: false,
+          status: null,
+          statusText: null,
+          error: String(error?.message ?? error ?? "Unknown composio_org_api_request error"),
+          data: null,
+        };
+      }
+    },
+  });
+
+  const composioVerifyWebhookSignature = tool({
+    description:
+      "Verify a Composio webhook signature using the webhook id, timestamp, raw payload string, and signature header. Use when debugging or implementing webhook handlers.",
+    inputSchema: zodSchema(
+      z.object({
+        id: z.string().min(1),
+        timestamp: z.string().min(1),
+        signature: z.string().min(1),
+        payload: z.string().min(1),
+        secret: z.string().optional(),
+        toleranceSeconds: z.number().int().min(0).max(86_400).optional(),
+      })
+    ),
+    execute: async (input: {
+      id: string;
+      timestamp: string;
+      signature: string;
+      payload: string;
+      secret?: string;
+      toleranceSeconds?: number;
+    }) => {
+      try {
+        const secret = String(input.secret ?? env("COMPOSIO_WEBHOOK_SECRET") ?? "").trim();
+        if (!secret) {
+          return {
+            ok: false,
+            error: "COMPOSIO_WEBHOOK_SECRET not set and no secret provided",
+          };
+        }
+
+        const toleranceSeconds = input.toleranceSeconds ?? 300;
+        const parsedTimestamp = parseWebhookTimestampSeconds(input.timestamp);
+        if (parsedTimestamp == null) {
+          return {
+            ok: false,
+            error: "Invalid webhook timestamp",
+          };
+        }
+
+        if (toleranceSeconds > 0) {
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          if (Math.abs(nowSeconds - parsedTimestamp) > toleranceSeconds) {
+            return {
+              ok: false,
+              error: `Webhook timestamp outside tolerance (${toleranceSeconds}s)`,
+              parsedTimestamp,
+            };
+          }
+        }
+
+        const signingString = `${input.id}.${input.timestamp}.${input.payload}`;
+        const expected = await hmacSha256Base64(secret, signingString);
+        const received = extractWebhookSignatureValue(input.signature);
+        const verified = constantTimeEquals(expected, received);
+        const parsedPayload = tryParseJson(input.payload);
+
+        return {
+          ok: verified,
+          verified,
+          expectedSignatureBase64: expected,
+          receivedSignatureBase64: received,
+          version: detectComposioWebhookVersion(parsedPayload),
+          parsedTimestamp,
+          eventType: (parsedPayload as any)?.type ?? null,
+          triggerSlug: (parsedPayload as any)?.metadata?.trigger_slug ?? (parsedPayload as any)?.trigger_slug ?? null,
+          payload: parsedPayload,
+          error: verified ? null : "Invalid webhook signature",
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          error: String(error?.message ?? error ?? "Unknown composio_verify_webhook_signature error"),
+        };
+      }
+    },
+  });
+
   // ============================================================
   // Fast-path /ssh
   // ============================================================
@@ -3302,20 +3989,29 @@ export async function agentTurn(args: {
   // Load Composio session meta tools and wrap them with deterministic asset resolution
   // ============================================================
   let composioTools: ToolSet = {};
-  if (env("COMPOSIO_API_KEY")) {
-    const rawTools = await getComposioToolsForUser(args.userId).catch(() => ({} as ToolSet));
+  if (getComposioProjectApiKey(args.composio)) {
+    const rawTools = await getComposioToolsForUser(args.userId, args.composio?.session, args.composio).catch(
+      () => ({} as ToolSet)
+    );
     composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
       sessionAssets,
+      composioConfig: args.composio,
+      virtualRuntime,
     });
   }
 
   const nativeTools: ToolSet = {
     schedule_message: scheduleMessage,
     ssh_exec: sshTool,
+    composio_get_mcp_server: composioGetMcpServer,
+    composio_api_request: composioProjectApiRequest,
+    composio_org_api_request: composioOrgApiRequest,
+    composio_verify_webhook_signature: composioVerifyWebhookSignature,
     list_skills: listSkills,
     read_skill: readSkill,
     read_virtual_file: readVirtualFile,
     write_virtual_file: writeVirtualFile,
+    get_virtual_file_url: getVirtualFileUrl,
     virtual_shell: virtualShell,
     list_session_assets: listSessionAssets,
     prepare_session_asset: prepareSessionAsset,
@@ -3500,7 +4196,7 @@ export async function agentTurn(args: {
   // System prompt
   // ============================================================
   const system = [
-    "You are an Agentic Operating System assistant running in Telegram/WhatsApp/SMS with Composio tools.",
+    "You are an Agentic Operating System similar to OpenClaw running in Telegram/WhatsApp/SMS with over +1000 Composio based API toolkits (slack, discord, linkedin, google drive, google docs, github, etc).",
     "",
     "CRITICAL TOOL RULES:",
     "- If the user asks for an external action, use the appropriate tool.",
@@ -3510,21 +4206,30 @@ export async function agentTurn(args: {
     "",
     "COMPOSIO SESSION:",
     `- Active namespace: ${args.userId}`,
-    "- session.tools() returns Composio meta tools for discovery, auth, and execution.",
-    "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app tool slug.",
+    "Namespaces are used to identify active connections in an authconfig instance scoped to that users credentials for that specific toolkit/api integration",
+    "- session.tools() returns Composio meta tools for discovery, auth, execution, browser automation toolkit discovery, and the persistent workbench sandbox.",
+    "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app/tool slug or need browser automation or other dynamic toolkit discovery.",
+    "- Use COMPOSIO_GET_TOOL_SCHEMAS to inspect exact tool inputs before execution.",
     "- Use COMPOSIO_MANAGE_CONNECTIONS when auth may be missing or the user asks to connect an app.",
     "- Use COMPOSIO_MULTI_EXECUTE_TOOL or COMPOSIO_EXECUTE_TOOL to run Composio actions after discovery.",
+    "- Use COMPOSIO_REMOTE_WORKBENCH or COMPOSIO_REMOTE_BASH_TOOL for the Composio code sandbox/workbench.",
+    "- Use composio_api_request for project-scoped Composio platform APIs that are outside session meta tools, including /webhook_subscriptions, /trigger_instances, /triggers_types, /connected_accounts, /auth_configs, /toolkits, /tools, /files, /mcp, /tool_router, and /org/project/config.",
+    "- Use composio_org_api_request only for org-level project administration endpoints such as /org/owner/project/list or /org/owner/project/new when an org key is configured.",
+    "- Use composio_get_mcp_server to retrieve MCP connection info for this user session.",
+    "- Use composio_verify_webhook_signature when working with inbound webhook payloads and headers.",
     "",
     "FILESYSTEM:",
     "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
+    "- Use get_virtual_file_url when an external tool needs a signed APP_BASE_URL URL for a VFS file.",
     "- Use virtual_shell for shell-like operations on the virtual filesystem only.",
     "- Prefer /workspace for drafts, payloads, notes, JSON, and staging.",
     "",
     "MODALITIES:",
     `- Session asset count available via tools: ${sessionAssets.length}`,
     "- Use list_session_assets to inspect assets.",
-    "- Use prepare_session_asset first for metadata and upload hints.",
+    "- Use prepare_session_asset first for metadata, signed APP_BASE_URL URLs, and upload hints.",
     "- When calling external tools, pass asset references like asset://asset_m6_p2.",
+    "- The asset wrapper can resolve those refs to signed APP_BASE_URL VFS URLs for URL-style tools or s3keys for upload-style tools.",
     "- The execution wrapper resolves asset references deterministically before the external tool runs, staging asset bytes into Composio storage when a tool expects an s3key-backed upload.",
     "- Only request inline content when the target tool really needs it.",
     "",
@@ -3533,7 +4238,7 @@ export async function agentTurn(args: {
     "- If blocked, tell the user to use /ssh <command>.",
     "",
     "SKILLS:",
-    "- Use list_skills or read_skill only when needed.",
+    "- Use list_skills (retreives skill fils from vfs shell) or read_skill only when needed.",
     "",
     `Mode: ${autonomy}`,
     "Be concise, accurate, and tool-grounded.",
