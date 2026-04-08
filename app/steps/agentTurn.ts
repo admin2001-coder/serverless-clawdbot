@@ -3087,6 +3087,24 @@ async function createComposioSessionForUser(
   return await composio.create(userId, buildComposioSessionOptions(overrides) as any);
 }
 
+function coerceComposioToolsToToolSet(sessionTools: unknown): ToolSet {
+  if (!sessionTools) return {};
+
+  if (Array.isArray(sessionTools)) {
+    throw new Error(
+      "Composio session.tools() returned an array instead of a Vercel AI SDK ToolSet. Ensure the SDK is initialized with new VercelProvider()."
+    );
+  }
+
+  if (typeof sessionTools !== "object") {
+    throw new Error(
+      `Composio session.tools() returned ${typeof sessionTools} instead of a Vercel AI SDK ToolSet.`
+    );
+  }
+
+  return sessionTools as unknown as ToolSet;
+}
+
 async function getComposioToolsForUser(
   userId: string,
   overrides?: ComposioSessionOverrides,
@@ -3095,7 +3113,8 @@ async function getComposioToolsForUser(
   if (!getComposioProjectApiKey(composioConfig)) return {};
 
   const session = await createComposioSessionForUser(userId, overrides, composioConfig);
-  return (await session.tools()) as ToolSet;
+  const sessionTools = await session.tools();
+  return coerceComposioToolsToToolSet(sessionTools);
 }
 
 // ============================================================
