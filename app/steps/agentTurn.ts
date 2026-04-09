@@ -13,7 +13,6 @@ import { openai } from "@ai-sdk/openai";
 import { Composio } from "@composio/core";
 import { VercelProvider } from "@composio/vercel";
 import { z } from "zod/v4";
-import { assign, createActor, fromPromise, setup, toPromise } from "xstate";
 
 import { env } from "@/app/lib/env";
 import type { Channel } from "@/app/lib/identity";
@@ -419,13 +418,6 @@ function dirname(p: string): string {
   return s.slice(0, idx);
 }
 
-function basename(p: string): string {
-  const s = sanitizePath(p);
-  if (s === "/") return "";
-  const idx = s.lastIndexOf("/");
-  return idx >= 0 ? s.slice(idx + 1) : s;
-}
-
 function parentDirs(p: string): string[] {
   const s = sanitizePath(p);
   const parts = s.split("/").filter(Boolean);
@@ -774,18 +766,11 @@ function mediaPartToTextPlaceholder(part: any): { type: "text"; text: string } {
   };
 }
 
-
 type SanitizeHistoryOptions = {
   maxMessages?: number;
   maxTextChars?: number;
   maxTotalChars?: number;
   maxAssistantMessages?: number;
-};
-
-type SanitizedModelMessageEntry = {
-  originalIndex: number;
-  role: string;
-  message: ModelMessage;
 };
 
 function approximateModelMessageChars(message: ModelMessage): number {
@@ -805,10 +790,7 @@ function approximateModelMessageChars(message: ModelMessage): number {
   return 0;
 }
 
-function sanitizeHistoryEntriesForModel(
-  history: ModelMessage[],
-  opts?: SanitizeHistoryOptions
-): SanitizedModelMessageEntry[] {
+function sanitizeMessagesForModel(history: ModelMessage[], opts?: SanitizeHistoryOptions): ModelMessage[] {
   const maxMessages = Math.max(2, opts?.maxMessages ?? parseIntOr(env("AGENT_MAX_HISTORY_MESSAGES"), 8));
   const maxTextChars = Math.max(500, opts?.maxTextChars ?? parseIntOr(env("AGENT_MAX_TEXT_PART_CHARS"), 4000));
   const maxTotalChars = Math.max(
@@ -820,14 +802,12 @@ function sanitizeHistoryEntriesForModel(
     opts?.maxAssistantMessages ?? parseIntOr(env("AGENT_MAX_ASSISTANT_HISTORY_MESSAGES"), 3)
   );
 
-  const startIndex = Math.max(0, history.length - maxMessages);
-  const trimmed = history.slice(startIndex);
-  const selected: SanitizedModelMessageEntry[] = [];
+  const trimmed = history.slice(-maxMessages);
+  const selected: ModelMessage[] = [];
   let totalChars = 0;
   let assistantCount = 0;
 
   for (let i = trimmed.length - 1; i >= 0; i--) {
-    const originalIndex = startIndex + i;
     const msg = trimmed[i];
     const role = String((msg as any).role ?? "");
 
@@ -889,63 +869,12 @@ function sanitizeHistoryEntriesForModel(
 
     if (role === "assistant") assistantCount += 1;
     totalChars += candidateChars;
-    selected.push({
-      originalIndex,
-      role,
-      message: candidate,
-    });
+    selected.push(candidate);
   }
 
   return selected.reverse();
 }
 
-function sanitizeMessagesForModel(history: ModelMessage[], opts?: SanitizeHistoryOptions): ModelMessage[] {
-  return sanitizeHistoryEntriesForModel(history, opts).map((entry) => entry.message);
-}
-
-function appendUserContextTextToMessage(message: ModelMessage, text: string): ModelMessage {
-  const normalizedText = clampNonEmptyText(text);
-  const content: any = (message as any).content;
-
-  if (typeof content === "string") {
-    return {
-      ...message,
-      content: [
-        {
-          type: "text",
-          text: clampNonEmptyText(content),
-        },
-        {
-          type: "text",
-          text: normalizedText,
-        },
-      ],
-    } as any;
-  }
-
-  if (Array.isArray(content)) {
-    return {
-      ...message,
-      content: [
-        ...content,
-        {
-          type: "text",
-          text: normalizedText,
-        },
-      ],
-    } as any;
-  }
-
-  return {
-    ...message,
-    content: [
-      {
-        type: "text",
-        text: normalizedText,
-      },
-    ],
-  } as any;
-}
 function splitForTelegram(text: string, maxChars: number): string[] {
   const t = String(text ?? "");
   const max = Math.max(500, Math.min(4096, Math.floor(maxChars)));
@@ -1124,7 +1053,6 @@ const INLINE_SKILLS: Record<string, InlineSkill> = {
     whenToUse: "Use when the user message includes images, audio, video, or files that need staging or upload.",
     guidance: [
       "Use list_session_assets to inspect available assets.",
-      "Use inspect_session_asset when the user wants to know what an uploaded image, file, PDF, code file, or log contains.",
       "Use prepare_session_asset first for metadata and upload hints.",
       "Use asset references like asset://asset_m6_p2 when calling external tools.",
       "The tool execution wrapper resolves asset references deterministically before the external tool runs.",
@@ -1760,19 +1688,17 @@ async function loadSessionAssetContent(
 async function materializeSessionAssetToVfs(
   rt: VirtualRuntime,
   asset: SessionAsset,
-  opts?: { fetchRemote?: boolean; includeBase64?: boolean; ttlSeconds?: number }
+  opts?: { fetchRemote?: boolean; includeBase64?: boolean }
 ) {
   const includeBase64 = opts?.includeBase64 ?? false;
   const loaded = await loadSessionAssetContent(asset, { fetchRemote: opts?.fetchRemote ?? true });
   const assetRoot = sanitizePath(`/workspace/assets/${asset.id}`);
   const metaPath = sanitizePath(`${assetRoot}/meta.json`);
-  const binaryPath = sanitizePath(`${assetRoot}/content.base64`);
   const rawBase64Path = sanitizePath(`${assetRoot}/${asset.filename}.base64.txt`);
   const textPath = sanitizePath(`${assetRoot}/${asset.filename}.txt`);
   const infoPath = sanitizePath(`${assetRoot}/composio_payload.json`);
 
   await vfsEnsureDir(rt, assetRoot);
-  await vfsWriteFile(rt, binaryPath, loaded.base64);
 
   await vfsWriteFile(
     rt,
@@ -1782,7 +1708,6 @@ async function materializeSessionAssetToVfs(
       loadedMimeType: loaded.mimeType,
       loadedSizeBytes: loaded.sizeBytes,
       loadedSource: loaded.source,
-      binaryPath,
       createdAt: nowIso(),
     })
   );
@@ -1795,28 +1720,18 @@ async function materializeSessionAssetToVfs(
     await vfsWriteFile(rt, textPath, loaded.textPreview);
   }
 
-  const publicUrl = await buildSignedVfsUrlForRuntime(rt, binaryPath, {
-    filename: loaded.filename,
-    mimeType: loaded.mimeType,
-    encoding: "base64",
-    ttlSeconds: opts?.ttlSeconds ?? 900,
-  });
-
   await vfsWriteFile(
     rt,
     infoPath,
     toSafeJson({
       filename: loaded.filename,
       mimeType: loaded.mimeType,
-      url: publicUrl ?? asset.url ?? null,
-      sourceUrl: asset.url ?? null,
-      binaryPath,
+      url: asset.url ?? null,
       dataUrl: includeBase64 ? loaded.dataUrl ?? null : null,
       base64Path: includeBase64 ? rawBase64Path : null,
       textPath: loaded.textPreview != null ? textPath : null,
       notes: [
         "Prefer url when a target Composio tool accepts URL-based file ingestion.",
-        "These signed URLs are served from the Redis-backed VFS via APP_BASE_URL.",
         "Otherwise request inline content only when the target tool truly requires it.",
         "Not all Composio tools share the same schema; adapt to the declared tool input schema.",
       ],
@@ -1828,8 +1743,6 @@ async function materializeSessionAssetToVfs(
     assetId: asset.id,
     assetRoot,
     metaPath,
-    binaryPath,
-    publicUrl,
     base64Path: includeBase64 ? rawBase64Path : null,
     textPath: loaded.textPreview != null ? textPath : null,
     infoPath,
@@ -1849,118 +1762,16 @@ function getPublicBaseUrl(): string | null {
 }
 
 function getAssetSigningSecret(): string | null {
-  const v =
-    env("VFS_URL_SIGNING_SECRET") ||
-    env("ASSET_URL_SIGNING_SECRET") ||
-    env("SESSION_ASSET_SIGNING_SECRET") ||
-    "";
+  const v = env("ASSET_URL_SIGNING_SECRET") || env("SESSION_ASSET_SIGNING_SECRET") || "";
   return v.trim() || null;
 }
 
-type VfsUrlEncoding = "utf8" | "base64";
-
-type BuildSignedVfsUrlOptions = {
-  filename?: string;
-  mimeType?: string;
-  encoding?: VfsUrlEncoding;
-  ttlSeconds?: number;
-  download?: boolean;
-};
-
-function buildSignedVfsPayload(args: {
-  userId: string;
-  sessionId: string;
-  path: string;
-  expiresAt: number;
-  filename: string;
-  mimeType: string;
-  encoding: VfsUrlEncoding;
-  download: boolean;
-}): string {
-  return [
-    "v1",
-    `userId=${args.userId}`,
-    `sessionId=${args.sessionId}`,
-    `path=${sanitizePath(args.path)}`,
-    `expires=${args.expiresAt}`,
-    `filename=${args.filename}`,
-    `mimeType=${args.mimeType}`,
-    `encoding=${args.encoding}`,
-    `download=${args.download ? "1" : "0"}`,
-  ].join("\n");
-}
-
-async function buildSignedVfsUrl(args: {
-  userId: string;
-  sessionId: string;
-  path: string;
-} & BuildSignedVfsUrlOptions): Promise<string | null> {
+async function buildSignedAssetUrl(asset: SessionAsset, ttlSeconds = 900): Promise<string | null> {
   const baseUrl = getPublicBaseUrl();
   const secret = getAssetSigningSecret();
   const subtle = globalThis.crypto?.subtle;
 
   if (!baseUrl || !secret || !subtle) return null;
-
-  const path = sanitizePath(args.path);
-  const filename = safeFilenameSegment(args.filename || basename(path) || "file");
-  const mimeType = String(args.mimeType || inferMimeFromFilename(filename) || "application/octet-stream")
-    .trim()
-    .toLowerCase();
-  const encoding: VfsUrlEncoding = args.encoding === "base64" ? "base64" : "utf8";
-  const download = args.download === true;
-  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, args.ttlSeconds ?? 900);
-  const sig = await hmacSha256Hex(
-    secret,
-    buildSignedVfsPayload({
-      userId: args.userId,
-      sessionId: args.sessionId,
-      path,
-      expiresAt,
-      filename,
-      mimeType,
-      encoding,
-      download,
-    })
-  );
-
-  const encodedPath = path.split("/").filter(Boolean).map((part) => encodeURIComponent(part)).join("/");
-  const url = new URL(`${baseUrl}/api/vfs/${encodedPath}`);
-  url.searchParams.set("userId", args.userId);
-  url.searchParams.set("sessionId", args.sessionId);
-  url.searchParams.set("expires", String(expiresAt));
-  url.searchParams.set("filename", filename);
-  url.searchParams.set("mimeType", mimeType);
-  url.searchParams.set("encoding", encoding);
-  if (download) url.searchParams.set("download", "1");
-  url.searchParams.set("sig", sig);
-  return url.toString();
-}
-
-async function buildSignedVfsUrlForRuntime(
-  rt: VirtualRuntime,
-  path: string,
-  opts?: BuildSignedVfsUrlOptions
-): Promise<string | null> {
-  return await buildSignedVfsUrl({
-    userId: rt.userId,
-    sessionId: rt.sessionId,
-    path,
-    ...opts,
-  });
-}
-
-async function buildSignedAssetUrl(
-  _rt: VirtualRuntime | undefined,
-  asset: SessionAsset,
-  ttlSeconds = 900
-): Promise<string | null> {
-  const baseUrl = getPublicBaseUrl();
-  const secret = getAssetSigningSecret();
-  const subtle = globalThis.crypto?.subtle;
-
-  if (!baseUrl || !secret || !subtle) {
-    return asset.url ?? null;
-  }
 
   const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, ttlSeconds);
   const payload = `${asset.id}.${expiresAt}.${asset.filename}.${asset.mimeType}`;
@@ -1981,11 +1792,9 @@ function buildPreparedAssetPayload(
     materialized?: {
       assetRoot: string;
       metaPath: string;
-      binaryPath?: string | null;
       base64Path: string | null;
       textPath: string | null;
       infoPath: string;
-      publicUrl?: string | null;
     } | null;
     includeInlineData?: boolean;
     signedUrl?: string | null;
@@ -1994,7 +1803,7 @@ function buildPreparedAssetPayload(
   const loaded = opts?.loaded ?? null;
   const materialized = opts?.materialized ?? null;
   const includeInlineData = opts?.includeInlineData ?? false;
-  const signedUrl = opts?.signedUrl ?? materialized?.publicUrl ?? null;
+  const signedUrl = opts?.signedUrl ?? null;
 
   const mimeType = loaded?.mimeType ?? asset.mimeType;
   const filename = loaded?.filename ?? asset.filename;
@@ -2033,8 +1842,7 @@ function buildPreparedAssetPayload(
       },
       guidance: [
         "Inspect the target Composio tool schema first.",
-        "For URL-style parameters, pass asset://<assetId> and let the execution wrapper resolve it to a signed APP_BASE_URL VFS URL.",
-        "For upload-style Composio tools, the wrapper stages bytes and supplies the resulting s3key automatically.",
+        "For URL-style parameters, pass asset://<assetId> and let the execution wrapper resolve it. For upload-style Composio tools, the wrapper stages bytes and supplies the resulting s3key automatically.",
         "For inline file parameters, use asset://<assetId> or an object with assetId and the wrapper will materialize data deterministically.",
       ],
     },
@@ -2042,427 +1850,12 @@ function buildPreparedAssetPayload(
       ? {
           assetRoot: materialized.assetRoot,
           metaPath: materialized.metaPath,
-          binaryPath: materialized.binaryPath ?? null,
           base64Path: materialized.base64Path,
           textPath: materialized.textPath,
           infoPath: materialized.infoPath,
-          url: materialized.publicUrl ?? null,
         }
       : null,
   };
-}
-
-
-type AutoAssetContextMode = "text-inline" | "vision-summary" | "audio-summary" | "file-summary" | "metadata" | "error";
-
-type AutoAssetContextRecord = {
-  version: 1;
-  assetId: string;
-  filename: string;
-  mimeType: string;
-  mode: AutoAssetContextMode;
-  contextText: string;
-  createdAt: string;
-};
-
-function autoAssetContextCachePath(assetId: string): string {
-  return sanitizePath(`/workspace/assets/${assetId}/auto_context.json`);
-}
-
-async function readAutoAssetContextCache(
-  rt: VirtualRuntime,
-  asset: SessionAsset
-): Promise<AutoAssetContextRecord | null> {
-  try {
-    const node = await vfsGetNode(rt, autoAssetContextCachePath(asset.id));
-    if (!node || node.type !== "file") return null;
-
-    const parsed = JSON.parse(node.content ?? "") as Partial<AutoAssetContextRecord> | null;
-    if (!parsed || parsed.version !== 1) return null;
-    if (String(parsed.assetId ?? "") !== asset.id) return null;
-
-    return {
-      version: 1,
-      assetId: asset.id,
-      filename: String(parsed.filename ?? asset.filename),
-      mimeType: String(parsed.mimeType ?? asset.mimeType),
-      mode: (parsed.mode as AutoAssetContextMode) ?? "metadata",
-      contextText: String(parsed.contextText ?? ""),
-      createdAt: String(parsed.createdAt ?? nowIso()),
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function writeAutoAssetContextCache(
-  rt: VirtualRuntime,
-  record: AutoAssetContextRecord
-): Promise<void> {
-  const path = autoAssetContextCachePath(record.assetId);
-  await vfsEnsureDir(rt, dirname(path));
-  await vfsWriteFile(rt, path, toSafeJson(record));
-}
-
-function isTextLikeAssetFilename(filename: string): boolean {
-  const ext = String(filename ?? "").split(".").pop()?.toLowerCase() ?? "";
-  return [
-    "txt",
-    "md",
-    "markdown",
-    "json",
-    "jsonl",
-    "csv",
-    "tsv",
-    "ts",
-    "tsx",
-    "js",
-    "jsx",
-    "mjs",
-    "cjs",
-    "py",
-    "rb",
-    "go",
-    "java",
-    "kt",
-    "swift",
-    "php",
-    "rs",
-    "cpp",
-    "cc",
-    "cxx",
-    "c",
-    "h",
-    "hpp",
-    "cs",
-    "html",
-    "css",
-    "scss",
-    "less",
-    "xml",
-    "yaml",
-    "yml",
-    "ini",
-    "conf",
-    "toml",
-    "env",
-    "log",
-    "sql",
-    "sh",
-    "bash",
-    "zsh",
-    "ps1",
-    "dockerfile",
-  ].includes(ext);
-}
-
-function isProbablyReadableText(textValue: string | null | undefined): boolean {
-  const value = String(textValue ?? "");
-  if (!value.trim()) return false;
-
-  const sample = value.slice(0, 4000);
-  if (!sample) return false;
-
-  let readable = 0;
-  for (const char of sample) {
-    const code = char.charCodeAt(0);
-    const isCommonWhitespace = char === "\n" || char === "\r" || char === "\t";
-    const isPrintable = code >= 32 && code !== 65533;
-    if (isCommonWhitespace || isPrintable) readable += 1;
-  }
-
-  return readable / sample.length >= 0.85;
-}
-
-function inferInspectableTextAsset(asset: SessionAsset, loaded: LoadedSessionAsset): boolean {
-  return (
-    isTextualMimeType(loaded.mimeType) ||
-    isTextLikeAssetFilename(loaded.filename || asset.filename) ||
-    isProbablyReadableText(loaded.textPreview) ||
-    isProbablyReadableText(tryUtf8FromBase64(loaded.base64))
-  );
-}
-
-async function runAssetContextTextGeneration(args: {
-  modelName: string;
-  prompt?: string;
-  messages?: Array<{ role: string; content: any }>;
-  useChatModel?: boolean;
-}): Promise<string> {
-  const request: any = {
-    model: args.useChatModel ? openai.chat(args.modelName) : openai(args.modelName),
-  };
-
-  if (args.messages) {
-    request.messages = args.messages;
-  } else {
-    request.prompt = args.prompt;
-  }
-
-  if (shouldSendTemperature(args.modelName, 0.2)) {
-    request.temperature = 0.2;
-  }
-
-  const result = await generateText(request);
-  return String(result.text ?? "").trim();
-}
-
-async function buildAutomaticAssetContext(args: {
-  asset: SessionAsset;
-  virtualRuntime: VirtualRuntime;
-  inspectionModelName: string;
-  audioModelName: string;
-  fetchRemote?: boolean;
-  maxTextChars: number;
-  maxContextChars: number;
-}): Promise<AutoAssetContextRecord> {
-  const cached = await readAutoAssetContextCache(args.virtualRuntime, args.asset);
-  if (cached) return cached;
-
-  const fetchRemote = args.fetchRemote ?? true;
-  const signedUrl = await buildSignedAssetUrl(args.virtualRuntime, args.asset);
-
-  let mode: AutoAssetContextMode = "metadata";
-  let contextText = "";
-
-  try {
-    const loaded = await loadSessionAssetContent(args.asset, { fetchRemote });
-
-    if (inferInspectableTextAsset(args.asset, loaded)) {
-      const decodedText = loaded.textPreview ?? tryUtf8FromBase64(loaded.base64) ?? "";
-      const excerpt = truncateForModelContext(decodedText, args.maxTextChars);
-      mode = "text-inline";
-      contextText = [
-        `Asset reference: asset://${args.asset.id}`,
-        `Filename: ${loaded.filename}`,
-        `MIME type: ${loaded.mimeType}`,
-        "Extracted content:",
-        excerpt,
-      ].join("\n");
-    } else if (loaded.mimeType.startsWith("image/")) {
-      const imageInput = signedUrl ?? base64ToBytes(loaded.base64);
-      const analysis = await runAssetContextTextGeneration({
-        modelName: args.inspectionModelName,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text:
-                  "Describe this uploaded image accurately. Include visible text, UI elements, charts, objects, people, diagrams, and the most important details. Do not speculate beyond the image.",
-              },
-              {
-                type: "image",
-                image: imageInput,
-              },
-            ],
-          },
-        ],
-      });
-
-      mode = "vision-summary";
-      contextText = [
-        `Asset reference: asset://${args.asset.id}`,
-        `Filename: ${loaded.filename}`,
-        `MIME type: ${loaded.mimeType}`,
-        "Image understanding:",
-        analysis,
-      ].join("\n");
-    } else if (loaded.mimeType.startsWith("audio/")) {
-      const audioInput = signedUrl ?? base64ToBytes(loaded.base64);
-      const analysis = await runAssetContextTextGeneration({
-        modelName: args.audioModelName,
-        useChatModel: true,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text:
-                  "Transcribe this uploaded audio accurately. Then provide a concise summary of the important content. If multiple speakers are obvious, mention them.",
-              },
-              {
-                type: "file",
-                data: audioInput,
-                mediaType: loaded.mimeType,
-                filename: loaded.filename,
-              },
-            ],
-          },
-        ],
-      });
-
-      mode = "audio-summary";
-      contextText = [
-        `Asset reference: asset://${args.asset.id}`,
-        `Filename: ${loaded.filename}`,
-        `MIME type: ${loaded.mimeType}`,
-        "Audio transcription and summary:",
-        analysis,
-      ].join("\n");
-    } else {
-      const fileInput = signedUrl ?? base64ToBytes(loaded.base64);
-
-      try {
-        const analysis = await runAssetContextTextGeneration({
-          modelName: args.inspectionModelName,
-          messages: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "text",
-                  text:
-                    "Inspect this uploaded file and summarize what it contains. If it is a PDF, document, spreadsheet, slide deck, or code file, capture the key structure and important facts. If the format is unsupported, say so instead of guessing.",
-                },
-                {
-                  type: "file",
-                  data: fileInput,
-                  mediaType: loaded.mimeType,
-                  filename: loaded.filename,
-                },
-              ],
-            },
-          ],
-        });
-
-        mode = "file-summary";
-        contextText = [
-          `Asset reference: asset://${args.asset.id}`,
-          `Filename: ${loaded.filename}`,
-          `MIME type: ${loaded.mimeType}`,
-          "File understanding:",
-          analysis,
-        ].join("\n");
-      } catch {
-        mode = "metadata";
-        contextText = [
-          `Asset reference: asset://${args.asset.id}`,
-          `Filename: ${loaded.filename}`,
-          `MIME type: ${loaded.mimeType}`,
-          loaded.sizeBytes != null ? `Size bytes: ${loaded.sizeBytes}` : undefined,
-          "Automatic deep inspection was not available for this file type. It is still available to tools through the session asset helpers.",
-        ]
-          .filter(Boolean)
-          .join("\n");
-      }
-    }
-  } catch (error: any) {
-    mode = "error";
-    contextText = [
-      `Asset reference: asset://${args.asset.id}`,
-      `Filename: ${args.asset.filename}`,
-      `MIME type: ${args.asset.mimeType}`,
-      `Automatic extraction error: ${String(error?.message ?? error ?? "Unknown asset extraction error")}`,
-    ].join("\n");
-  }
-
-  const record: AutoAssetContextRecord = {
-    version: 1,
-    assetId: args.asset.id,
-    filename: args.asset.filename,
-    mimeType: args.asset.mimeType,
-    mode,
-    contextText: truncateText(contextText, args.maxContextChars),
-    createdAt: nowIso(),
-  };
-
-  if (record.mode !== "error" && record.mode !== "metadata") {
-    try {
-      await writeAutoAssetContextCache(args.virtualRuntime, record);
-    } catch {
-      // best effort only
-    }
-  }
-
-  return record;
-}
-
-async function augmentSanitizedHistoryEntriesWithAutoAssetContext(args: {
-  entries: SanitizedModelMessageEntry[];
-  sessionAssets: SessionAsset[];
-  virtualRuntime: VirtualRuntime;
-  inspectionModelName: string;
-  audioModelName: string;
-  maxAssets?: number;
-  maxTextCharsPerAsset?: number;
-  maxContextCharsPerAsset?: number;
-  maxTotalContextChars?: number;
-}): Promise<SanitizedModelMessageEntry[]> {
-  const maxAssets = Math.max(1, args.maxAssets ?? parseIntOr(env("AGENT_AUTO_ASSET_MAX_COUNT"), 4));
-  const maxTextCharsPerAsset = Math.max(
-    500,
-    args.maxTextCharsPerAsset ?? parseIntOr(env("AGENT_AUTO_ASSET_TEXT_CHARS_PER_ASSET"), 8000)
-  );
-  const maxContextCharsPerAsset = Math.max(
-    500,
-    args.maxContextCharsPerAsset ?? parseIntOr(env("AGENT_AUTO_ASSET_CONTEXT_CHARS_PER_ASSET"), 5000)
-  );
-  const maxTotalContextChars = Math.max(
-    maxContextCharsPerAsset,
-    args.maxTotalContextChars ?? parseIntOr(env("AGENT_AUTO_ASSET_TOTAL_CONTEXT_CHARS"), 12000)
-  );
-
-  const userEntryIndexes = new Set(
-    args.entries.filter((entry) => entry.role === "user").map((entry) => entry.originalIndex)
-  );
-
-  const candidateAssets = args.sessionAssets
-    .filter((asset) => asset.role === "user" && userEntryIndexes.has(asset.messageIndex))
-    .sort((a, b) => b.messageIndex - a.messageIndex || b.partIndex - a.partIndex)
-    .slice(0, maxAssets);
-
-  if (!candidateAssets.length) return args.entries;
-
-  let remainingContextChars = maxTotalContextChars;
-  const contextByMessageIndex = new Map<number, string[]>();
-
-  for (const asset of candidateAssets) {
-    if (remainingContextChars <= 0) break;
-
-    const record = await buildAutomaticAssetContext({
-      asset,
-      virtualRuntime: args.virtualRuntime,
-      inspectionModelName: args.inspectionModelName,
-      audioModelName: args.audioModelName,
-      fetchRemote: true,
-      maxTextChars: maxTextCharsPerAsset,
-      maxContextChars: maxContextCharsPerAsset,
-    });
-
-    const contextText = clampNonEmptyText(
-      truncateText(record.contextText, Math.min(maxContextCharsPerAsset, remainingContextChars))
-    );
-
-    const perMessage = contextByMessageIndex.get(asset.messageIndex) ?? [];
-    perMessage.push(contextText);
-    contextByMessageIndex.set(asset.messageIndex, perMessage);
-
-    remainingContextChars -= contextText.length;
-  }
-
-  if (!contextByMessageIndex.size) return args.entries;
-
-  return args.entries.map((entry) => {
-    if (entry.role !== "user") return entry;
-
-    const contexts = contextByMessageIndex.get(entry.originalIndex);
-    if (!contexts?.length) return entry;
-
-    const combinedContext = [
-      "[Automatically extracted attachment context]",
-      ...contexts.map((context, index) =>
-        contexts.length > 1 ? `Attachment ${index + 1}\n${context}` : context
-      ),
-    ].join("\n\n");
-
-    return {
-      ...entry,
-      message: appendUserContextTextToMessage(entry.message, combinedContext),
-    };
-  });
 }
 
 // ============================================================
@@ -3109,7 +2502,6 @@ async function resolveAssetForToolExecution(args: {
   toolkitSlug?: string | null;
   fetchRemote?: boolean;
   composioConfig?: AgentTurnComposioConfig;
-  virtualRuntime?: VirtualRuntime;
 }): Promise<{
   filename: string;
   mimeType: string;
@@ -3122,11 +2514,9 @@ async function resolveAssetForToolExecution(args: {
 }> {
   const mode = args.mode;
   const asset = args.asset;
-  const signedUrl = await buildSignedAssetUrl(args.virtualRuntime, asset);
+  const signedUrl = await buildSignedAssetUrl(asset);
   const toolSlug = normalizeComposioToolSlug(args.toolSlug ?? "");
-  const toolkitSlug =
-    String(args.toolkitSlug ?? "").trim().toLowerCase() ||
-    (toolSlug ? inferComposioToolkitSlugFromToolSlug(toolSlug) : "");
+  const toolkitSlug = String(args.toolkitSlug ?? "").trim().toLowerCase() || (toolSlug ? inferComposioToolkitSlugFromToolSlug(toolSlug) : "");
 
   if (mode === "url") {
     if (signedUrl || asset.url) {
@@ -3332,7 +2722,6 @@ async function transformToolInputAssets(
     toolkitSlug?: string;
     fetchRemote?: boolean;
     composioConfig?: AgentTurnComposioConfig;
-    virtualRuntime?: VirtualRuntime;
   }
 ): Promise<unknown> {
   if (typeof value === "string") {
@@ -3353,7 +2742,6 @@ async function transformToolInputAssets(
         toolkitSlug: ctx.toolkitSlug,
         fetchRemote: ctx.fetchRemote ?? true,
         composioConfig: ctx.composioConfig,
-        virtualRuntime: ctx.virtualRuntime,
       });
 
       if (mode === "s3key") return resolved.staged?.s3key ?? value;
@@ -3396,7 +2784,6 @@ async function transformToolInputAssets(
         toolkitSlug: nextCtxBase.toolkitSlug,
         fetchRemote: nextCtxBase.fetchRemote ?? true,
         composioConfig: nextCtxBase.composioConfig,
-        virtualRuntime: nextCtxBase.virtualRuntime,
       });
 
       if (!resolved.staged) return value;
@@ -3467,7 +2854,6 @@ async function transformToolInputAssets(
         toolkitSlug: nextCtxBase.toolkitSlug,
         fetchRemote: nextCtxBase.fetchRemote ?? true,
         composioConfig: nextCtxBase.composioConfig,
-        virtualRuntime: nextCtxBase.virtualRuntime,
       });
 
       const next: Record<string, any> = { ...input };
@@ -3579,7 +2965,6 @@ function wrapComposioToolsWithAssetResolution(
   deps: {
     sessionAssets: SessionAsset[];
     composioConfig?: AgentTurnComposioConfig;
-    virtualRuntime: VirtualRuntime;
   }
 ): ToolSet {
   const wrapped: Record<string, any> = {};
@@ -3604,7 +2989,6 @@ function wrapComposioToolsWithAssetResolution(
           toolkitSlug,
           fetchRemote: true,
           composioConfig: deps.composioConfig,
-          virtualRuntime: deps.virtualRuntime,
         });
         return await toolDef.execute(resolvedInput, ...rest);
       },
@@ -3613,7 +2997,6 @@ function wrapComposioToolsWithAssetResolution(
 
   return wrapped as ToolSet;
 }
-
 
 function isReasoningModel(modelName: string): boolean {
   const name = String(modelName ?? "").trim().toLowerCase();
@@ -3703,24 +3086,6 @@ async function createComposioSessionForUser(
   return await composio.create(userId, buildComposioSessionOptions(overrides) as any);
 }
 
-function coerceComposioToolsToToolSet(sessionTools: unknown): ToolSet {
-  if (!sessionTools) return {};
-
-  if (Array.isArray(sessionTools)) {
-    throw new Error(
-      "Composio session.tools() returned an array instead of a Vercel AI SDK ToolSet. Ensure the SDK is initialized with new VercelProvider()."
-    );
-  }
-
-  if (typeof sessionTools !== "object") {
-    throw new Error(
-      `Composio session.tools() returned ${typeof sessionTools} instead of a Vercel AI SDK ToolSet.`
-    );
-  }
-
-  return sessionTools as unknown as ToolSet;
-}
-
 async function getComposioToolsForUser(
   userId: string,
   overrides?: ComposioSessionOverrides,
@@ -3729,8 +3094,7 @@ async function getComposioToolsForUser(
   if (!getComposioProjectApiKey(composioConfig)) return {};
 
   const session = await createComposioSessionForUser(userId, overrides, composioConfig);
-  const sessionTools = await session.tools();
-  return coerceComposioToolsToToolSet(sessionTools);
+  return (await session.tools()) as ToolSet;
 }
 
 // ============================================================
@@ -3768,7 +3132,7 @@ function createEditCoalescer(opts: {
   }
 
   function nextTypewriterFrame(target: string): string {
-    const charsPerTick = 2;
+    const charsPerTick = 12;
 
     if (!displayedTypewriterText) {
       return target.slice(0, charsPerTick);
@@ -3845,91 +3209,18 @@ function createEditCoalescer(opts: {
 }
 
 // ============================================================
-// XState-powered orchestration
+// MAIN
 // ============================================================
-type AgentTurnArgs = {
+export async function agentTurn(args: {
   sessionId: string;
   userId: string;
   channel: Channel;
   history: ModelMessage[];
   showTyping?: boolean;
   composio?: AgentTurnComposioConfig;
-};
+}) {
+  "use step";
 
-type AgentTurnResult = {
-  text: string;
-  responseMessages: any[];
-  delivered?: boolean;
-};
-
-type AgentTurnBootstrap = {
-  autonomy: string;
-  normalizedHistory: ModelMessage[];
-  sessionAssets: SessionAsset[];
-  userText: string;
-  hasRichMedia: boolean;
-  primaryMessages: ModelMessage[];
-  retryMessages: ModelMessage[];
-  virtualRuntime: VirtualRuntime;
-  fastModel: string;
-  smartModel: string;
-  forceSmart: boolean;
-  modelName: string;
-  temperature: number;
-  maxToolSteps: number;
-  isTelegram: boolean;
-  telegramStreamingEnabled: boolean;
-  editThrottleMs: number;
-  typingIntervalMs: number;
-  maxEditChars: number;
-  slashCommand: { cmd: string; arg: string } | null;
-};
-
-type AgentToolBundle = {
-  nativeTools: ToolSet;
-  composioTools: ToolSet;
-  tools: ToolSet;
-  retryTools: ToolSet;
-};
-
-type AgentTurnStreamingHandle = {
-  typingLoop: { stop: () => void } | null;
-  placeholderMsgId: number | null;
-};
-
-type AgentTurnMachineInput = {
-  args: AgentTurnArgs;
-};
-
-type AgentTurnMachineContext = {
-  args: AgentTurnArgs;
-  bootstrap: AgentTurnBootstrap | null;
-  toolBundle: AgentToolBundle | null;
-  streamingHandle: AgentTurnStreamingHandle | null;
-  lastError: unknown;
-  result: AgentTurnResult | null;
-};
-
-type AgentTurnMachineEvent = {
-  type: string;
-  output?: unknown;
-  error?: unknown;
-  [key: string]: unknown;
-};
-
-type AgentTurnMachineContextArg = {
-  context: AgentTurnMachineContext;
-};
-
-type AgentTurnMachineInputArg = {
-  input: AgentTurnMachineInput;
-};
-
-type AgentTurnMachineEventArg = {
-  event: AgentTurnMachineEvent;
-};
-
-async function buildAgentTurnBootstrap(args: AgentTurnArgs): Promise<AgentTurnBootstrap> {
   const autonomy = env("AUTONOMOUS_MODE") ?? "assistive";
 
   const normalizedHistory = normalizeHistory(args.history);
@@ -3937,8 +3228,8 @@ async function buildAgentTurnBootstrap(args: AgentTurnArgs): Promise<AgentTurnBo
   const userText = String(extractRecentUserText(normalizedHistory) ?? "").trim();
   const hasRichMedia = historyHasRichMedia(normalizedHistory);
 
-  const primaryEntries = sanitizeHistoryEntriesForModel(normalizedHistory);
-  const retryEntries = sanitizeHistoryEntriesForModel(normalizedHistory, {
+  const primaryMessages = sanitizeMessagesForModel(normalizedHistory);
+  const retryMessages = sanitizeMessagesForModel(normalizedHistory, {
     maxMessages: parseIntOr(env("AGENT_RETRY_MAX_HISTORY_MESSAGES"), 4),
     maxTextChars: parseIntOr(env("AGENT_RETRY_MAX_TEXT_PART_CHARS"), 2000),
     maxTotalChars: parseIntOr(env("AGENT_RETRY_MAX_TOTAL_CONTEXT_CHARS"), 12000),
@@ -3950,7 +3241,7 @@ async function buildAgentTurnBootstrap(args: AgentTurnArgs): Promise<AgentTurnBo
     userId: args.userId,
     channel: args.channel,
     userText,
-    history: primaryEntries.map((entry) => entry.message),
+    history: primaryMessages,
     sessionAssets,
   });
 
@@ -3958,38 +3249,6 @@ async function buildAgentTurnBootstrap(args: AgentTurnArgs): Promise<AgentTurnBo
   const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o";
   const forceSmart = (env("AGENT_FORCE_SMART_MODEL") ?? "true") !== "false";
   const modelName = forceSmart ? smartModel : hasRichMedia ? smartModel : fastModel;
-
-  const augmentedPrimaryEntries = await augmentSanitizedHistoryEntriesWithAutoAssetContext({
-    entries: primaryEntries,
-    sessionAssets,
-    virtualRuntime,
-    inspectionModelName: env("ASSET_INSPECTION_MODEL_NAME") ?? smartModel ?? "gpt-5.4",
-    audioModelName: env("AUDIO_INSPECTION_MODEL_NAME") ?? "gpt-4o-audio-preview",
-  });
-
-  const augmentedRetryEntries = await augmentSanitizedHistoryEntriesWithAutoAssetContext({
-    entries: retryEntries,
-    sessionAssets,
-    virtualRuntime,
-    inspectionModelName: env("ASSET_INSPECTION_MODEL_NAME") ?? smartModel ?? "gpt-5.4",
-    audioModelName: env("AUDIO_INSPECTION_MODEL_NAME") ?? "gpt-4o-audio-preview",
-    maxAssets: Math.min(2, parseIntOr(env("AGENT_AUTO_ASSET_MAX_COUNT"), 4)),
-    maxTextCharsPerAsset: Math.min(
-      4000,
-      parseIntOr(env("AGENT_AUTO_ASSET_TEXT_CHARS_PER_ASSET"), 8000)
-    ),
-    maxContextCharsPerAsset: Math.min(
-      2500,
-      parseIntOr(env("AGENT_AUTO_ASSET_CONTEXT_CHARS_PER_ASSET"), 5000)
-    ),
-    maxTotalContextChars: Math.min(
-      5000,
-      parseIntOr(env("AGENT_AUTO_ASSET_TOTAL_CONTEXT_CHARS"), 12000)
-    ),
-  });
-
-  const primaryMessages = augmentedPrimaryEntries.map((entry) => entry.message);
-  const retryMessages = augmentedRetryEntries.map((entry) => entry.message);
 
   const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.7");
   const maxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 11));
@@ -4000,110 +3259,14 @@ async function buildAgentTurnBootstrap(args: AgentTurnArgs): Promise<AgentTurnBo
 
   const editThrottleMs = 120;
   const typingIntervalMs = Math.max(1000, Number(env("TELEGRAM_TYPING_INTERVAL_MS") ?? 4000));
-  const maxEditChars = Math.max(800, Math.min(3800, Number(env("TELEGRAM_STREAM_CHUNK_CHARS") ?? 3000)));
+  const maxEditChars = Math.max(800, Math.min(3800, Number(env("TELEGRAM_STREAM_CHUNK_CHARS") ?? 3500)));
 
-  return {
-    autonomy,
-    normalizedHistory,
-    sessionAssets,
-    userText,
-    hasRichMedia,
-    primaryMessages,
-    retryMessages,
-    virtualRuntime,
-    fastModel,
-    smartModel,
-    forceSmart,
-    modelName,
-    temperature,
-    maxToolSteps,
-    isTelegram,
-    telegramStreamingEnabled,
-    editThrottleMs,
-    typingIntervalMs,
-    maxEditChars,
-    slashCommand: parseSlashCommand(userText),
-  };
-}
+  let typingLoop: { stop: () => void } | null = null;
+  let placeholderMsgId: number | null = null;
 
-function createNativeAgentTools(args: {
-  request: AgentTurnArgs;
-  bootstrap: AgentTurnBootstrap;
-}): ToolSet {
-  const requestArgs = args.request;
-  const bootstrap = args.bootstrap;
-  const virtualRuntime = bootstrap.virtualRuntime;
-  const userText = bootstrap.userText;
-  const sessionAssets = bootstrap.sessionAssets;
-
-  function buildAssetReference(asset: SessionAsset): string {
-    return `asset://${asset.id}`;
-  }
-
-  async function buildAssetSignedUrl(asset: SessionAsset): Promise<string | null> {
-    return (await buildSignedAssetUrl(virtualRuntime, asset)) ?? asset.url ?? null;
-  }
-
-  function isTextLikeAssetFilename(filename: string): boolean {
-    const ext = String(filename ?? "").split(".").pop()?.toLowerCase() ?? "";
-    return [
-      "txt", "md", "markdown", "json", "jsonl", "csv", "ts", "tsx", "js", "jsx", "mjs", "cjs",
-      "py", "rb", "go", "java", "kt", "swift", "php", "rs", "cpp", "cc", "cxx", "c", "h", "hpp",
-      "cs", "html", "css", "scss", "less", "xml", "yaml", "yml", "ini", "conf", "toml", "env",
-      "log", "sql", "sh", "bash", "zsh", "ps1", "dockerfile",
-    ].includes(ext);
-  }
-
-  function isProbablyReadableText(textValue: string | null | undefined): boolean {
-    const value = String(textValue ?? "");
-    if (!value.trim()) return false;
-
-    const sample = value.slice(0, 4000);
-    if (!sample) return false;
-
-    let readable = 0;
-    for (const char of sample) {
-      const code = char.charCodeAt(0);
-      const isCommonWhitespace = char === "\n" || char === "\r" || char === "\t";
-      const isPrintable = code >= 32 && code !== 65533;
-      if (isCommonWhitespace || isPrintable) readable += 1;
-    }
-
-    return readable / sample.length >= 0.85;
-  }
-
-  function inferInspectableTextAsset(asset: SessionAsset, loaded: LoadedSessionAsset): boolean {
-    return (
-      isTextualMimeType(loaded.mimeType) ||
-      isTextLikeAssetFilename(loaded.filename || asset.filename) ||
-      isProbablyReadableText(loaded.textPreview) ||
-      isProbablyReadableText(tryUtf8FromBase64(loaded.base64))
-    );
-  }
-
-  async function runAssetInspectionText(args: {
-    modelName: string;
-    prompt?: string;
-    messages?: Array<{ role: string; content: any }>;
-  }): Promise<string> {
-    const request: any = {
-      model: openai(args.modelName),
-    };
-
-    if (args.messages) {
-      request.messages = args.messages;
-    } else {
-      request.prompt = args.prompt;
-    }
-
-    if (shouldSendTemperature(args.modelName, 0.2)) {
-      request.temperature = 0.2;
-    }
-
-    const result = await generateText(request);
-    return String(result.text ?? "").trim();
-  }
-
+  // ============================================================
+  // Native tools
+  // ============================================================
   const scheduleMessage = tool({
     description: "Schedule a message back to this user/session after delaySeconds.",
     inputSchema: zodSchema(
@@ -4117,8 +3280,8 @@ function createNativeAgentTools(args: {
       const id = await createSendTask({
         type: "send",
         dueAt,
-        channel: requestArgs.channel,
-        sessionId: requestArgs.sessionId,
+        channel: args.channel,
+        sessionId: args.sessionId,
         text: input.text,
         createdBy: "agent",
       } as any);
@@ -4189,18 +3352,11 @@ function createNativeAgentTools(args: {
     ),
     execute: async (input: { path: string }) => {
       try {
-        const path = sanitizePath(input.path);
-        const content = await vfsReadFile(virtualRuntime, path);
-        const filename = basename(path) || "file";
+        const content = await vfsReadFile(virtualRuntime, input.path);
         return {
           ok: true,
-          path,
+          path: sanitizePath(input.path),
           content: truncateText(content, 30000),
-          url: await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
-            filename,
-            mimeType: inferMimeFromFilename(filename),
-            encoding: "utf8",
-          }),
         };
       } catch (error: any) {
         return {
@@ -4222,18 +3378,11 @@ function createNativeAgentTools(args: {
     ),
     execute: async (input: { path: string; content: string }) => {
       try {
-        const path = sanitizePath(input.path);
-        await vfsWriteFile(virtualRuntime, path, input.content);
-        const filename = basename(path) || "file";
+        await vfsWriteFile(virtualRuntime, input.path, input.content);
         return {
           ok: true,
-          path,
+          path: sanitizePath(input.path),
           bytes: utf8ByteLength(input.content),
-          url: await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
-            filename,
-            mimeType: inferMimeFromFilename(filename),
-            encoding: "utf8",
-          }),
         };
       } catch (error: any) {
         return {
@@ -4245,67 +3394,9 @@ function createNativeAgentTools(args: {
     },
   });
 
-  const getVirtualFileUrl = tool({
-    description:
-      "Return a signed APP_BASE_URL URL for a file in the Redis-backed virtual filesystem so external systems can fetch it.",
-    inputSchema: zodSchema(
-      z.object({
-        path: z.string().min(1).max(4000),
-        mimeType: z.string().optional(),
-        filename: z.string().optional(),
-        encoding: z.enum(["utf8", "base64"]).optional(),
-        download: z.boolean().optional(),
-        ttlSeconds: z.number().int().min(60).max(86_400).optional(),
-      })
-    ),
-    execute: async (input: {
-      path: string;
-      mimeType?: string;
-      filename?: string;
-      encoding?: "utf8" | "base64";
-      download?: boolean;
-      ttlSeconds?: number;
-    }) => {
-      try {
-        const path = sanitizePath(input.path);
-        const node = await vfsGetNode(virtualRuntime, path);
-        if (!node) throw new Error(`No such path: ${path}`);
-        if (node.type !== "file") throw new Error(`Not a file: ${path}`);
-
-        const filename = safeFilenameSegment(input.filename || basename(path) || "file");
-        const mimeType = String(input.mimeType || inferMimeFromFilename(filename) || "application/octet-stream")
-          .trim()
-          .toLowerCase();
-        const encoding = input.encoding ?? "utf8";
-        const url = await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
-          filename,
-          mimeType,
-          encoding,
-          download: input.download ?? false,
-          ttlSeconds: input.ttlSeconds ?? 900,
-        });
-
-        return {
-          ok: Boolean(url),
-          path,
-          filename,
-          mimeType,
-          encoding,
-          url,
-        };
-      } catch (error: any) {
-        return {
-          ok: false,
-          path: sanitizePath(input.path),
-          error: String(error?.message ?? error ?? "Unknown get_virtual_file_url error"),
-        };
-      }
-    },
-  });
-
   const virtualShell = tool({
     description:
-      "Run bash-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep.",
+      "Run shell-like commands against the Redis-backed virtual filesystem only. Supports pwd, ls, tree, cat, mkdir, write, rm, mv, cp, find, and grep.",
     inputSchema: zodSchema(
       z.object({
         command: z.string().min(1).max(120000),
@@ -4323,223 +3414,25 @@ function createNativeAgentTools(args: {
     },
   });
 
-
-  const inspectSessionAsset = tool({
-    description:
-      "Inspect the contents of the most recent uploaded asset or a specific session asset. Use this when the user asks what an image, screenshot, PDF, file, JSON, code file, or log contains.",
-    inputSchema: zodSchema(
-      z.object({
-        assetId: z.string().optional(),
-        question: z.string().max(4000).optional(),
-        fetchRemote: z.boolean().optional(),
-        maxTextChars: z.number().int().min(500).max(40000).optional(),
-      })
-    ),
-    execute: async (input: {
-      assetId?: string;
-      question?: string;
-      fetchRemote?: boolean;
-      maxTextChars?: number;
-    }) => {
-      const selectedAsset = input.assetId
-        ? sessionAssets.find((x) => x.id === input.assetId)
-        : sessionAssets[sessionAssets.length - 1];
-
-      if (!selectedAsset) {
-        return {
-          ok: false,
-          error: "No session assets are available to inspect.",
-        };
-      }
-
-      const fetchRemote = input.fetchRemote ?? true;
-      const maxTextChars = input.maxTextChars ?? 16000;
-      const question = String(input.question ?? "").trim();
-      const signedUrl = await buildAssetSignedUrl(selectedAsset);
-      const inspectionModelName = env("ASSET_INSPECTION_MODEL_NAME") ?? bootstrap.smartModel ?? "gpt-5";
-
-      try {
-        const loaded = await loadSessionAssetContent(selectedAsset, { fetchRemote });
-        const base = {
-          ok: true,
-          asset: describeSessionAsset(selectedAsset),
-          ref: buildAssetReference(selectedAsset),
-          url: signedUrl,
-          filename: loaded.filename,
-          mimeType: loaded.mimeType,
-          sizeBytes: loaded.sizeBytes,
-          question: question || null,
-        };
-
-        if (inferInspectableTextAsset(selectedAsset, loaded)) {
-          const decodedText = loaded.textPreview ?? tryUtf8FromBase64(loaded.base64) ?? "";
-          const preview = truncateForModelContext(decodedText, maxTextChars);
-          const analysis = await runAssetInspectionText({
-            modelName: inspectionModelName,
-            prompt: [
-              "You are inspecting a user-uploaded text file.",
-              "Explain what it contains and answer the user's question if one is provided.",
-              "If the file looks like code, mention the language and summarize what it does.",
-              "If the file looks like JSON, CSV, logs, or config, describe the structure and important contents.",
-              "Do not invent content beyond the provided text.",
-              "",
-              `Filename: ${loaded.filename}`,
-              `MIME Type: ${loaded.mimeType}`,
-              question ? `User question: ${question}` : "User question: Describe what this file contains.",
-              "",
-              "File content:",
-              preview,
-            ].join("\n"),
-          });
-
-          return {
-            ...base,
-            inspectionMode: "text",
-            textPreview: truncateText(decodedText, 6000),
-            analysis,
-          };
-        }
-
-        if (loaded.mimeType.startsWith("image/")) {
-          const imageInput = signedUrl ?? base64ToBytes(loaded.base64);
-          const analysis = await runAssetInspectionText({
-            modelName: inspectionModelName,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: [
-                      "Inspect this uploaded image and describe what it contains.",
-                      "Include visible text, UI elements, objects, people, charts, diagrams, and other important details.",
-                      question ? `User question: ${question}` : "User question: Describe exactly what you see.",
-                    ].join("\n"),
-                  },
-                  {
-                    type: "image",
-                    image: imageInput,
-                  },
-                ],
-              },
-            ],
-          });
-
-          return {
-            ...base,
-            inspectionMode: "image",
-            analysis,
-          };
-        }
-
-        if (loaded.mimeType === "application/pdf") {
-          const pdfInput = signedUrl ?? base64ToBytes(loaded.base64);
-          const analysis = await runAssetInspectionText({
-            modelName: inspectionModelName,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: [
-                      "Inspect this uploaded PDF and explain what it contains.",
-                      "Summarize the document, mention major sections, and answer the user's question if one is provided.",
-                      question ? `User question: ${question}` : "User question: What does this PDF contain?",
-                    ].join("\n"),
-                  },
-                  {
-                    type: "file",
-                    data: pdfInput,
-                    mediaType: "application/pdf",
-                    filename: loaded.filename,
-                  },
-                ],
-              },
-            ],
-          });
-
-          return {
-            ...base,
-            inspectionMode: "pdf",
-            analysis,
-          };
-        }
-
-        if (loaded.mimeType.startsWith("audio/")) {
-          const audioModelName = env("AUDIO_INSPECTION_MODEL_NAME") ?? "gpt-4o-audio-preview";
-          const audioInput = signedUrl ?? base64ToBytes(loaded.base64);
-          const audioResult = await generateText({
-            model: openai.chat(audioModelName),
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: question || "Transcribe this audio and summarize what it says.",
-                  },
-                  {
-                    type: "file",
-                    data: audioInput,
-                    mediaType: loaded.mimeType,
-                    filename: loaded.filename,
-                  },
-                ],
-              },
-            ],
-          });
-
-          return {
-            ...base,
-            inspectionMode: "audio",
-            analysis: String(audioResult.text ?? "").trim(),
-          };
-        }
-
-        return {
-          ...base,
-          inspectionMode: "metadata",
-          analysis:
-            `I could not directly inspect the binary contents of ${loaded.filename} (${loaded.mimeType}). ` +
-            `I can still provide metadata and a signed URL for an external tool if needed.`,
-        };
-      } catch (error: any) {
-        return {
-          ok: false,
-          asset: describeSessionAsset(selectedAsset),
-          ref: buildAssetReference(selectedAsset),
-          url: signedUrl,
-          error: String(error?.message ?? error ?? "Unknown inspect_session_asset error"),
-        };
-      }
-    },
-  });
-
   const listSessionAssets = tool({
     description:
-      "List images, audio, video, and files detected in the current conversation history, including canonical IDs and signed APP_BASE_URL URLs for follow-up asset preparation.",
+      "List images, audio, video, and files detected in the current conversation history, including canonical IDs for follow-up asset preparation.",
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
-      const assets = await Promise.all(
-        sessionAssets.map(async (asset) => ({
-          ...describeSessionAsset(asset),
-          ref: buildAssetReference(asset),
-          url: await buildAssetSignedUrl(asset),
-        }))
-      );
-
       return {
         ok: true,
         count: sessionAssets.length,
-        assets,
+        assets: sessionAssets.map((asset) => ({
+          ...describeSessionAsset(asset),
+          ref: `asset://${asset.id}`,
+        })),
       };
     },
   });
 
   const prepareSessionAsset = tool({
     description:
-      "Prepare a session asset for external tool usage. Returns a signed APP_BASE_URL VFS URL plus optional inline data when requested.",
+      "Prepare a session asset for external tool usage. By default returns metadata and upload hints only. Set includeInlineData=true only when the target tool truly needs inline content.",
     inputSchema: zodSchema(
       z.object({
         assetId: z.string().min(1),
@@ -4571,11 +3464,9 @@ function createNativeAgentTools(args: {
         | {
             assetRoot: string;
             metaPath: string;
-            binaryPath: string | null;
             base64Path: string | null;
             textPath: string | null;
             infoPath: string;
-            publicUrl: string | null;
           }
         | null = null;
 
@@ -4592,25 +3483,21 @@ function createNativeAgentTools(args: {
           materialized = {
             assetRoot: result.assetRoot,
             metaPath: result.metaPath,
-            binaryPath: result.binaryPath ?? null,
             base64Path: result.base64Path,
             textPath: result.textPath,
             infoPath: result.infoPath,
-            publicUrl: result.publicUrl ?? null,
           };
           loaded = result.loaded;
         }
 
-        const signedUrl = await buildAssetSignedUrl(asset);
-
         return {
           ok: true,
-          ref: buildAssetReference(asset),
+          ref: `asset://${asset.id}`,
           ...buildPreparedAssetPayload(asset, {
             loaded,
             materialized,
             includeInlineData,
-            signedUrl,
+            signedUrl: await buildSignedAssetUrl(asset),
           }),
         };
       } catch (error: any) {
@@ -4625,7 +3512,7 @@ function createNativeAgentTools(args: {
 
   const materializeSessionAsset = tool({
     description:
-      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/ and return its signed APP_BASE_URL URL.",
+      "Persist a session asset into the Redis-backed virtual filesystem under /workspace/assets/<asset-id>/. Does not include base64 unless explicitly requested.",
     inputSchema: zodSchema(
       z.object({
         assetId: z.string().min(1),
@@ -4649,16 +3536,12 @@ function createNativeAgentTools(args: {
           includeBase64: input.includeBase64 ?? false,
         });
 
-        const signedUrl = await buildAssetSignedUrl(asset);
-
         return {
           ok: true,
           asset: describeSessionAsset(asset),
-          ref: buildAssetReference(asset),
-          url: signedUrl,
+          ref: `asset://${asset.id}`,
           assetRoot: result.assetRoot,
           metaPath: result.metaPath,
-          binaryPath: result.binaryPath ?? null,
           base64Path: result.base64Path,
           textPath: result.textPath,
           infoPath: result.infoPath,
@@ -4685,15 +3568,11 @@ function createNativeAgentTools(args: {
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
       try {
-        const session = await createComposioSessionForUser(
-          requestArgs.userId,
-          requestArgs.composio?.session,
-          requestArgs.composio
-        );
+        const session = await createComposioSessionForUser(args.userId, args.composio?.session, args.composio);
         const mcp: any = (session as any)?.mcp ?? null;
         return {
           ok: Boolean(mcp?.url),
-          userId: requestArgs.userId,
+          userId: args.userId,
           url: mcp?.url ?? null,
           headers: mcp?.headers ?? null,
         };
@@ -4735,7 +3614,7 @@ function createNativeAgentTools(args: {
         return await composioApiRequest({
           ...input,
           authMode: "project",
-          config: requestArgs.composio,
+          config: args.composio,
         });
       } catch (error: any) {
         return {
@@ -4778,7 +3657,7 @@ function createNativeAgentTools(args: {
         return await composioApiRequest({
           ...input,
           authMode: "org",
-          config: requestArgs.composio,
+          config: args.composio,
         });
       } catch (error: any) {
         return {
@@ -4856,8 +3735,7 @@ function createNativeAgentTools(args: {
           version: detectComposioWebhookVersion(parsedPayload),
           parsedTimestamp,
           eventType: (parsedPayload as any)?.type ?? null,
-          triggerSlug:
-            (parsedPayload as any)?.metadata?.trigger_slug ?? (parsedPayload as any)?.trigger_slug ?? null,
+          triggerSlug: (parsedPayload as any)?.metadata?.trigger_slug ?? (parsedPayload as any)?.trigger_slug ?? null,
           payload: parsedPayload,
           error: verified ? null : "Invalid webhook signature",
         };
@@ -4870,7 +3748,31 @@ function createNativeAgentTools(args: {
     },
   });
 
-  return {
+  // ============================================================
+  // Fast-path /ssh
+  // ============================================================
+  const slash = parseSlashCommand(userText);
+  if (slash?.cmd === "/ssh") {
+    const cmd = slash.arg;
+    const out = cmd ? await sshExec(cmd) : "Usage: /ssh <command>";
+    return { text: String(out), responseMessages: [] as any[] };
+  }
+
+  // ============================================================
+  // Load Composio session meta tools and wrap them with deterministic asset resolution
+  // ============================================================
+  let composioTools: ToolSet = {};
+  if (getComposioProjectApiKey(args.composio)) {
+    const rawTools = await getComposioToolsForUser(args.userId, args.composio?.session, args.composio).catch(
+      () => ({} as ToolSet)
+    );
+    composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
+      sessionAssets,
+      composioConfig: args.composio,
+    });
+  }
+
+  const nativeTools: ToolSet = {
     schedule_message: scheduleMessage,
     ssh_exec: sshTool,
     composio_get_mcp_server: composioGetMcpServer,
@@ -4881,56 +3783,191 @@ function createNativeAgentTools(args: {
     read_skill: readSkill,
     read_virtual_file: readVirtualFile,
     write_virtual_file: writeVirtualFile,
-    get_virtual_file_url: getVirtualFileUrl,
     virtual_shell: virtualShell,
     list_session_assets: listSessionAssets,
-    inspect_session_asset: inspectSessionAsset,
     prepare_session_asset: prepareSessionAsset,
     materialize_session_asset: materializeSessionAsset,
   };
-}
 
-
-async function loadAgentToolBundle(args: {
-  request: AgentTurnArgs;
-  bootstrap: AgentTurnBootstrap;
-}): Promise<AgentToolBundle> {
-  let composioTools: ToolSet = {};
-  if (getComposioProjectApiKey(args.request.composio)) {
-    const rawTools = await getComposioToolsForUser(
-      args.request.userId,
-      args.request.composio?.session,
-      args.request.composio
-    ).catch(() => ({} as ToolSet));
-
-    composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
-      sessionAssets: args.bootstrap.sessionAssets,
-      composioConfig: args.request.composio,
-      virtualRuntime: args.bootstrap.virtualRuntime,
-    });
-  }
-
-  const nativeTools = createNativeAgentTools(args);
   const tools: ToolSet = {
     ...composioTools,
     ...nativeTools,
   };
 
-  return {
-    nativeTools,
-    composioTools,
-    tools,
-    retryTools: tools,
-  };
-}
+  const retryTools: ToolSet = tools;
 
+  // ============================================================
+  // Telegram streaming helpers
+  // ============================================================
+  async function deliverFinalTelegram(text: string) {
+    const chunks = splitForTelegram(text, maxEditChars);
 
-function buildAgentSystemPrompt(args: {
-  request: AgentTurnArgs;
-  bootstrap: AgentTurnBootstrap;
-}): string {
-  return [
-    "You are an Agentic Operating System similar to OpenClaw running in Telegram/WhatsApp/SMS with over 1000 Composio-based API toolkits (Slack, Discord, LinkedIn, Google Drive, Google Docs, GitHub, etc).",
+    if (placeholderMsgId != null) {
+      try {
+        await telegramEditMessageText(args.sessionId, placeholderMsgId, chunks[0]);
+      } catch {
+        placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
+      }
+    } else {
+      placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
+    }
+
+    for (let i = 1; i < chunks.length; i++) {
+      await telegramSendMessage(args.sessionId, chunks[i], { disableNotification: true });
+    }
+
+    return { delivered: true };
+  }
+
+  async function streamToTelegram(fullStream: AsyncIterable<any>): Promise<string> {
+    let full = "";
+    let stepNumber = 0;
+    let sawReasoning = false;
+
+    const toolStates = new Map<string, TelegramLiveToolState>();
+
+    const editor = createEditCoalescer({
+      sessionId: args.sessionId,
+      messageId: placeholderMsgId!,
+      throttleMs: editThrottleMs,
+    });
+
+    const requestRender = () => {
+      if (full.length > 0) {
+        editor.requestTypewriter(truncateForTelegramLive(full, maxEditChars));
+        return;
+      }
+
+      editor.requestStatus(
+        truncateForTelegramLive(
+          renderTelegramStatus({
+            stepNumber,
+            sawReasoning,
+            tools: Array.from(toolStates.values()),
+          }),
+          maxEditChars
+        )
+      );
+    };
+
+    const upsertToolState = (part: any, patch: Partial<TelegramLiveToolState>) => {
+      const toolCallId = String(part?.toolCallId ?? part?.id ?? "");
+      const prev = toolStates.get(toolCallId) ?? {
+        toolCallId,
+        toolName: String(part?.toolName ?? "tool"),
+        status: "running" as const,
+      };
+
+      toolStates.set(toolCallId, {
+        ...prev,
+        ...patch,
+        toolCallId,
+        toolName: String(part?.toolName ?? patch.toolName ?? prev.toolName ?? "tool"),
+      });
+    };
+
+    requestRender();
+
+    for await (const part of fullStream) {
+      const type = String(part?.type ?? "");
+
+      switch (type) {
+        case "start-step": {
+          stepNumber += 1;
+          requestRender();
+          break;
+        }
+
+        case "reasoning":
+        case "reasoning-start":
+        case "reasoning-delta": {
+          sawReasoning = true;
+          requestRender();
+          break;
+        }
+
+        case "tool-input-start":
+        case "tool-call-streaming-start": {
+          upsertToolState(part, {
+            status: "running",
+          });
+          requestRender();
+          break;
+        }
+
+        case "tool-input-delta":
+        case "tool-call-delta": {
+          const previousId = String(part?.toolCallId ?? part?.id ?? "");
+          const previous = toolStates.get(previousId);
+          const delta = String(part?.delta ?? part?.argsTextDelta ?? "");
+          const nextArgs = `${previous?.argsPreview ?? ""}${delta}`;
+
+          upsertToolState(part, {
+            status: "running",
+            argsPreview: singleLineStatus(nextArgs, 220),
+          });
+          requestRender();
+          break;
+        }
+
+        case "tool-input-end": {
+          requestRender();
+          break;
+        }
+
+        case "tool-call": {
+          upsertToolState(part, {
+            status: "running",
+            argsPreview: summarizeToolPayloadForTelegram(part?.input ?? part?.args, 220),
+          });
+          requestRender();
+          break;
+        }
+
+        case "tool-result": {
+          upsertToolState(part, {
+            status: "done",
+            resultPreview: summarizeToolPayloadForTelegram(part?.output ?? part?.result, 180),
+          });
+          requestRender();
+          break;
+        }
+
+        case "text": {
+          full += String(part?.text ?? "");
+          requestRender();
+          break;
+        }
+
+        case "text-delta": {
+          full += String(part?.delta ?? part?.textDelta ?? "");
+          requestRender();
+          break;
+        }
+
+        case "text-start":
+        case "text-end":
+        case "finish-step":
+        case "finish":
+        case "error": {
+          requestRender();
+          break;
+        }
+
+        default:
+          break;
+      }
+    }
+
+    await editor.flush();
+    return full;
+  }
+
+  // ============================================================
+  // System prompt
+  // ============================================================
+  const system = [
+    "You are an Agentic Operating System assistant running in Telegram/WhatsApp/SMS with Composio tools.",
     "",
     "CRITICAL TOOL RULES:",
     "- If the user asks for an external action, use the appropriate tool.",
@@ -4939,14 +3976,13 @@ function buildAgentSystemPrompt(args: {
     "- Let Composio search, authenticate, and execute dynamically at runtime instead of relying on hard-coded toolkit routing.",
     "",
     "COMPOSIO SESSION:",
-    `- Active namespace: ${args.request.userId}`,
-    "- Namespaces identify active connections in an auth config instance scoped to that user's credentials for that specific toolkit or API integration.",
+    `- Active namespace: ${args.userId}`,
     "- session.tools() returns Composio meta tools for discovery, auth, execution, browser automation toolkit discovery, and the persistent workbench sandbox.",
     "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app/tool slug or need browser automation or other dynamic toolkit discovery.",
     "- Use COMPOSIO_GET_TOOL_SCHEMAS to inspect exact tool inputs before execution.",
     "- Use COMPOSIO_MANAGE_CONNECTIONS when auth may be missing or the user asks to connect an app.",
     "- Use COMPOSIO_MULTI_EXECUTE_TOOL or COMPOSIO_EXECUTE_TOOL to run Composio actions after discovery.",
-    "- Use COMPOSIO_REMOTE_WORKBENCH or COMPOSIO_REMOTE_BASH_TOOL for the Composio code sandbox or workbench.",
+    "- Use COMPOSIO_REMOTE_WORKBENCH or COMPOSIO_REMOTE_BASH_TOOL for the Composio code sandbox/workbench.",
     "- Use composio_api_request for project-scoped Composio platform APIs that are outside session meta tools, including /webhook_subscriptions, /trigger_instances, /triggers_types, /connected_accounts, /auth_configs, /toolkits, /tools, /files, /mcp, /tool_router, and /org/project/config.",
     "- Use composio_org_api_request only for org-level project administration endpoints such as /org/owner/project/list or /org/owner/project/new when an org key is configured.",
     "- Use composio_get_mcp_server to retrieve MCP connection info for this user session.",
@@ -4954,21 +3990,16 @@ function buildAgentSystemPrompt(args: {
     "",
     "FILESYSTEM:",
     "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
-    "- Use get_virtual_file_url when an external tool needs a signed APP_BASE_URL URL for a VFS file.",
     "- Use virtual_shell for shell-like operations on the virtual filesystem only.",
     "- Prefer /workspace for drafts, payloads, notes, JSON, and staging.",
     "",
     "MODALITIES:",
-    `- Session asset count available via tools: ${args.bootstrap.sessionAssets.length}`,
+    `- Session asset count available via tools: ${sessionAssets.length}`,
     "- Use list_session_assets to inspect assets.",
-    "- Use inspect_session_asset when the user asks what an uploaded image, screenshot, PDF, JSON, code file, log, or document contains.",
-    "- Recent uploaded assets may already have auto-extracted attachment context appended to the user messages. Use that context first, then inspect_session_asset only when you need more detail or the extraction was insufficient.",
-    "- Use prepare_session_asset first for metadata, signed APP_BASE_URL URLs, and upload hints.",
+    "- Use prepare_session_asset first for metadata and upload hints.",
     "- When calling external tools, pass asset references like asset://asset_m6_p2.",
-    "- The asset wrapper can resolve those refs to signed APP_BASE_URL VFS URLs for URL-style tools or s3keys for upload-style tools.",
     "- The execution wrapper resolves asset references deterministically before the external tool runs, staging asset bytes into Composio storage when a tool expects an s3key-backed upload.",
     "- Only request inline content when the target tool really needs it.",
-    "- After inspect_session_asset returns, answer directly instead of repeatedly calling list_session_assets or prepare_session_asset.",
     "",
     "SSH:",
     "- Use ssh_exec only for real host actions the user wants.",
@@ -4977,635 +4008,83 @@ function buildAgentSystemPrompt(args: {
     "SKILLS:",
     "- Use list_skills or read_skill only when needed.",
     "",
-    "FORMATTING:",
-    "- When returning code, JSON, logs, stack traces, or terminal output, prefer fenced code blocks with an explicit language, for example ```typescript, ```json, ```bash, or ```text.",
-    "- Keep code fences balanced and do not emit raw HTML.",
-    "",
-    `Mode: ${args.bootstrap.autonomy}`,
+    `Mode: ${autonomy}`,
     "Be concise, accurate, and tool-grounded.",
   ].join("\n");
-}
 
-
-async function prepareTelegramStreamingHandle(
-  request: AgentTurnArgs,
-  bootstrap: AgentTurnBootstrap
-): Promise<AgentTurnStreamingHandle> {
-  const typingLoop = telegramStartChatActionLoop(request.sessionId, "typing", {
-    intervalMs: bootstrap.typingIntervalMs,
-  });
-
-  try {
-    const placeholderMsgId = await telegramSendMessage(request.sessionId, "Thinking…", {
-      disableNotification: true,
-    });
-
-    return {
-      typingLoop,
-      placeholderMsgId,
-    };
-  } catch (error) {
-    typingLoop?.stop();
-    throw error;
-  }
-}
-
-async function deliverFinalTelegram(args: {
-  sessionId: string;
-  placeholderMsgId: number | null;
-  text: string;
-  maxEditChars: number;
-}) {
-  const chunks = splitForTelegram(args.text, args.maxEditChars);
-
-  let messageId = args.placeholderMsgId;
-
-  if (messageId != null) {
-    try {
-      await telegramEditMessageText(args.sessionId, messageId, chunks[0]);
-    } catch {
-      messageId = await telegramSendMessage(args.sessionId, chunks[0]);
-    }
-  } else {
-    messageId = await telegramSendMessage(args.sessionId, chunks[0]);
-  }
-
-  for (let i = 1; i < chunks.length; i++) {
-    await telegramSendMessage(args.sessionId, chunks[i], { disableNotification: true });
-  }
-
-  return { delivered: true, messageId };
-}
-
-async function streamToTelegram(args: {
-  sessionId: string;
-  placeholderMsgId: number;
-  fullStream: AsyncIterable<any>;
-  editThrottleMs: number;
-  maxEditChars: number;
-}): Promise<string> {
-  let full = "";
-  let stepNumber = 0;
-  let sawReasoning = false;
-
-  const toolStates = new Map<string, TelegramLiveToolState>();
-
-  const editor = createEditCoalescer({
-    sessionId: args.sessionId,
-    messageId: args.placeholderMsgId,
-    throttleMs: args.editThrottleMs,
-  });
-
-  const requestRender = () => {
-    if (full.length > 0) {
-      editor.requestTypewriter(truncateForTelegramLive(full, args.maxEditChars));
-      return;
-    }
-
-    editor.requestStatus(
-      truncateForTelegramLive(
-        renderTelegramStatus({
-          stepNumber,
-          sawReasoning,
-          tools: Array.from(toolStates.values()),
-        }),
-        args.maxEditChars
-      )
+  async function runStreamingAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
+    const s = streamText(
+      buildModelCallArgs({
+        modelName,
+        system,
+        messages: attemptMessages,
+        tools: attemptTools,
+        temperature,
+        maxToolSteps,
+      })
     );
-  };
 
-  const upsertToolState = (part: any, patch: Partial<TelegramLiveToolState>) => {
-    const toolCallId = String(part?.toolCallId ?? part?.id ?? "");
-    const prev = toolStates.get(toolCallId) ?? {
-      toolCallId,
-      toolName: String(part?.toolName ?? "tool"),
-      status: "running" as const,
-    };
+    const streamedText = await streamToTelegram(s.fullStream as AsyncIterable<any>);
 
-    toolStates.set(toolCallId, {
-      ...prev,
-      ...patch,
-      toolCallId,
-      toolName: String(part?.toolName ?? patch.toolName ?? prev.toolName ?? "tool"),
-    });
-  };
+    const maybeText = (s as any).text;
+    const fallbackText =
+      typeof maybeText === "string"
+        ? maybeText
+        : maybeText && typeof maybeText.then === "function"
+          ? await maybeText
+          : "";
 
-  requestRender();
+    const text = String(streamedText || fallbackText || "").trim();
 
-  for await (const part of args.fullStream) {
-    const type = String(part?.type ?? "");
-
-    switch (type) {
-      case "start-step": {
-        stepNumber += 1;
-        requestRender();
-        break;
-      }
-
-      case "reasoning":
-      case "reasoning-start":
-      case "reasoning-delta": {
-        sawReasoning = true;
-        requestRender();
-        break;
-      }
-
-      case "tool-input-start":
-      case "tool-call-streaming-start": {
-        upsertToolState(part, {
-          status: "running",
-        });
-        requestRender();
-        break;
-      }
-
-      case "tool-input-delta":
-      case "tool-call-delta": {
-        const previousId = String(part?.toolCallId ?? part?.id ?? "");
-        const previous = toolStates.get(previousId);
-        const delta = String(part?.delta ?? part?.argsTextDelta ?? "");
-        const nextArgs = `${previous?.argsPreview ?? ""}${delta}`;
-
-        upsertToolState(part, {
-          status: "running",
-          argsPreview: singleLineStatus(nextArgs, 220),
-        });
-        requestRender();
-        break;
-      }
-
-      case "tool-input-end": {
-        requestRender();
-        break;
-      }
-
-      case "tool-call": {
-        upsertToolState(part, {
-          status: "running",
-          argsPreview: summarizeToolPayloadForTelegram(part?.input ?? part?.args, 220),
-        });
-        requestRender();
-        break;
-      }
-
-      case "tool-result": {
-        upsertToolState(part, {
-          status: "done",
-          resultPreview: summarizeToolPayloadForTelegram(part?.output ?? part?.result, 180),
-        });
-        requestRender();
-        break;
-      }
-
-      case "text": {
-        full += String(part?.text ?? "");
-        requestRender();
-        break;
-      }
-
-      case "text-delta": {
-        full += String(part?.delta ?? part?.textDelta ?? "");
-        requestRender();
-        break;
-      }
-
-      case "text-start":
-      case "text-end":
-      case "finish-step":
-      case "finish":
-      case "error": {
-        requestRender();
-        break;
-      }
-
-      default:
-        break;
+    if (!text) {
+      throw new Error("Streaming completed without assistant text");
     }
+
+    await deliverFinalTelegram(text);
+
+    const responseMessages = Array.isArray((await (s as any).response)?.messages)
+      ? ((await (s as any).response).messages as any[])
+      : [];
+
+    return { text, responseMessages, delivered: true };
   }
 
-  await editor.flush();
-  return full;
-}
 
-async function runStreamingAttempt(args: {
-  request: AgentTurnArgs;
-  bootstrap: AgentTurnBootstrap;
-  messages: ModelMessage[];
-  tools: ToolSet;
-  system: string;
-  placeholderMsgId: number | null;
-}): Promise<AgentTurnResult> {
-  const placeholderMsgId =
-    args.placeholderMsgId ??
-    (await telegramSendMessage(args.request.sessionId, "Thinking…", { disableNotification: true }));
+  async function runGenerateAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
+    const r = await generateText(
+      buildModelCallArgs({
+        modelName,
+        system,
+        messages: attemptMessages,
+        tools: attemptTools,
+        temperature,
+        maxToolSteps,
+      })
+    );
 
-  const streamResult = streamText(
-    buildModelCallArgs({
-      modelName: args.bootstrap.modelName,
-      system: args.system,
-      messages: args.messages,
-      tools: args.tools,
-      temperature: args.bootstrap.temperature,
-      maxToolSteps: args.bootstrap.maxToolSteps,
-    })
-  );
-
-  const streamedText = await streamToTelegram({
-    sessionId: args.request.sessionId,
-    placeholderMsgId,
-    fullStream: streamResult.fullStream as AsyncIterable<any>,
-    editThrottleMs: args.bootstrap.editThrottleMs,
-    maxEditChars: args.bootstrap.maxEditChars,
-  });
-
-  const maybeText = (streamResult as any).text;
-  const fallbackText =
-    typeof maybeText === "string"
-      ? maybeText
-      : maybeText && typeof maybeText.then === "function"
-        ? await maybeText
-        : "";
-
-  const text = String(streamedText || fallbackText || "").trim();
-  if (!text) {
-    throw new Error("Streaming completed without assistant text");
+    return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
   }
-
-  await deliverFinalTelegram({
-    sessionId: args.request.sessionId,
-    placeholderMsgId,
-    text,
-    maxEditChars: args.bootstrap.maxEditChars,
-  });
-
-  const response = await (streamResult as any).response;
-  const responseMessages = Array.isArray(response?.messages) ? (response.messages as any[]) : [];
-
-  return {
-    text,
-    responseMessages,
-    delivered: true,
-  };
-}
-
-async function runGenerateAttempt(args: {
-  bootstrap: AgentTurnBootstrap;
-  messages: ModelMessage[];
-  tools: ToolSet;
-  system: string;
-}): Promise<AgentTurnResult> {
-  const result = await generateText(
-    buildModelCallArgs({
-      modelName: args.bootstrap.modelName,
-      system: args.system,
-      messages: args.messages,
-      tools: args.tools,
-      temperature: args.bootstrap.temperature,
-      maxToolSteps: args.bootstrap.maxToolSteps,
-    })
-  );
-
-  return {
-    text: result.text,
-    responseMessages: (result.response?.messages as any[]) ?? [],
-  };
-}
-
-const agentTurnMachine = setup({
-  types: {
-    input: {} as AgentTurnMachineInput,
-    context: {} as AgentTurnMachineContext,
-    events: {} as AgentTurnMachineEvent,
-    output: {} as AgentTurnResult,
-  },
-  guards: {
-    hasSlashSsh: ({ context }: AgentTurnMachineContextArg) => context.bootstrap?.slashCommand?.cmd === "/ssh",
-    shouldPrepareStreaming: ({ context }: AgentTurnMachineContextArg) => Boolean(context.bootstrap?.telegramStreamingEnabled),
-    canRetryPromptBudget: ({ event }: AgentTurnMachineEventArg) => isPromptBudgetRetryableError((event as any)?.error),
-  },
-  actions: {
-    storeBootstrap: assign({
-      bootstrap: ({ event }: AgentTurnMachineEventArg) => ((event as any)?.output ?? null) as AgentTurnBootstrap | null,
-    }),
-    storeToolBundle: assign({
-      toolBundle: ({ event }: AgentTurnMachineEventArg) => ((event as any)?.output ?? null) as AgentToolBundle | null,
-    }),
-    storeStreamingHandle: assign({
-      streamingHandle: ({ event }: AgentTurnMachineEventArg) => ((event as any)?.output ?? null) as AgentTurnStreamingHandle | null,
-    }),
-    storeResult: assign({
-      result: ({ event }: AgentTurnMachineEventArg) => ((event as any)?.output ?? null) as AgentTurnResult | null,
-      lastError: () => null,
-    }),
-    storeError: assign({
-      lastError: ({ event }: AgentTurnMachineEventArg) => (event as any)?.error ?? new Error("Unknown agentTurn error"),
-    }),
-    stopTypingLoop: ({ context }: AgentTurnMachineContextArg) => {
-      context.streamingHandle?.typingLoop?.stop();
-    },
-    throwLastError: ({ context }: AgentTurnMachineContextArg) => {
-      throw context.lastError ?? new Error("agentTurn failed");
-    },
-  },
-  actors: {
-    bootstrap: fromPromise(async ({ input }: { input: AgentTurnMachineInput }) => {
-      return await buildAgentTurnBootstrap(input.args);
-    }),
-    slashSsh: fromPromise(async ({ input }: { input: { args: AgentTurnArgs; bootstrap: AgentTurnBootstrap | null } }) => {
-      const cmd = input.bootstrap?.slashCommand?.arg ?? "";
-      const out = cmd ? await sshExec(cmd) : "Usage: /ssh <command>";
-      return { text: String(out), responseMessages: [] as any[] } satisfies AgentTurnResult;
-    }),
-    loadTools: fromPromise(
-      async ({
-        input,
-      }: {
-        input: { args: AgentTurnArgs; bootstrap: AgentTurnBootstrap | null };
-      }) => {
-        if (!input.bootstrap) {
-          throw new Error("Cannot load tools before bootstrap is initialized");
-        }
-        return await loadAgentToolBundle({
-          request: input.args,
-          bootstrap: input.bootstrap,
-        });
-      }
-    ),
-    prepareStreaming: fromPromise(
-      async ({
-        input,
-      }: {
-        input: { args: AgentTurnArgs; bootstrap: AgentTurnBootstrap | null };
-      }) => {
-        if (!input.bootstrap) {
-          throw new Error("Cannot prepare Telegram streaming before bootstrap is initialized");
-        }
-        return await prepareTelegramStreamingHandle(input.args, input.bootstrap);
-      }
-    ),
-    executePrimary: fromPromise(
-      async ({
-        input,
-      }: {
-        input: {
-          args: AgentTurnArgs;
-          bootstrap: AgentTurnBootstrap | null;
-          toolBundle: AgentToolBundle | null;
-          streamingHandle: AgentTurnStreamingHandle | null;
-        };
-      }) => {
-        if (!input.bootstrap || !input.toolBundle) {
-          throw new Error("Cannot execute agent turn before bootstrap and tools are initialized");
-        }
-
-        const system = buildAgentSystemPrompt({
-          request: input.args,
-          bootstrap: input.bootstrap,
-        });
-
-        if (input.bootstrap.telegramStreamingEnabled) {
-          return await runStreamingAttempt({
-            request: input.args,
-            bootstrap: input.bootstrap,
-            messages: input.bootstrap.primaryMessages,
-            tools: input.toolBundle.tools,
-            system,
-            placeholderMsgId: input.streamingHandle?.placeholderMsgId ?? null,
-          });
-        }
-
-        return await runGenerateAttempt({
-          bootstrap: input.bootstrap,
-          messages: input.bootstrap.primaryMessages,
-          tools: input.toolBundle.tools,
-          system,
-        });
-      }
-    ),
-    executeRetry: fromPromise(
-      async ({
-        input,
-      }: {
-        input: {
-          args: AgentTurnArgs;
-          bootstrap: AgentTurnBootstrap | null;
-          toolBundle: AgentToolBundle | null;
-          streamingHandle: AgentTurnStreamingHandle | null;
-        };
-      }) => {
-        if (!input.bootstrap || !input.toolBundle) {
-          throw new Error("Cannot retry agent turn before bootstrap and tools are initialized");
-        }
-
-        const system = buildAgentSystemPrompt({
-          request: input.args,
-          bootstrap: input.bootstrap,
-        });
-
-        if (input.bootstrap.telegramStreamingEnabled) {
-          return await runStreamingAttempt({
-            request: input.args,
-            bootstrap: input.bootstrap,
-            messages: input.bootstrap.retryMessages,
-            tools: input.toolBundle.retryTools,
-            system,
-            placeholderMsgId: input.streamingHandle?.placeholderMsgId ?? null,
-          });
-        }
-
-        return await runGenerateAttempt({
-          bootstrap: input.bootstrap,
-          messages: input.bootstrap.retryMessages,
-          tools: input.toolBundle.retryTools,
-          system,
-        });
-      }
-    ),
-  },
-}).createMachine({
-  id: "agentTurn",
-  output: ({ context }: AgentTurnMachineContextArg) => {
-    if (!context.result) {
-      throw new Error("agentTurn completed without a result");
-    }
-    return context.result;
-  },
-  context: ({ input }: AgentTurnMachineInputArg) => ({
-    args: input.args,
-    bootstrap: null,
-    toolBundle: null,
-    streamingHandle: null,
-    lastError: null,
-    result: null,
-  }),
-  initial: "bootstrapping",
-  states: {
-    bootstrapping: {
-      invoke: {
-        src: "bootstrap",
-        input: ({ context }: AgentTurnMachineContextArg) => ({ args: context.args }),
-        onDone: {
-          target: "route",
-          actions: "storeBootstrap",
-        },
-        onError: {
-          target: "failure",
-          actions: "storeError",
-        },
-      },
-    },
-    route: {
-      always: [
-        {
-          guard: "hasSlashSsh",
-          target: "slashSsh",
-        },
-        {
-          target: "loadTools",
-        },
-      ],
-    },
-    slashSsh: {
-      invoke: {
-        src: "slashSsh",
-        input: ({ context }: AgentTurnMachineContextArg) => ({
-          args: context.args,
-          bootstrap: context.bootstrap,
-        }),
-        onDone: {
-          target: "success",
-          actions: "storeResult",
-        },
-        onError: {
-          target: "failure",
-          actions: "storeError",
-        },
-      },
-    },
-    loadTools: {
-      invoke: {
-        src: "loadTools",
-        input: ({ context }: AgentTurnMachineContextArg) => ({
-          args: context.args,
-          bootstrap: context.bootstrap,
-        }),
-        onDone: {
-          target: "maybePrepareStreaming",
-          actions: "storeToolBundle",
-        },
-        onError: {
-          target: "failure",
-          actions: "storeError",
-        },
-      },
-    },
-    maybePrepareStreaming: {
-      always: [
-        {
-          guard: "shouldPrepareStreaming",
-          target: "prepareStreaming",
-        },
-        {
-          target: "executePrimary",
-        },
-      ],
-    },
-    prepareStreaming: {
-      invoke: {
-        src: "prepareStreaming",
-        input: ({ context }: AgentTurnMachineContextArg) => ({
-          args: context.args,
-          bootstrap: context.bootstrap,
-        }),
-        onDone: {
-          target: "executePrimary",
-          actions: "storeStreamingHandle",
-        },
-        onError: {
-          target: "failure",
-          actions: "storeError",
-        },
-      },
-    },
-    executePrimary: {
-      invoke: {
-        src: "executePrimary",
-        input: ({ context }: AgentTurnMachineContextArg) => ({
-          args: context.args,
-          bootstrap: context.bootstrap,
-          toolBundle: context.toolBundle,
-          streamingHandle: context.streamingHandle,
-        }),
-        onDone: {
-          target: "success",
-          actions: "storeResult",
-        },
-        onError: [
-          {
-            guard: "canRetryPromptBudget",
-            target: "executeRetry",
-            actions: "storeError",
-          },
-          {
-            target: "failure",
-            actions: "storeError",
-          },
-        ],
-      },
-    },
-    executeRetry: {
-      invoke: {
-        src: "executeRetry",
-        input: ({ context }: AgentTurnMachineContextArg) => ({
-          args: context.args,
-          bootstrap: context.bootstrap,
-          toolBundle: context.toolBundle,
-          streamingHandle: context.streamingHandle,
-        }),
-        onDone: {
-          target: "success",
-          actions: "storeResult",
-        },
-        onError: {
-          target: "failure",
-          actions: "storeError",
-        },
-      },
-    },
-    success: {
-      type: "final",
-      entry: "stopTypingLoop",
-    },
-    failure: {
-      entry: ["stopTypingLoop", "throwLastError"],
-    },
-  },
-});
-
-// ============================================================
-// MAIN
-// ============================================================
-export async function agentTurn(args: AgentTurnArgs) {
-  "use step";
-
-  const actor = createActor(agentTurnMachine, {
-    input: { args },
-  });
 
   try {
-    actor.start();
-    return await toPromise(actor);
-  } finally {
-    try {
-      actor.getSnapshot().context.streamingHandle?.typingLoop?.stop();
-    } catch {
-      // best effort only
+    if (telegramStreamingEnabled) {
+      typingLoop = telegramStartChatActionLoop(args.sessionId, "typing", { intervalMs: typingIntervalMs });
+      placeholderMsgId = await telegramSendMessage(args.sessionId, "Thinking…", { disableNotification: true });
+
+      try {
+        return await runStreamingAttempt(primaryMessages, tools);
+      } catch (error) {
+        if (!isPromptBudgetRetryableError(error)) throw error;
+        return await runStreamingAttempt(retryMessages, retryTools);
+      }
     }
 
     try {
-      actor.stop();
-    } catch {
-      // best effort only
+      return await runGenerateAttempt(primaryMessages, tools);
+    } catch (error) {
+      if (!isPromptBudgetRetryableError(error)) throw error;
+      return await runGenerateAttempt(retryMessages, retryTools);
     }
+  } finally {
+    typingLoop?.stop();
   }
 }
