@@ -1061,8 +1061,8 @@ const INLINE_SKILLS: Record<string, InlineSkill> = {
     whenToUse: "Use when the user message includes images, audio, video, or files that need staging or upload.",
     guidance: [
       "Use list_session_assets to inspect available assets.",
-      "Use inspect_session_asset when the user wants to know what an uploaded image, file, PDF, code file, or log contains.",
-      "Use prepare_session_asset first for metadata and upload hints.",
+      "Use inspect_session_asset when the user asks what an uploaded image, PDF, code file, JSON file, log, or audio clip contains.",
+      "Use prepare_session_asset for metadata and upload hints when an external tool needs the asset.",
       "Use asset references like asset://asset_m6_p2 when calling external tools.",
       "The tool execution wrapper resolves asset references deterministically before the external tool runs.",
       "Do not assume all Composio upload tools use the same schema.",
@@ -1989,6 +1989,79 @@ function buildPreparedAssetPayload(
   };
 }
 
+
+function buildCanonicalAssetRef(assetId: string): string {
+  return `asset://${assetId}`;
+}
+
+function dedupeNonEmptyStrings(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+
+  for (const value of values) {
+    const normalized = String(value ?? "").trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+
+  return out;
+}
+
+function guessLanguageFromAsset(filename: string, mimeType: string): string {
+  const lowerName = String(filename ?? "").toLowerCase();
+  const mime = String(mimeType ?? "").toLowerCase();
+  const ext = lowerName.includes('.') ? lowerName.split('.').pop() ?? '' : '';
+
+  const byExt: Record<string, string> = {
+    ts: 'typescript',
+    tsx: 'tsx',
+    js: 'javascript',
+    jsx: 'jsx',
+    json: 'json',
+    md: 'markdown',
+    py: 'python',
+    rb: 'ruby',
+    php: 'php',
+    go: 'go',
+    rs: 'rust',
+    java: 'java',
+    kt: 'kotlin',
+    swift: 'swift',
+    cs: 'csharp',
+    cpp: 'cpp',
+    c: 'c',
+    h: 'c',
+    sql: 'sql',
+    sh: 'bash',
+    zsh: 'zsh',
+    yaml: 'yaml',
+    yml: 'yaml',
+    xml: 'xml',
+    html: 'html',
+    css: 'css',
+    csv: 'csv',
+    log: 'text',
+    txt: 'text',
+  };
+
+  if (ext && byExt[ext]) return byExt[ext];
+  if (mime.includes('json')) return 'json';
+  if (mime.includes('markdown')) return 'markdown';
+  if (mime.includes('csv')) return 'csv';
+  if (mime.includes('yaml')) return 'yaml';
+  if (mime.includes('xml')) return 'xml';
+  if (mime.includes('html')) return 'html';
+  if (mime.includes('javascript')) return 'javascript';
+  if (mime.includes('typescript')) return 'typescript';
+  if (mime.startsWith('text/')) return 'text';
+  return 'text';
+}
+
+function createAssetInspectionQuestion(inputQuestion: string | undefined, fallback: string): string {
+  const question = String(inputQuestion ?? '').trim();
+  return question || fallback;
+}
 // ============================================================
 // Deterministic asset URL + tool input resolution
 // ============================================================
@@ -3529,71 +3602,38 @@ function createNativeAgentTools(args: {
   const sessionAssets = bootstrap.sessionAssets;
 
   function buildAssetReference(asset: SessionAsset): string {
-    return `asset://${asset.id}`;
+    return buildCanonicalAssetRef(asset.id);
   }
 
-  async function buildAssetSignedUrl(asset: SessionAsset): Promise<string | null> {
+  async function buildAssetAccessUrl(asset: SessionAsset): Promise<string | null> {
     return (await buildSignedAssetUrl(virtualRuntime, asset)) ?? asset.url ?? null;
   }
 
-  function isTextLikeAssetFilename(filename: string): boolean {
-    const ext = String(filename ?? "").split(".").pop()?.toLowerCase() ?? "";
-    return [
-      "txt", "md", "markdown", "json", "jsonl", "csv", "ts", "tsx", "js", "jsx", "mjs", "cjs",
-      "py", "rb", "go", "java", "kt", "swift", "php", "rs", "cpp", "cc", "cxx", "c", "h", "hpp",
-      "cs", "html", "css", "scss", "less", "xml", "yaml", "yml", "ini", "conf", "toml", "env",
-      "log", "sql", "sh", "bash", "zsh", "ps1", "dockerfile",
-    ].includes(ext);
-  }
+  async function generateAssetInspectionWithFallback(args: {
+    modelCandidates: Array<string | null | undefined>;
+    messages: any[];
+  }): Promise<{ text: string; modelName: string }> {
+    let lastError: unknown = null;
 
-  function isProbablyReadableText(textValue: string | null | undefined): boolean {
-    const value = String(textValue ?? "");
-    if (!value.trim()) return false;
+    for (const modelName of dedupeNonEmptyStrings(args.modelCandidates)) {
+      try {
+        const result = await generateText({
+          model: openai.chat(modelName),
+          messages: args.messages as any,
+        } as any);
 
-    const sample = value.slice(0, 4000);
-    if (!sample) return false;
+        const text = String(result.text ?? '').trim();
+        if (!text) {
+          throw new Error(`Asset inspection produced no text for model ${modelName}`);
+        }
 
-    let readable = 0;
-    for (const char of sample) {
-      const code = char.charCodeAt(0);
-      const isCommonWhitespace = char === "\n" || char === "\r" || char === "\t";
-      const isPrintable = code >= 32 && code !== 65533;
-      if (isCommonWhitespace || isPrintable) readable += 1;
+        return { text, modelName };
+      } catch (error) {
+        lastError = error;
+      }
     }
 
-    return readable / sample.length >= 0.85;
-  }
-
-  function inferInspectableTextAsset(asset: SessionAsset, loaded: LoadedSessionAsset): boolean {
-    return (
-      isTextualMimeType(loaded.mimeType) ||
-      isTextLikeAssetFilename(loaded.filename || asset.filename) ||
-      isProbablyReadableText(loaded.textPreview) ||
-      isProbablyReadableText(tryUtf8FromBase64(loaded.base64))
-    );
-  }
-
-  async function runAssetInspectionText(args: {
-    modelName: string;
-    prompt?: string;
-    messages?: Array<{ role: string; content: any }>;
-  }): Promise<string> {
-    const request: any = {
-      model: openai(args.modelName),
-    };
-
-    if (args.messages) {
-      request.messages = args.messages;
-    } else {
-      request.prompt = args.prompt;
-    }
-
-    if (shouldSendTemperature(args.modelName, 0.2)) {
-      request.temperature = 0.2;
-    }
-
-    const result = await generateText(request);
-    return String(result.text ?? "").trim();
+    throw lastError ?? new Error('No asset inspection model succeeded');
   }
 
   const scheduleMessage = tool({
@@ -3815,209 +3855,16 @@ function createNativeAgentTools(args: {
     },
   });
 
-
-  const inspectSessionAsset = tool({
-    description:
-      "Inspect the contents of the most recent uploaded asset or a specific session asset. Use this when the user asks what an image, screenshot, PDF, file, JSON, code file, or log contains.",
-    inputSchema: zodSchema(
-      z.object({
-        assetId: z.string().optional(),
-        question: z.string().max(4000).optional(),
-        fetchRemote: z.boolean().optional(),
-        maxTextChars: z.number().int().min(500).max(40000).optional(),
-      })
-    ),
-    execute: async (input: {
-      assetId?: string;
-      question?: string;
-      fetchRemote?: boolean;
-      maxTextChars?: number;
-    }) => {
-      const selectedAsset = input.assetId
-        ? sessionAssets.find((x) => x.id === input.assetId)
-        : sessionAssets[sessionAssets.length - 1];
-
-      if (!selectedAsset) {
-        return {
-          ok: false,
-          error: "No session assets are available to inspect.",
-        };
-      }
-
-      const fetchRemote = input.fetchRemote ?? true;
-      const maxTextChars = input.maxTextChars ?? 16000;
-      const question = String(input.question ?? "").trim();
-      const signedUrl = await buildAssetSignedUrl(selectedAsset);
-      const inspectionModelName = env("ASSET_INSPECTION_MODEL_NAME") ?? bootstrap.smartModel ?? "gpt-5";
-
-      try {
-        const loaded = await loadSessionAssetContent(selectedAsset, { fetchRemote });
-        const base = {
-          ok: true,
-          asset: describeSessionAsset(selectedAsset),
-          ref: buildAssetReference(selectedAsset),
-          url: signedUrl,
-          filename: loaded.filename,
-          mimeType: loaded.mimeType,
-          sizeBytes: loaded.sizeBytes,
-          question: question || null,
-        };
-
-        if (inferInspectableTextAsset(selectedAsset, loaded)) {
-          const decodedText = loaded.textPreview ?? tryUtf8FromBase64(loaded.base64) ?? "";
-          const preview = truncateForModelContext(decodedText, maxTextChars);
-          const analysis = await runAssetInspectionText({
-            modelName: inspectionModelName,
-            prompt: [
-              "You are inspecting a user-uploaded text file.",
-              "Explain what it contains and answer the user's question if one is provided.",
-              "If the file looks like code, mention the language and summarize what it does.",
-              "If the file looks like JSON, CSV, logs, or config, describe the structure and important contents.",
-              "Do not invent content beyond the provided text.",
-              "",
-              `Filename: ${loaded.filename}`,
-              `MIME Type: ${loaded.mimeType}`,
-              question ? `User question: ${question}` : "User question: Describe what this file contains.",
-              "",
-              "File content:",
-              preview,
-            ].join("\n"),
-          });
-
-          return {
-            ...base,
-            inspectionMode: "text",
-            textPreview: truncateText(decodedText, 6000),
-            analysis,
-          };
-        }
-
-        if (loaded.mimeType.startsWith("image/")) {
-          const imageInput = signedUrl ?? base64ToBytes(loaded.base64);
-          const analysis = await runAssetInspectionText({
-            modelName: inspectionModelName,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: [
-                      "Inspect this uploaded image and describe what it contains.",
-                      "Include visible text, UI elements, objects, people, charts, diagrams, and other important details.",
-                      question ? `User question: ${question}` : "User question: Describe exactly what you see.",
-                    ].join("\n"),
-                  },
-                  {
-                    type: "image",
-                    image: imageInput,
-                  },
-                ],
-              },
-            ],
-          });
-
-          return {
-            ...base,
-            inspectionMode: "image",
-            analysis,
-          };
-        }
-
-        if (loaded.mimeType === "application/pdf") {
-          const pdfInput = signedUrl ?? base64ToBytes(loaded.base64);
-          const analysis = await runAssetInspectionText({
-            modelName: inspectionModelName,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: [
-                      "Inspect this uploaded PDF and explain what it contains.",
-                      "Summarize the document, mention major sections, and answer the user's question if one is provided.",
-                      question ? `User question: ${question}` : "User question: What does this PDF contain?",
-                    ].join("\n"),
-                  },
-                  {
-                    type: "file",
-                    data: pdfInput,
-                    mediaType: "application/pdf",
-                    filename: loaded.filename,
-                  },
-                ],
-              },
-            ],
-          });
-
-          return {
-            ...base,
-            inspectionMode: "pdf",
-            analysis,
-          };
-        }
-
-        if (loaded.mimeType.startsWith("audio/")) {
-          const audioModelName = env("AUDIO_INSPECTION_MODEL_NAME") ?? "gpt-4o-audio-preview";
-          const audioInput = signedUrl ?? base64ToBytes(loaded.base64);
-          const audioResult = await generateText({
-            model: openai.chat(audioModelName),
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: question || "Transcribe this audio and summarize what it says.",
-                  },
-                  {
-                    type: "file",
-                    data: audioInput,
-                    mediaType: loaded.mimeType,
-                    filename: loaded.filename,
-                  },
-                ],
-              },
-            ],
-          });
-
-          return {
-            ...base,
-            inspectionMode: "audio",
-            analysis: String(audioResult.text ?? "").trim(),
-          };
-        }
-
-        return {
-          ...base,
-          inspectionMode: "metadata",
-          analysis:
-            `I could not directly inspect the binary contents of ${loaded.filename} (${loaded.mimeType}). ` +
-            `I can still provide metadata and a signed URL for an external tool if needed.`,
-        };
-      } catch (error: any) {
-        return {
-          ok: false,
-          asset: describeSessionAsset(selectedAsset),
-          ref: buildAssetReference(selectedAsset),
-          url: signedUrl,
-          error: String(error?.message ?? error ?? "Unknown inspect_session_asset error"),
-        };
-      }
-    },
-  });
-
   const listSessionAssets = tool({
     description:
-      "List images, audio, video, and files detected in the current conversation history, including canonical IDs and signed APP_BASE_URL URLs for follow-up asset preparation.",
+      "List images, audio, video, and files detected in the current conversation history, including canonical asset references and any signed URLs available for follow-up preparation.",
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
       const assets = await Promise.all(
         sessionAssets.map(async (asset) => ({
           ...describeSessionAsset(asset),
           ref: buildAssetReference(asset),
-          url: await buildAssetSignedUrl(asset),
+          url: await buildAssetAccessUrl(asset),
         }))
       );
 
@@ -4093,11 +3940,12 @@ function createNativeAgentTools(args: {
           loaded = result.loaded;
         }
 
-        const signedUrl = await buildAssetSignedUrl(asset);
+        const signedUrl = await buildAssetAccessUrl(asset);
 
         return {
           ok: true,
           ref: buildAssetReference(asset),
+          url: signedUrl,
           ...buildPreparedAssetPayload(asset, {
             loaded,
             materialized,
@@ -4110,6 +3958,240 @@ function createNativeAgentTools(args: {
           ok: false,
           asset: describeSessionAsset(asset),
           error: String(error?.message ?? error ?? "Unknown prepare_session_asset error"),
+        };
+      }
+    },
+  });
+
+  const inspectSessionAsset = tool({
+    description:
+      "Inspect and describe an uploaded session asset so the assistant can answer what an image, PDF, code file, JSON file, log, text document, or audio clip contains.",
+    inputSchema: zodSchema(
+      z.object({
+        assetId: z.string().min(1),
+        question: z.string().max(2000).optional(),
+        fetchRemote: z.boolean().optional(),
+        maxChars: z.number().int().min(500).max(40000).optional(),
+      })
+    ),
+    execute: async (input: {
+      assetId: string;
+      question?: string;
+      fetchRemote?: boolean;
+      maxChars?: number;
+    }) => {
+      const asset = sessionAssets.find((x) => x.id === input.assetId);
+      if (!asset) {
+        return {
+          ok: false,
+          error: `Unknown assetId "${input.assetId}"`,
+          availableAssetIds: sessionAssets.map((x) => x.id),
+        };
+      }
+
+      try {
+        const loaded = await loadSessionAssetContent(asset, {
+          fetchRemote: input.fetchRemote ?? true,
+        });
+        const bytes = base64ToBytes(loaded.base64);
+        const mimeType = String(loaded.mimeType || asset.mimeType || 'application/octet-stream').toLowerCase();
+        const maxChars = Math.max(500, Math.min(40000, input.maxChars ?? 12000));
+        const ref = buildAssetReference(asset);
+        const url = await buildAssetAccessUrl(asset);
+
+        if (loaded.textPreview != null || isTextualMimeType(mimeType)) {
+          const decodedText = loaded.textPreview ?? tryUtf8FromBase64(loaded.base64) ?? '';
+          const excerpt = truncateForModelContext(decodedText, Math.min(maxChars, 16000));
+          const question = createAssetInspectionQuestion(
+            input.question,
+            'Explain what this file contains. Summarize it clearly and call out the most important details.'
+          );
+          const language = guessLanguageFromAsset(loaded.filename, mimeType);
+          const modelResult = await generateAssetInspectionWithFallback({
+            modelCandidates: [
+              env('ASSET_TEXT_INSPECTION_MODEL_NAME'),
+              env('ASSET_INSPECTION_MODEL_NAME'),
+              bootstrap.smartModel,
+              bootstrap.modelName,
+              'gpt-4.1-mini',
+              'gpt-4.1',
+              'gpt-4o-mini',
+              'gpt-4o',
+            ],
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: [
+                      question,
+                      '',
+                      `Filename: ${loaded.filename}`,
+                      `Media type: ${mimeType}`,
+                      `Best language tag: ${language}`,
+                      '',
+                      'Respond with a concise explanation of what the file contains. If it is code, explain the purpose and important functions. If it is JSON, explain the schema and key fields. If it is a log, explain the important events or errors.',
+                      '',
+                      `File excerpt:
+
+\`\`\`${language}
+${excerpt}
+\`\`\``,
+                    ].join('\n'),
+                  },
+                ],
+              },
+            ],
+          });
+
+          return {
+            ok: true,
+            ref,
+            url,
+            asset: describeSessionAsset(asset),
+            inspectionMode: 'text',
+            analysis: modelResult.text,
+            modelName: modelResult.modelName,
+            contentPreview: truncateText(decodedText, maxChars),
+          };
+        }
+
+        if (mimeType.startsWith('image/')) {
+          const question = createAssetInspectionQuestion(
+            input.question,
+            'Describe exactly what is visible in this image. Mention any text, UI elements, diagrams, objects, people, charts, code, or warnings you can see.'
+          );
+          const modelResult = await generateAssetInspectionWithFallback({
+            modelCandidates: [
+              env('ASSET_IMAGE_INSPECTION_MODEL_NAME'),
+              env('ASSET_INSPECTION_MODEL_NAME'),
+              bootstrap.smartModel,
+              bootstrap.modelName,
+              'gpt-4.1-mini',
+              'gpt-4.1',
+              'gpt-4o-mini',
+              'gpt-4o',
+            ],
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: question },
+                  { type: 'image', image: bytes },
+                ],
+              },
+            ],
+          });
+
+          return {
+            ok: true,
+            ref,
+            url,
+            asset: describeSessionAsset(asset),
+            inspectionMode: 'image',
+            analysis: modelResult.text,
+            modelName: modelResult.modelName,
+          };
+        }
+
+        if (mimeType === 'application/pdf') {
+          const question = createAssetInspectionQuestion(
+            input.question,
+            'Read this PDF and explain what it contains. Summarize the main points and mention any key tables, sections, or actions.'
+          );
+          const modelResult = await generateAssetInspectionWithFallback({
+            modelCandidates: [
+              env('ASSET_PDF_INSPECTION_MODEL_NAME'),
+              env('ASSET_INSPECTION_MODEL_NAME'),
+              bootstrap.smartModel,
+              bootstrap.modelName,
+              'gpt-4.1-mini',
+              'gpt-4.1',
+              'gpt-4o',
+            ],
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: question },
+                  {
+                    type: 'file',
+                    data: bytes,
+                    mediaType: mimeType,
+                    filename: loaded.filename,
+                  },
+                ],
+              },
+            ],
+          });
+
+          return {
+            ok: true,
+            ref,
+            url,
+            asset: describeSessionAsset(asset),
+            inspectionMode: 'pdf',
+            analysis: modelResult.text,
+            modelName: modelResult.modelName,
+          };
+        }
+
+        if (mimeType.startsWith('audio/')) {
+          const question = createAssetInspectionQuestion(
+            input.question,
+            'Transcribe this audio and summarize what it says.'
+          );
+          const modelResult = await generateAssetInspectionWithFallback({
+            modelCandidates: [
+              env('AUDIO_INSPECTION_MODEL_NAME'),
+              'gpt-4o-audio-preview',
+            ],
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: question },
+                  {
+                    type: 'file',
+                    data: bytes,
+                    mediaType: mimeType,
+                    filename: loaded.filename,
+                  },
+                ],
+              },
+            ],
+          });
+
+          return {
+            ok: true,
+            ref,
+            url,
+            asset: describeSessionAsset(asset),
+            inspectionMode: 'audio',
+            analysis: modelResult.text,
+            modelName: modelResult.modelName,
+          };
+        }
+
+        return {
+          ok: true,
+          ref,
+          url,
+          asset: describeSessionAsset(asset),
+          inspectionMode: 'metadata',
+          analysis: 'This asset type is not directly inspectable by the current built-in inspection flow. I can still provide metadata, stage it for external tools, or analyze it if it can be converted to text, image, audio, or PDF.',
+          metadata: {
+            filename: loaded.filename,
+            mimeType,
+            sizeBytes: loaded.sizeBytes,
+          },
+        };
+      } catch (error: any) {
+        return {
+          ok: false,
+          asset: describeSessionAsset(asset),
+          error: String(error?.message ?? error ?? 'Unknown inspect_session_asset error'),
         };
       }
     },
@@ -4141,7 +4223,7 @@ function createNativeAgentTools(args: {
           includeBase64: input.includeBase64 ?? false,
         });
 
-        const signedUrl = await buildAssetSignedUrl(asset);
+        const signedUrl = await buildAssetAccessUrl(asset);
 
         return {
           ok: true,
@@ -4376,8 +4458,8 @@ function createNativeAgentTools(args: {
     get_virtual_file_url: getVirtualFileUrl,
     virtual_shell: virtualShell,
     list_session_assets: listSessionAssets,
-    inspect_session_asset: inspectSessionAsset,
     prepare_session_asset: prepareSessionAsset,
+    inspect_session_asset: inspectSessionAsset,
     materialize_session_asset: materializeSessionAsset,
   };
 }
@@ -4452,14 +4534,13 @@ function buildAgentSystemPrompt(args: {
     "",
     "MODALITIES:",
     `- Session asset count available via tools: ${args.bootstrap.sessionAssets.length}`,
-    "- Use list_session_assets to inspect assets.",
-    "- Use inspect_session_asset when the user asks what an uploaded image, screenshot, PDF, JSON, code file, log, or document contains.",
-    "- Use prepare_session_asset first for metadata, signed APP_BASE_URL URLs, and upload hints.",
+    "- Use list_session_assets to inspect which assets are available.",
+    "- Use inspect_session_asset when the user asks what an uploaded image, screenshot, PDF, JSON file, code file, log, text document, or audio clip contains.",
+    "- Use prepare_session_asset for metadata, signed APP_BASE_URL URLs, and upload hints when an external tool needs the asset.",
     "- When calling external tools, pass asset references like asset://asset_m6_p2.",
-    "- The asset wrapper can resolve those refs to signed APP_BASE_URL VFS URLs for URL-style tools or s3keys for upload-style tools.",
-    "- The execution wrapper resolves asset references deterministically before the external tool runs, staging asset bytes into Composio storage when a tool expects an s3key-backed upload.",
+    "- The asset wrapper can resolve those refs to signed APP_BASE_URL URLs for URL-style tools or s3keys for upload-style tools.",
+    "- After inspect_session_asset returns, answer the user directly instead of repeatedly calling list_session_assets or prepare_session_asset.",
     "- Only request inline content when the target tool really needs it.",
-    "- After inspect_session_asset returns, answer directly instead of repeatedly calling list_session_assets or prepare_session_asset.",
     "",
     "SSH:",
     "- Use ssh_exec only for real host actions the user wants.",
