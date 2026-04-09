@@ -557,6 +557,128 @@ function tryUtf8FromBase64(base64: string): string | null {
   }
 }
 
+function normalizeBase64String(value: string): string {
+  const compact = String(value ?? '')
+    .replace(/\s+/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+
+  if (!compact) return compact;
+
+  const remainder = compact.length % 4;
+  return remainder === 0 ? compact : `${compact}${'='.repeat(4 - remainder)}`;
+}
+
+function isLikelyBinaryBytes(bytes: Uint8Array): boolean {
+  if (!bytes.length) return false;
+
+  const sample = bytes.subarray(0, Math.min(bytes.length, 512));
+  let suspicious = 0;
+
+  for (const byte of sample) {
+    if (byte === 0) {
+      suspicious += 3;
+      continue;
+    }
+
+    if (byte < 9 || (byte > 13 && byte < 32) || byte === 127) {
+      suspicious += 1;
+    }
+  }
+
+  return suspicious / Math.max(1, sample.length) > 0.08;
+}
+
+function detectMimeTypeFromBytes(bytes: Uint8Array, fallbackMimeType?: string, filename?: string): string {
+  const toAscii = (start: number, length: number) =>
+    String.fromCharCode(...Array.from(bytes.subarray(start, start + length)));
+
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return 'image/png';
+  }
+
+  if (bytes.length >= 6) {
+    const gifHeader = toAscii(0, 6);
+    if (gifHeader === 'GIF87a' || gifHeader === 'GIF89a') {
+      return 'image/gif';
+    }
+  }
+
+  if (bytes.length >= 12 && toAscii(0, 4) === 'RIFF' && toAscii(8, 4) === 'WEBP') {
+    return 'image/webp';
+  }
+
+  if (bytes.length >= 5 && toAscii(0, 5) === '%PDF-') {
+    return 'application/pdf';
+  }
+
+  if (bytes.length >= 4 && toAscii(0, 4) === 'OggS') {
+    return 'audio/ogg';
+  }
+
+  if (bytes.length >= 12 && toAscii(0, 4) === 'RIFF' && toAscii(8, 4) === 'WAVE') {
+    return 'audio/wav';
+  }
+
+  if (bytes.length >= 3 && toAscii(0, 3) === 'ID3') {
+    return 'audio/mpeg';
+  }
+
+  if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) {
+    return 'audio/mpeg';
+  }
+
+  if (bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04) {
+    return 'application/zip';
+  }
+
+  const fallback = String(fallbackMimeType ?? '').trim().toLowerCase();
+  if (fallback && fallback !== 'application/octet-stream' && fallback !== 'text/plain') {
+    return fallback;
+  }
+
+  return inferMimeFromFilename(filename ?? '') || fallback || 'application/octet-stream';
+}
+
+function tryDecodeBase64BinaryString(
+  value: string,
+  fallbackMimeType?: string,
+  filename?: string
+): { bytes: Uint8Array; mimeType: string } | null {
+  const raw = String(value ?? '').trim();
+  if (!raw || raw.length < 64) return null;
+  if (!/^[A-Za-z0-9+/_=\s-]+$/.test(raw)) return null;
+
+  try {
+    const normalized = normalizeBase64String(raw);
+    const bytes = base64ToBytes(normalized);
+    if (bytes.length < 16) return null;
+
+    const mimeType = detectMimeTypeFromBytes(bytes, fallbackMimeType, filename);
+    if (mimeType === 'application/octet-stream' && !isLikelyBinaryBytes(bytes)) {
+      return null;
+    }
+
+    return { bytes, mimeType };
+  } catch {
+    return null;
+  }
+}
+
 function isTextualMimeType(mimeType: string): boolean {
   const mime = String(mimeType ?? "").toLowerCase();
   return (
@@ -663,6 +785,16 @@ function coerceAssetSource(payload: unknown): {
       const base64 = stripDataUrlPrefix(payload);
       return { source: "data_url", dataUrl: payload, base64, sizeBytes: estimateBase64Bytes(base64) };
     }
+
+    const decodedBinary = tryDecodeBase64BinaryString(payload);
+    if (decodedBinary) {
+      return {
+        source: "base64",
+        base64: bytesToBase64(decodedBinary.bytes),
+        sizeBytes: decodedBinary.bytes.byteLength,
+      };
+    }
+
     return { source: "text", text: payload, sizeBytes: utf8ByteLength(payload) };
   }
 
@@ -1652,6 +1784,23 @@ async function loadSessionAssetContent(
   }
 
   if (asset.text != null) {
+    const decodedBinary = tryDecodeBase64BinaryString(asset.text, asset.mimeType, asset.filename);
+    if (decodedBinary) {
+      const base64 = bytesToBase64(decodedBinary.bytes);
+      const mimeType = detectMimeTypeFromBytes(decodedBinary.bytes, asset.mimeType, asset.filename);
+      const textPreview = isTextualMimeType(mimeType) ? bytesToUtf8(decodedBinary.bytes) : null;
+
+      return {
+        base64,
+        mimeType,
+        filename: asset.filename,
+        sizeBytes: decodedBinary.bytes.byteLength,
+        source: "base64",
+        textPreview,
+        dataUrl: `data:${mimeType};base64,${base64}`,
+      };
+    }
+
     const base64 = utf8ToBase64(asset.text);
     return {
       base64,
@@ -3618,7 +3767,7 @@ function createNativeAgentTools(args: {
     for (const modelName of dedupeNonEmptyStrings(args.modelCandidates)) {
       try {
         const result = await generateText({
-          model: openai.chat(modelName),
+          model: openai(modelName),
           messages: args.messages as any,
         } as any);
 
@@ -3634,6 +3783,50 @@ function createNativeAgentTools(args: {
     }
 
     throw lastError ?? new Error('No asset inspection model succeeded');
+  }
+
+  async function generateImageInspectionWithFallback(args: {
+    modelCandidates: Array<string | null | undefined>;
+    question: string;
+    bytes: Uint8Array;
+    dataUrl?: string | null;
+    url?: string | null;
+  }): Promise<{ text: string; modelName: string }> {
+    const imageCandidates = [args.bytes, args.dataUrl ?? undefined, args.url ?? undefined].filter(
+      (candidate): candidate is Uint8Array | string => candidate !== undefined && candidate !== null
+    );
+
+    let lastError: unknown = null;
+
+    for (const modelName of dedupeNonEmptyStrings(args.modelCandidates)) {
+      for (const image of imageCandidates) {
+        try {
+          const result = await generateText({
+            model: openai(modelName),
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: args.question },
+                  { type: 'image', image },
+                ],
+              },
+            ] as any,
+          } as any);
+
+          const text = String(result.text ?? '').trim();
+          if (!text) {
+            throw new Error(`Asset inspection produced no text for model ${modelName}`);
+          }
+
+          return { text, modelName };
+        } catch (error) {
+          lastError = error;
+        }
+      }
+    }
+
+    throw lastError ?? new Error('No image inspection model succeeded');
   }
 
   const scheduleMessage = tool({
@@ -3994,19 +4187,145 @@ function createNativeAgentTools(args: {
           fetchRemote: input.fetchRemote ?? true,
         });
         const bytes = base64ToBytes(loaded.base64);
-        const mimeType = String(loaded.mimeType || asset.mimeType || 'application/octet-stream').toLowerCase();
+        const fallbackMimeType = String(loaded.mimeType || asset.mimeType || 'application/octet-stream').toLowerCase();
+        const effectiveMimeType = detectMimeTypeFromBytes(bytes, fallbackMimeType, loaded.filename).toLowerCase();
         const maxChars = Math.max(500, Math.min(40000, input.maxChars ?? 12000));
         const ref = buildAssetReference(asset);
         const url = await buildAssetAccessUrl(asset);
+        const decodedText =
+          loaded.textPreview ??
+          (isTextualMimeType(effectiveMimeType) ? tryUtf8FromBase64(loaded.base64) : null) ??
+          '';
+        const imageLike = effectiveMimeType.startsWith('image/') || asset.kind === 'image';
+        const pdfLike = effectiveMimeType === 'application/pdf' || loaded.filename.toLowerCase().endsWith('.pdf');
+        const audioLike = effectiveMimeType.startsWith('audio/') || asset.kind === 'audio';
+        const textLike = isTextualMimeType(effectiveMimeType);
 
-        if (loaded.textPreview != null || isTextualMimeType(mimeType)) {
-          const decodedText = loaded.textPreview ?? tryUtf8FromBase64(loaded.base64) ?? '';
+        if (imageLike) {
+          const question = createAssetInspectionQuestion(
+            input.question,
+            'Describe exactly what is visible in this image. Mention any text, UI elements, diagrams, objects, people, charts, code, or warnings you can see.'
+          );
+          const modelResult = await generateImageInspectionWithFallback({
+            modelCandidates: [
+              env('ASSET_IMAGE_INSPECTION_MODEL_NAME'),
+              env('ASSET_INSPECTION_MODEL_NAME'),
+              bootstrap.smartModel,
+              bootstrap.modelName,
+              'gpt-5',
+              'gpt-4.1',
+              'gpt-4.1-mini',
+              'gpt-4o',
+              'gpt-4o-mini',
+            ],
+            question,
+            bytes,
+            dataUrl: loaded.dataUrl ?? null,
+            url,
+          });
+
+          return {
+            ok: true,
+            ref,
+            url,
+            asset: describeSessionAsset(asset),
+            inspectionMode: 'image',
+            analysis: modelResult.text,
+            modelName: modelResult.modelName,
+            mimeType: effectiveMimeType,
+          };
+        }
+
+        if (pdfLike) {
+          const question = createAssetInspectionQuestion(
+            input.question,
+            'Read this PDF and explain what it contains. Summarize the main points and mention any key tables, sections, or actions.'
+          );
+          const modelResult = await generateAssetInspectionWithFallback({
+            modelCandidates: [
+              env('ASSET_PDF_INSPECTION_MODEL_NAME'),
+              env('ASSET_INSPECTION_MODEL_NAME'),
+              bootstrap.smartModel,
+              bootstrap.modelName,
+              'gpt-5',
+              'gpt-4.1',
+              'gpt-4.1-mini',
+              'gpt-4o',
+            ],
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: question },
+                  {
+                    type: 'file',
+                    data: bytes,
+                    mediaType: 'application/pdf',
+                    filename: loaded.filename,
+                  },
+                ],
+              },
+            ],
+          });
+
+          return {
+            ok: true,
+            ref,
+            url,
+            asset: describeSessionAsset(asset),
+            inspectionMode: 'pdf',
+            analysis: modelResult.text,
+            modelName: modelResult.modelName,
+            mimeType: effectiveMimeType,
+          };
+        }
+
+        if (audioLike) {
+          const question = createAssetInspectionQuestion(
+            input.question,
+            'Transcribe this audio and summarize what it says.'
+          );
+          const modelResult = await generateAssetInspectionWithFallback({
+            modelCandidates: [
+              env('AUDIO_INSPECTION_MODEL_NAME'),
+              'gpt-4o-audio-preview',
+              'gpt-4o',
+            ],
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: question },
+                  {
+                    type: 'file',
+                    data: bytes,
+                    mediaType: effectiveMimeType,
+                    filename: loaded.filename,
+                  },
+                ],
+              },
+            ],
+          });
+
+          return {
+            ok: true,
+            ref,
+            url,
+            asset: describeSessionAsset(asset),
+            inspectionMode: 'audio',
+            analysis: modelResult.text,
+            modelName: modelResult.modelName,
+            mimeType: effectiveMimeType,
+          };
+        }
+
+        if (textLike || decodedText) {
           const excerpt = truncateForModelContext(decodedText, Math.min(maxChars, 16000));
           const question = createAssetInspectionQuestion(
             input.question,
             'Explain what this file contains. Summarize it clearly and call out the most important details.'
           );
-          const language = guessLanguageFromAsset(loaded.filename, mimeType);
+          const language = guessLanguageFromAsset(loaded.filename, effectiveMimeType);
           const modelResult = await generateAssetInspectionWithFallback({
             modelCandidates: [
               env('ASSET_TEXT_INSPECTION_MODEL_NAME'),
@@ -4028,7 +4347,7 @@ function createNativeAgentTools(args: {
                       question,
                       '',
                       `Filename: ${loaded.filename}`,
-                      `Media type: ${mimeType}`,
+                      `Media type: ${effectiveMimeType}`,
                       `Best language tag: ${language}`,
                       '',
                       'Respond with a concise explanation of what the file contains. If it is code, explain the purpose and important functions. If it is JSON, explain the schema and key fields. If it is a log, explain the important events or errors.',
@@ -4053,124 +4372,8 @@ ${excerpt}
             inspectionMode: 'text',
             analysis: modelResult.text,
             modelName: modelResult.modelName,
+            mimeType: effectiveMimeType,
             contentPreview: truncateText(decodedText, maxChars),
-          };
-        }
-
-        if (mimeType.startsWith('image/')) {
-          const question = createAssetInspectionQuestion(
-            input.question,
-            'Describe exactly what is visible in this image. Mention any text, UI elements, diagrams, objects, people, charts, code, or warnings you can see.'
-          );
-          const modelResult = await generateAssetInspectionWithFallback({
-            modelCandidates: [
-              env('ASSET_IMAGE_INSPECTION_MODEL_NAME'),
-              env('ASSET_INSPECTION_MODEL_NAME'),
-              bootstrap.smartModel,
-              bootstrap.modelName,
-              'gpt-4.1-mini',
-              'gpt-4.1',
-              'gpt-4o-mini',
-              'gpt-4o',
-            ],
-            messages: [
-              {
-                role: 'user',
-                content: [
-                  { type: 'text', text: question },
-                  { type: 'image', image: bytes },
-                ],
-              },
-            ],
-          });
-
-          return {
-            ok: true,
-            ref,
-            url,
-            asset: describeSessionAsset(asset),
-            inspectionMode: 'image',
-            analysis: modelResult.text,
-            modelName: modelResult.modelName,
-          };
-        }
-
-        if (mimeType === 'application/pdf') {
-          const question = createAssetInspectionQuestion(
-            input.question,
-            'Read this PDF and explain what it contains. Summarize the main points and mention any key tables, sections, or actions.'
-          );
-          const modelResult = await generateAssetInspectionWithFallback({
-            modelCandidates: [
-              env('ASSET_PDF_INSPECTION_MODEL_NAME'),
-              env('ASSET_INSPECTION_MODEL_NAME'),
-              bootstrap.smartModel,
-              bootstrap.modelName,
-              'gpt-4.1-mini',
-              'gpt-4.1',
-              'gpt-4o',
-            ],
-            messages: [
-              {
-                role: 'user',
-                content: [
-                  { type: 'text', text: question },
-                  {
-                    type: 'file',
-                    data: bytes,
-                    mediaType: mimeType,
-                    filename: loaded.filename,
-                  },
-                ],
-              },
-            ],
-          });
-
-          return {
-            ok: true,
-            ref,
-            url,
-            asset: describeSessionAsset(asset),
-            inspectionMode: 'pdf',
-            analysis: modelResult.text,
-            modelName: modelResult.modelName,
-          };
-        }
-
-        if (mimeType.startsWith('audio/')) {
-          const question = createAssetInspectionQuestion(
-            input.question,
-            'Transcribe this audio and summarize what it says.'
-          );
-          const modelResult = await generateAssetInspectionWithFallback({
-            modelCandidates: [
-              env('AUDIO_INSPECTION_MODEL_NAME'),
-              'gpt-4o-audio-preview',
-            ],
-            messages: [
-              {
-                role: 'user',
-                content: [
-                  { type: 'text', text: question },
-                  {
-                    type: 'file',
-                    data: bytes,
-                    mediaType: mimeType,
-                    filename: loaded.filename,
-                  },
-                ],
-              },
-            ],
-          });
-
-          return {
-            ok: true,
-            ref,
-            url,
-            asset: describeSessionAsset(asset),
-            inspectionMode: 'audio',
-            analysis: modelResult.text,
-            modelName: modelResult.modelName,
           };
         }
 
@@ -4183,7 +4386,7 @@ ${excerpt}
           analysis: 'This asset type is not directly inspectable by the current built-in inspection flow. I can still provide metadata, stage it for external tools, or analyze it if it can be converted to text, image, audio, or PDF.',
           metadata: {
             filename: loaded.filename,
-            mimeType,
+            mimeType: effectiveMimeType,
             sizeBytes: loaded.sizeBytes,
           },
         };
