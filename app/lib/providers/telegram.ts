@@ -18,6 +18,7 @@ type TelegramChatAction =
   | "upload_video_note";
 
 type TelegramParseMode = "HTML";
+type TelegramMediaInput = string | Blob | File;
 
 type TelegramPreparedText = {
   html: string;
@@ -306,6 +307,58 @@ function shouldRetryWithoutHtml(error: unknown): boolean {
   return TELEGRAM_ENTITY_ERROR_RE.test(message);
 }
 
+function appendTelegramFormValue(form: FormData, key: string, value: unknown): void {
+  if (value === undefined || value === null) return;
+  form.append(key, typeof value === "string" ? value : String(value));
+}
+
+function appendTelegramMediaInput(
+  form: FormData,
+  key: string,
+  media: TelegramMediaInput,
+  fallbackFilename: string
+): void {
+  if (typeof media === "string") {
+    form.append(key, media);
+    return;
+  }
+
+  const maybeName = (media as any)?.name;
+  const filename = typeof maybeName === "string" && maybeName.trim() ? maybeName.trim() : fallbackFilename;
+  form.append(key, media, filename);
+}
+
+async function telegramApiCallFormData<T>(method: string, form: FormData): Promise<T> {
+  const token = envRequired("TELEGRAM_BOT_TOKEN");
+  const url = `https://api.telegram.org/bot${token}/${method}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    body: form,
+  });
+
+  const raw = await res.text();
+
+  let parsed: TelegramApiOk<T> | TelegramApiErr | null = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+
+  if (parsed && (parsed as any).ok === false) {
+    const err = parsed as TelegramApiErr;
+    const code = err.error_code ?? res.status;
+    const desc = err.description ?? raw;
+    throw new Error(`Telegram ${method} failed: ${code} ${desc}`);
+  }
+
+  if (!res.ok) throw new Error(`Telegram ${method} HTTP ${res.status}: ${raw}`);
+  if (!parsed || (parsed as any).ok !== true) throw new Error(`Telegram ${method} bad response: ${raw}`);
+
+  return (parsed as TelegramApiOk<T>).result;
+}
+
 async function telegramApiCall<T>(method: string, payload: Record<string, unknown>): Promise<T> {
   const token = envRequired("TELEGRAM_BOT_TOKEN");
   const url = `https://api.telegram.org/bot${token}/${method}`;
@@ -405,6 +458,195 @@ export async function telegramSendMessage(
   }
 }
 
+
+function buildTelegramCaptionPayload(
+  caption: string | undefined,
+  disableNotification: boolean | undefined
+): { caption?: string; parse_mode?: TelegramParseMode; disable_notification: boolean; plainCaption?: string } {
+  if (!caption) {
+    return {
+      disable_notification: disableNotification ?? false,
+    };
+  }
+
+  const prepared = telegramFormatMessageHtml(caption);
+  return {
+    caption: prepared.html,
+    parse_mode: prepared.parseMode,
+    disable_notification: disableNotification ?? false,
+    plainCaption: prepared.plain,
+  };
+}
+
+export async function telegramSendPhoto(
+  sessionId: string,
+  photo: string,
+  opts?: { caption?: string; disableNotification?: boolean; hasSpoiler?: boolean }
+): Promise<number> {
+  const { chatId, threadId } = telegramSessionToChatAndThread(sessionId);
+  if (!chatId) throw new Error(`Invalid telegram sessionId: ${sessionId}`);
+
+  const captionPayload = buildTelegramCaptionPayload(opts?.caption, opts?.disableNotification);
+  const payload: any = {
+    chat_id: chatId,
+    photo,
+    disable_notification: captionPayload.disable_notification,
+    has_spoiler: opts?.hasSpoiler ?? false,
+  };
+  if (captionPayload.caption) {
+    payload.caption = captionPayload.caption;
+    payload.parse_mode = captionPayload.parse_mode;
+  }
+  if (threadId) payload.message_thread_id = threadId;
+
+  try {
+    const result = await telegramApiCall<{ message_id: number }>("sendPhoto", payload);
+    return result.message_id;
+  } catch (error) {
+    if (!shouldRetryWithoutHtml(error) || !captionPayload.plainCaption) throw error;
+
+    const fallbackPayload: any = {
+      ...payload,
+      caption: captionPayload.plainCaption,
+    };
+    delete fallbackPayload.parse_mode;
+
+    const result = await telegramApiCall<{ message_id: number }>("sendPhoto", fallbackPayload);
+    return result.message_id;
+  }
+}
+
+export async function telegramSendDocument(
+  sessionId: string,
+  document: string,
+  opts?: { caption?: string; disableNotification?: boolean }
+): Promise<number> {
+  const { chatId, threadId } = telegramSessionToChatAndThread(sessionId);
+  if (!chatId) throw new Error(`Invalid telegram sessionId: ${sessionId}`);
+
+  const captionPayload = buildTelegramCaptionPayload(opts?.caption, opts?.disableNotification);
+  const payload: any = {
+    chat_id: chatId,
+    document,
+    disable_notification: captionPayload.disable_notification,
+  };
+  if (captionPayload.caption) {
+    payload.caption = captionPayload.caption;
+    payload.parse_mode = captionPayload.parse_mode;
+  }
+  if (threadId) payload.message_thread_id = threadId;
+
+  try {
+    const result = await telegramApiCall<{ message_id: number }>("sendDocument", payload);
+    return result.message_id;
+  } catch (error) {
+    if (!shouldRetryWithoutHtml(error) || !captionPayload.plainCaption) throw error;
+
+    const fallbackPayload: any = {
+      ...payload,
+      caption: captionPayload.plainCaption,
+    };
+    delete fallbackPayload.parse_mode;
+
+    const result = await telegramApiCall<{ message_id: number }>("sendDocument", fallbackPayload);
+    return result.message_id;
+  }
+}
+
+export async function telegramSendAudio(
+  sessionId: string,
+  audio: TelegramMediaInput,
+  opts?: {
+    caption?: string;
+    disableNotification?: boolean;
+    title?: string;
+    performer?: string;
+    duration?: number;
+    filename?: string;
+  }
+): Promise<number> {
+  const { chatId, threadId } = telegramSessionToChatAndThread(sessionId);
+  if (!chatId) throw new Error(`Invalid telegram sessionId: ${sessionId}`);
+
+  const captionPayload = buildTelegramCaptionPayload(opts?.caption, opts?.disableNotification);
+  const form = new FormData();
+  appendTelegramFormValue(form, "chat_id", chatId);
+  appendTelegramMediaInput(form, "audio", audio, opts?.filename ?? "audio.mp3");
+  appendTelegramFormValue(form, "disable_notification", captionPayload.disable_notification);
+  appendTelegramFormValue(form, "title", opts?.title);
+  appendTelegramFormValue(form, "performer", opts?.performer);
+  appendTelegramFormValue(form, "duration", opts?.duration);
+  if (threadId) appendTelegramFormValue(form, "message_thread_id", threadId);
+  if (captionPayload.caption) {
+    appendTelegramFormValue(form, "caption", captionPayload.caption);
+    appendTelegramFormValue(form, "parse_mode", captionPayload.parse_mode);
+  }
+
+  try {
+    const result = await telegramApiCallFormData<{ message_id: number }>("sendAudio", form);
+    return result.message_id;
+  } catch (error) {
+    if (!shouldRetryWithoutHtml(error) || !captionPayload.plainCaption) throw error;
+
+    const fallbackForm = new FormData();
+    appendTelegramFormValue(fallbackForm, "chat_id", chatId);
+    appendTelegramMediaInput(fallbackForm, "audio", audio, opts?.filename ?? "audio.mp3");
+    appendTelegramFormValue(fallbackForm, "disable_notification", captionPayload.disable_notification);
+    appendTelegramFormValue(fallbackForm, "title", opts?.title);
+    appendTelegramFormValue(fallbackForm, "performer", opts?.performer);
+    appendTelegramFormValue(fallbackForm, "duration", opts?.duration);
+    if (threadId) appendTelegramFormValue(fallbackForm, "message_thread_id", threadId);
+    appendTelegramFormValue(fallbackForm, "caption", captionPayload.plainCaption);
+
+    const result = await telegramApiCallFormData<{ message_id: number }>("sendAudio", fallbackForm);
+    return result.message_id;
+  }
+}
+
+export async function telegramSendVoice(
+  sessionId: string,
+  voice: TelegramMediaInput,
+  opts?: {
+    caption?: string;
+    disableNotification?: boolean;
+    duration?: number;
+    filename?: string;
+  }
+): Promise<number> {
+  const { chatId, threadId } = telegramSessionToChatAndThread(sessionId);
+  if (!chatId) throw new Error(`Invalid telegram sessionId: ${sessionId}`);
+
+  const captionPayload = buildTelegramCaptionPayload(opts?.caption, opts?.disableNotification);
+  const form = new FormData();
+  appendTelegramFormValue(form, "chat_id", chatId);
+  appendTelegramMediaInput(form, "voice", voice, opts?.filename ?? "voice.mp3");
+  appendTelegramFormValue(form, "disable_notification", captionPayload.disable_notification);
+  appendTelegramFormValue(form, "duration", opts?.duration);
+  if (threadId) appendTelegramFormValue(form, "message_thread_id", threadId);
+  if (captionPayload.caption) {
+    appendTelegramFormValue(form, "caption", captionPayload.caption);
+    appendTelegramFormValue(form, "parse_mode", captionPayload.parse_mode);
+  }
+
+  try {
+    const result = await telegramApiCallFormData<{ message_id: number }>("sendVoice", form);
+    return result.message_id;
+  } catch (error) {
+    if (!shouldRetryWithoutHtml(error) || !captionPayload.plainCaption) throw error;
+
+    const fallbackForm = new FormData();
+    appendTelegramFormValue(fallbackForm, "chat_id", chatId);
+    appendTelegramMediaInput(fallbackForm, "voice", voice, opts?.filename ?? "voice.mp3");
+    appendTelegramFormValue(fallbackForm, "disable_notification", captionPayload.disable_notification);
+    appendTelegramFormValue(fallbackForm, "duration", opts?.duration);
+    if (threadId) appendTelegramFormValue(fallbackForm, "message_thread_id", threadId);
+    appendTelegramFormValue(fallbackForm, "caption", captionPayload.plainCaption);
+
+    const result = await telegramApiCallFormData<{ message_id: number }>("sendVoice", fallbackForm);
+    return result.message_id;
+  }
+}
+
 export async function telegramEditMessageText(
   sessionId: string,
   messageId: number,
@@ -422,8 +664,6 @@ export async function telegramEditMessageText(
     parse_mode: prepared.parseMode,
     disable_web_page_preview: opts?.disableWebPreview ?? true,
   };
-  if (threadId) payload.message_thread_id = threadId;
-
   try {
     await telegramApiCall("editMessageText", payload);
   } catch (error: any) {
