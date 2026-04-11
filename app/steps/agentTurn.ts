@@ -422,6 +422,14 @@ function dirname(p: string): string {
   return s.slice(0, idx);
 }
 
+
+function basename(p: string): string {
+  const s = sanitizePath(p);
+  if (s === "/") return "";
+  const idx = s.lastIndexOf("/");
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
 function parentDirs(p: string): string[] {
   const s = sanitizePath(p);
   const parts = s.split("/").filter(Boolean);
@@ -1768,6 +1776,103 @@ function getPublicBaseUrl(): string | null {
 function getAssetSigningSecret(): string | null {
   const v = env("ASSET_URL_SIGNING_SECRET") || env("SESSION_ASSET_SIGNING_SECRET") || "";
   return v.trim() || null;
+}
+
+
+type VfsUrlEncoding = "utf8" | "base64";
+
+type BuildSignedVfsUrlOptions = {
+  filename?: string;
+  mimeType?: string;
+  encoding?: VfsUrlEncoding;
+  ttlSeconds?: number;
+  download?: boolean;
+};
+
+function buildSignedVfsPayload(args: {
+  userId: string;
+  sessionId: string;
+  path: string;
+  expiresAt: number;
+  filename: string;
+  mimeType: string;
+  encoding: VfsUrlEncoding;
+  download: boolean;
+}): string {
+  return [
+    "v1",
+    `userId=${args.userId}`,
+    `sessionId=${args.sessionId}`,
+    `path=${sanitizePath(args.path)}`,
+    `expires=${args.expiresAt}`,
+    `filename=${args.filename}`,
+    `mimeType=${args.mimeType}`,
+    `encoding=${args.encoding}`,
+    `download=${args.download ? "1" : "0"}`,
+  ].join("\n");
+}
+
+async function buildSignedVfsUrl(args: {
+  userId: string;
+  sessionId: string;
+  path: string;
+} & BuildSignedVfsUrlOptions): Promise<string | null> {
+  const baseUrl = getPublicBaseUrl();
+  const secret = getAssetSigningSecret();
+  const subtle = globalThis.crypto?.subtle;
+
+  if (!baseUrl || !secret || !subtle) return null;
+
+  const path = sanitizePath(args.path);
+  const filename = safeFilenameSegment(args.filename || basename(path) || "file");
+  const mimeType = String(args.mimeType || inferMimeFromFilename(filename) || "application/octet-stream")
+    .trim()
+    .toLowerCase();
+  const encoding: VfsUrlEncoding = args.encoding === "base64" ? "base64" : "utf8";
+  const download = args.download === true;
+  const expiresAt = Math.floor(Date.now() / 1000) + Math.max(60, args.ttlSeconds ?? 900);
+  const sig = await hmacSha256Hex(
+    secret,
+    buildSignedVfsPayload({
+      userId: args.userId,
+      sessionId: args.sessionId,
+      path,
+      expiresAt,
+      filename,
+      mimeType,
+      encoding,
+      download,
+    })
+  );
+
+  const encodedPath = path
+    .split("/")
+    .filter(Boolean)
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  const url = new URL(`${baseUrl}/api/vfs/${encodedPath}`);
+  url.searchParams.set("userId", args.userId);
+  url.searchParams.set("sessionId", args.sessionId);
+  url.searchParams.set("expires", String(expiresAt));
+  url.searchParams.set("filename", filename);
+  url.searchParams.set("mimeType", mimeType);
+  url.searchParams.set("encoding", encoding);
+  if (download) url.searchParams.set("download", "1");
+  url.searchParams.set("sig", sig);
+  return url.toString();
+}
+
+async function buildSignedVfsUrlForRuntime(
+  rt: VirtualRuntime,
+  path: string,
+  opts?: BuildSignedVfsUrlOptions
+): Promise<string | null> {
+  return await buildSignedVfsUrl({
+    userId: rt.userId,
+    sessionId: rt.sessionId,
+    path,
+    ...opts,
+  });
 }
 
 async function buildSignedAssetUrl(asset: SessionAsset, ttlSeconds = 900): Promise<string | null> {
@@ -3365,7 +3470,7 @@ export async function agentTurn(args: {
       filename: loaded.filename,
       mimeType: loaded.mimeType,
       sizeBytes: loaded.sizeBytes,
-      signedUrl: await buildSignedAssetUrl(virtualRuntime, asset),
+      signedUrl: await buildSignedAssetUrl(asset),
     };
   }
 
