@@ -422,7 +422,6 @@ function dirname(p: string): string {
   return s.slice(0, idx);
 }
 
-
 function basename(p: string): string {
   const s = sanitizePath(p);
   if (s === "/") return "";
@@ -560,6 +559,156 @@ function tryUtf8FromBase64(base64: string): string | null {
     return null;
   }
 }
+
+
+function inferMimeTypeFromBytes(bytes: Uint8Array, fallback = "application/octet-stream"): string {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+
+  if (bytes.length >= 6) {
+    const header = String.fromCharCode(...bytes.slice(0, 6));
+    if (header === "GIF87a" || header === "GIF89a") return "image/gif";
+  }
+
+  if (
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" &&
+    String.fromCharCode(...bytes.slice(8, 12)) === "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  if (bytes.length >= 5 && String.fromCharCode(...bytes.slice(0, 5)) === "%PDF-") return "application/pdf";
+
+  if (
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" &&
+    String.fromCharCode(...bytes.slice(8, 12)) === "WAVE"
+  ) {
+    return "audio/wav";
+  }
+
+  if (bytes.length >= 4 && String.fromCharCode(...bytes.slice(0, 4)) === "OggS") return "audio/ogg";
+  if (bytes.length >= 3 && String.fromCharCode(...bytes.slice(0, 3)) === "ID3") return "audio/mpeg";
+  if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) return "audio/mpeg";
+
+  if (bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04) {
+    return "application/zip";
+  }
+
+  if (
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.slice(4, 8)) === "ftyp"
+  ) {
+    const brand = String.fromCharCode(...bytes.slice(8, 12)).toLowerCase();
+    if (brand.startsWith("heic") || brand.startsWith("heix") || brand.startsWith("hevc") || brand.startsWith("mif1")) {
+      return "image/heic";
+    }
+    return "video/mp4";
+  }
+
+  return fallback;
+}
+
+function looksLikeBinaryBase64String(value: string): boolean {
+  const clean = String(value ?? "").replace(/\s+/g, "");
+  if (clean.length < 64 || clean.length % 4 !== 0) return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) return false;
+
+  try {
+    const bytes = base64ToBytes(clean);
+    if (bytes.length < 16) return false;
+
+    const inferred = inferMimeTypeFromBytes(bytes, "");
+    if (inferred) return true;
+
+    let printable = 0;
+    const sample = bytes.slice(0, Math.min(bytes.length, 256));
+    for (const byte of sample) {
+      if (byte === 9 || byte === 10 || byte === 13 || (byte >= 32 && byte <= 126)) printable += 1;
+    }
+    return printable / sample.length < 0.75;
+  } catch {
+    return false;
+  }
+}
+
+function isTextLikeFilename(filename: string): boolean {
+  const ext = String(filename ?? "").split(".").pop()?.toLowerCase() ?? "";
+  return [
+    "txt","md","markdown","json","jsonl","csv","ts","tsx","js","jsx","mjs","cjs",
+    "py","rb","go","java","kt","swift","php","rs","cpp","cc","cxx","c","h","hpp",
+    "cs","html","css","scss","less","xml","yaml","yml","ini","conf","toml","env",
+    "log","sql","sh","bash","zsh","ps1","dockerfile",
+  ].includes(ext);
+}
+
+function shouldTreatTextPayloadAsBinaryBase64(args: {
+  value: string;
+  kind: SessionAssetKind;
+  mimeType: string;
+  filename: string;
+}): boolean {
+  if (!looksLikeBinaryBase64String(args.value)) return false;
+  if (args.kind === "image" || args.kind === "audio" || args.kind === "video") return true;
+  if (args.kind === "file") {
+    if (isTextualMimeType(args.mimeType) || isTextLikeFilename(args.filename)) return false;
+    return true;
+  }
+  return false;
+}
+
+function tryInferMimeTypeFromBase64(base64: string, fallback: string): string {
+  try {
+    return inferMimeTypeFromBytes(base64ToBytes(base64), fallback);
+  } catch {
+    return fallback;
+  }
+}
+
+function isGenericOrPlaceholderMimeType(mimeType: string): boolean {
+  const mime = String(mimeType ?? "").toLowerCase().trim();
+  return !mime || mime === "application/octet-stream" || mime.endsWith("/*");
+}
+
+function coerceLoadedAssetMimeType(loaded: LoadedSessionAsset): LoadedSessionAsset {
+  const nextMimeType = tryInferMimeTypeFromBase64(loaded.base64, loaded.mimeType);
+  if (!nextMimeType || nextMimeType === loaded.mimeType) return loaded;
+  if (!isGenericOrPlaceholderMimeType(loaded.mimeType) && isTextualMimeType(loaded.mimeType)) return loaded;
+
+  return {
+    ...loaded,
+    mimeType: nextMimeType,
+    dataUrl: loaded.dataUrl ? `data:${nextMimeType};base64,${loaded.base64}` : loaded.dataUrl,
+  };
+}
+
+function isInspectQuestion(text: string): boolean {
+  const q = String(text ?? "").trim().toLowerCase();
+  if (!q) return false;
+  return /\b(what(?:'s| is)? (?:this|that|in|on)|describe|read|ocr|extract|inspect|analy[sz]e|summari[sz]e|tell me what you see|what do you see|caption)\b/.test(q);
+}
+
+function latestUserMessageHasAsset(history: ModelMessage[]): boolean {
+  const lastUser = [...history].reverse().find((m) => m.role === "user");
+  const content: any = (lastUser as any)?.content;
+  if (!Array.isArray(content)) return false;
+  return content.some((part: any) => isRichMediaPartType(String(part?.type ?? "")));
+}
+
 
 function isTextualMimeType(mimeType: string): boolean {
   const mime = String(mimeType ?? "").toLowerCase();
@@ -702,7 +851,7 @@ function buildSessionAsset(part: any, role: string, messageIndex: number, partIn
 
   const partType = String(part?.type ?? kind).toLowerCase();
   const payload = rawAssetPayloadFromPart(part, kind);
-  const sourceInfo = coerceAssetSource(payload);
+  let sourceInfo = coerceAssetSource(payload);
 
   let mimeType =
     String(
@@ -725,8 +874,29 @@ function buildSessionAsset(part: any, role: string, messageIndex: number, partIn
 
   const filename = explicitFilename || `asset_${messageIndex + 1}_${partIndex + 1}.${extension}`;
 
+  if (
+    sourceInfo.source === "text" &&
+    shouldTreatTextPayloadAsBinaryBase64({
+      value: sourceInfo.text ?? "",
+      kind,
+      mimeType,
+      filename,
+    })
+  ) {
+    const clean = String(sourceInfo.text ?? "").replace(/\s+/g, "");
+    sourceInfo = {
+      source: "base64",
+      base64: clean,
+      sizeBytes: estimateBase64Bytes(clean),
+    };
+  }
+
   if (!mimeType || mimeType === "application/octet-stream") {
     mimeType = inferMimeFromFilename(filename) || mimeType;
+  }
+
+  if (sourceInfo.base64 && (isGenericOrPlaceholderMimeType(mimeType) || mimeType === "text/plain")) {
+    mimeType = tryInferMimeTypeFromBase64(sourceInfo.base64, mimeType);
   }
 
   return {
@@ -1629,7 +1799,7 @@ async function loadSessionAssetContent(
 
   if (asset.base64) {
     const textPreview = isTextualMimeType(asset.mimeType) ? tryUtf8FromBase64(asset.base64) : null;
-    return {
+    return coerceLoadedAssetMimeType({
       base64: asset.base64,
       mimeType: asset.mimeType,
       filename: asset.filename,
@@ -1637,13 +1807,13 @@ async function loadSessionAssetContent(
       source: asset.source,
       textPreview,
       dataUrl: asset.dataUrl ?? `data:${asset.mimeType};base64,${asset.base64}`,
-    };
+    });
   }
 
   if (asset.dataUrl) {
     const base64 = stripDataUrlPrefix(asset.dataUrl);
     const textPreview = isTextualMimeType(asset.mimeType) ? tryUtf8FromBase64(base64) : null;
-    return {
+    return coerceLoadedAssetMimeType({
       base64,
       mimeType: asset.mimeType,
       filename: asset.filename,
@@ -1651,7 +1821,7 @@ async function loadSessionAssetContent(
       source: asset.source,
       textPreview,
       dataUrl: asset.dataUrl,
-    };
+    });
   }
 
   if (asset.text != null) {
@@ -1683,7 +1853,7 @@ async function loadSessionAssetContent(
       response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || asset.mimeType || "application/octet-stream";
     const textPreview = isTextualMimeType(contentType) ? bytesToUtf8(arr) : null;
 
-    return {
+    return coerceLoadedAssetMimeType({
       base64,
       mimeType: contentType,
       filename: asset.filename,
@@ -1691,7 +1861,7 @@ async function loadSessionAssetContent(
       source: "fetched_url",
       textPreview,
       dataUrl: `data:${contentType};base64,${base64}`,
-    };
+    });
   }
 
   throw new Error(`Asset ${asset.id} does not currently have retrievable inline data or an accessible URL`);
@@ -1774,10 +1944,13 @@ function getPublicBaseUrl(): string | null {
 }
 
 function getAssetSigningSecret(): string | null {
-  const v = env("ASSET_URL_SIGNING_SECRET") || env("SESSION_ASSET_SIGNING_SECRET") || "";
+  const v =
+    env("VFS_URL_SIGNING_SECRET") ||
+    env("ASSET_URL_SIGNING_SECRET") ||
+    env("SESSION_ASSET_SIGNING_SECRET") ||
+    "";
   return v.trim() || null;
 }
-
 
 type VfsUrlEncoding = "utf8" | "base64";
 
@@ -3497,7 +3670,7 @@ export async function agentTurn(args: {
 
     const baseUrl = String(env("OPENAI_API_BASE_URL") ?? process.env.OPENAI_API_BASE_URL ?? "https://api.openai.com/v1")
       .trim()
-      .replace(/\/+$|$/,"");
+      .replace(/\/+$/, "");
     const model = String(input.model ?? env("VOICE_MODEL_NAME") ?? env("TTS_MODEL_NAME") ?? "gpt-4o-mini-tts").trim();
     const voice = String(input.voice ?? env("VOICE_NAME") ?? env("TTS_VOICE") ?? "alloy").trim();
     const responseFormat: SpeechResponseFormat = input.responseFormat ?? "mp3";
@@ -3694,7 +3867,7 @@ export async function agentTurn(args: {
 
   const listSessionAssets = tool({
     description:
-      "List images, audio, video, and files detected in the current conversation history, including canonical IDs for follow-up asset preparation.",
+      "List images, audio, video, and files detected in the current conversation history, including canonical IDs for follow-up asset preparation. Do not use this to understand asset contents; use inspect_session_asset for that.",
     inputSchema: zodSchema(z.object({})),
     execute: async () => {
       return {
@@ -3710,7 +3883,7 @@ export async function agentTurn(args: {
 
   const prepareSessionAsset = tool({
     description:
-      "Prepare a session asset for external tool usage. By default returns metadata and upload hints only. Set includeInlineData=true only when the target tool truly needs inline content.",
+      "Prepare a session asset for external tool usage. By default returns metadata and upload hints only. Do not use this when the user wants to know what the asset contains; use inspect_session_asset instead.",
     inputSchema: zodSchema(
       z.object({
         assetId: z.string().min(1),
@@ -3840,6 +4013,219 @@ export async function agentTurn(args: {
     },
   });
 
+
+  async function inspectSessionAssetImpl(input: {
+    assetId?: string;
+    question?: string;
+    fetchRemote?: boolean;
+    maxTextChars?: number;
+  }) {
+    const selectedAsset = input.assetId
+      ? sessionAssets.find((x) => x.id === input.assetId)
+      : sessionAssets[sessionAssets.length - 1];
+
+    if (!selectedAsset) {
+      return {
+        ok: false,
+        error: "No session assets are available to inspect.",
+      };
+    }
+
+    const fetchRemote = input.fetchRemote ?? true;
+    const maxTextChars = input.maxTextChars ?? 16000;
+    const question = String(input.question ?? "").trim();
+    const signedUrl = await buildSignedAssetUrl(selectedAsset);
+    const inspectionModelName = env("ASSET_INSPECTION_MODEL_NAME") ?? smartModel ?? "gpt-4o";
+
+    const runInspectionText = async (request: { prompt?: string; messages?: any[] }) => {
+      const modelArgs: any = { model: openai(inspectionModelName) };
+      if (request.messages) {
+        modelArgs.messages = request.messages;
+      } else {
+        modelArgs.prompt = request.prompt;
+      }
+      if (shouldSendTemperature(inspectionModelName, 0.2)) {
+        modelArgs.temperature = 0.2;
+      }
+      const result = await generateText(modelArgs);
+      return String(result.text ?? "").trim();
+    };
+
+    try {
+      const loadedRaw = await loadSessionAssetContent(selectedAsset, { fetchRemote });
+      const loaded = coerceLoadedAssetMimeType(loadedRaw);
+
+      const base = {
+        ok: true,
+        asset: describeSessionAsset(selectedAsset),
+        ref: `asset://${selectedAsset.id}`,
+        url: signedUrl,
+        filename: loaded.filename,
+        mimeType: loaded.mimeType,
+        sizeBytes: loaded.sizeBytes,
+        question: question || null,
+      };
+
+      const decodedText = loaded.textPreview ?? tryUtf8FromBase64(loaded.base64) ?? "";
+      const shouldTreatAsText =
+        isTextualMimeType(loaded.mimeType) ||
+        isTextLikeFilename(loaded.filename || selectedAsset.filename) ||
+        (!question && decodedText.length > 0 && !looksLikeBinaryBase64String(decodedText));
+
+      if (shouldTreatAsText && decodedText.trim()) {
+        const preview = truncateForModelContext(decodedText, maxTextChars);
+        const analysis = await runInspectionText({
+          prompt: [
+            "You are inspecting a user-uploaded text file.",
+            "Explain what it contains and answer the user's question if one is provided.",
+            "If the file looks like code, mention the language and summarize what it does.",
+            "If the file looks like JSON, CSV, logs, or config, describe the structure and important contents.",
+            "Do not invent content beyond the provided text.",
+            "",
+            `Filename: ${loaded.filename}`,
+            `MIME Type: ${loaded.mimeType}`,
+            question ? `User question: ${question}` : "User question: Describe what this file contains.",
+            "",
+            "File content:",
+            preview,
+          ].join("\n"),
+        });
+
+        return {
+          ...base,
+          inspectionMode: "text",
+          textPreview: truncateText(decodedText, 6000),
+          analysis,
+        };
+      }
+
+      if (String(loaded.mimeType).toLowerCase().startsWith("image/")) {
+        const imageInput = signedUrl ?? base64ToBytes(loaded.base64);
+        const analysis = await runInspectionText({
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: [
+                    "Inspect this uploaded image and describe what it contains.",
+                    "Include visible text, UI elements, objects, people, charts, diagrams, and other important details.",
+                    question ? `User question: ${question}` : "User question: Describe exactly what you see.",
+                  ].join("\n"),
+                },
+                {
+                  type: "image",
+                  image: imageInput,
+                },
+              ],
+            },
+          ],
+        });
+
+        return {
+          ...base,
+          inspectionMode: "image",
+          analysis,
+        };
+      }
+
+      if (String(loaded.mimeType).toLowerCase() === "application/pdf") {
+        const pdfInput = signedUrl ?? base64ToBytes(loaded.base64);
+        const analysis = await runInspectionText({
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: [
+                    "Inspect this uploaded PDF and explain what it contains.",
+                    "Summarize the document, mention major sections, and answer the user's question if one is provided.",
+                    question ? `User question: ${question}` : "User question: What does this PDF contain?",
+                  ].join("\n"),
+                },
+                {
+                  type: "file",
+                  data: pdfInput,
+                  mediaType: "application/pdf",
+                  filename: loaded.filename,
+                },
+              ],
+            },
+          ],
+        });
+
+        return {
+          ...base,
+          inspectionMode: "pdf",
+          analysis,
+        };
+      }
+
+      if (String(loaded.mimeType).toLowerCase().startsWith("audio/")) {
+        const audioModelName = env("AUDIO_INSPECTION_MODEL_NAME") ?? "gpt-4o-audio-preview";
+        const audioInput = signedUrl ?? base64ToBytes(loaded.base64);
+        const audioResult = await generateText({
+          model: openai(audioModelName),
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: question || "Transcribe this audio and summarize what it says.",
+                },
+                {
+                  type: "file",
+                  data: audioInput,
+                  mediaType: loaded.mimeType,
+                  filename: loaded.filename,
+                },
+              ],
+            },
+          ],
+        });
+
+        return {
+          ...base,
+          inspectionMode: "audio",
+          analysis: String(audioResult.text ?? "").trim(),
+        };
+      }
+
+      return {
+        ...base,
+        inspectionMode: "metadata",
+        analysis:
+          `I could not directly inspect the binary contents of ${loaded.filename} (${loaded.mimeType}). ` +
+          `I can still provide metadata and a signed URL for an external tool if needed.`,
+      };
+    } catch (error: any) {
+      return {
+        ok: false,
+        asset: describeSessionAsset(selectedAsset),
+        ref: `asset://${selectedAsset.id}`,
+        url: signedUrl,
+        error: String(error?.message ?? error ?? "Unknown inspect_session_asset error"),
+      };
+    }
+  }
+
+  const inspectSessionAsset = tool({
+    description:
+      "Inspect the contents of the most recent uploaded asset or a specific session asset. Use this when the user asks what an image, screenshot, PDF, file, JSON, code file, or log contains. Do not use list_session_assets or prepare_session_asset when you need content understanding.",
+    inputSchema: zodSchema(
+      z.object({
+        assetId: z.string().optional(),
+        question: z.string().max(4000).optional(),
+        fetchRemote: z.boolean().optional(),
+        maxTextChars: z.number().int().min(500).max(40000).optional(),
+      })
+    ),
+    execute: inspectSessionAssetImpl,
+  });
+
   const sendSessionAssetToTelegram = tool({
     description:
       "Send a session asset back to the user in Telegram. Supports photo, document, audio, and voice delivery.",
@@ -3910,17 +4296,10 @@ export async function agentTurn(args: {
 
         const filename = basename(path) || "file";
         const mimeType = inferMimeFromFilename(filename);
-        const encoding = resolveTelegramSendAs({
-          mimeType,
-          filename,
-          sendAs: input.sendAs,
-          asDocument: input.asDocument,
-        }) === "document" ? "utf8" : "base64";
-
         const url = await buildSignedVfsUrlForRuntime(virtualRuntime, path, {
           filename,
           mimeType,
-          encoding,
+          encoding: "utf8",
           download: false,
         });
 
@@ -4218,6 +4597,26 @@ export async function agentTurn(args: {
     return { text: String(out), responseMessages: [] as any[] };
   }
 
+  const shouldAutoInspectLatestAsset =
+    sessionAssets.length > 0 &&
+    latestUserMessageHasAsset(normalizedHistory) &&
+    (!userText || isInspectQuestion(userText));
+
+  if (shouldAutoInspectLatestAsset) {
+    const inspection = await inspectSessionAssetImpl({
+      assetId: sessionAssets[sessionAssets.length - 1]?.id,
+      question: userText || undefined,
+      fetchRemote: true,
+    });
+
+    if ((inspection as any)?.ok && typeof (inspection as any)?.analysis === "string" && (inspection as any).analysis.trim()) {
+      return {
+        text: String((inspection as any).analysis).trim(),
+        responseMessages: [] as any[],
+      };
+    }
+  }
+
   // ============================================================
   // Load Composio session meta tools and wrap them with deterministic asset resolution
   // ============================================================
@@ -4245,8 +4644,12 @@ export async function agentTurn(args: {
     write_virtual_file: writeVirtualFile,
     virtual_shell: virtualShell,
     list_session_assets: listSessionAssets,
+    inspect_session_asset: inspectSessionAsset,
     prepare_session_asset: prepareSessionAsset,
     materialize_session_asset: materializeSessionAsset,
+    send_session_asset_to_telegram: sendSessionAssetToTelegram,
+    send_virtual_file_to_telegram: sendVirtualFileToTelegram,
+    send_voice_message_to_telegram: sendVoiceMessageToTelegram,
   };
 
   const tools: ToolSet = {
@@ -4450,16 +4853,19 @@ export async function agentTurn(args: {
     "",
     "FILESYSTEM:",
     "- Use read_virtual_file and write_virtual_file for the Redis-backed virtual filesystem.",
+    "- Use send_virtual_file_to_telegram when the user asks you to send back a file from the virtual filesystem.",
     "- Use virtual_shell for shell-like operations on the virtual filesystem only.",
     "- Prefer /workspace for drafts, payloads, notes, JSON, and staging.",
     "",
     "MODALITIES:",
     `- Session asset count available via tools: ${sessionAssets.length}`,
-    "- Use list_session_assets to inspect assets.",
-    "- Use prepare_session_asset first for metadata and upload hints.",
+    "- Use inspect_session_asset first when the user asks what an uploaded image, screenshot, PDF, file, JSON, code file, or log contains.",
+    "- Use list_session_assets only to enumerate available assets.",
+    "- Use prepare_session_asset only for metadata and upload hints.",
     "- When calling external tools, pass asset references like asset://asset_m6_p2.",
     "- The execution wrapper resolves asset references deterministically before the external tool runs, staging asset bytes into Composio storage when a tool expects an s3key-backed upload.",
     "- Only request inline content when the target tool really needs it.",
+    "- When the user asks what an uploaded asset contains, do not loop on list_session_assets or prepare_session_asset; use inspect_session_asset and then answer directly.",
     "",
     "SSH:",
     "- Use ssh_exec only for real host actions the user wants.",
@@ -4467,6 +4873,11 @@ export async function agentTurn(args: {
     "",
     "SKILLS:",
     "- Use list_skills or read_skill only when needed.",
+    "",
+    "DELIVERY:",
+    "- Use send_session_asset_to_telegram when the user asks you to send back an uploaded image, audio file, voice note, or document.",
+    "- Use send_virtual_file_to_telegram when the user asks you to send back a generated or saved file from /workspace.",
+    "- Use send_voice_message_to_telegram when the user asks for a spoken reply, voice note, or text-to-speech response from the bot itself.",
     "",
     `Mode: ${autonomy}`,
     "Be concise, accurate, and tool-grounded.",
