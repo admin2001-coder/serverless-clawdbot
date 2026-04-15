@@ -1,38 +1,61 @@
+import { Client } from "ssh2";
 import { env, csvEnv } from "@/app/lib/env";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 
-const execFileAsync = promisify(execFile);
-
-export async function sshExec(command: string) {
+export async function sshExec(command: string): Promise<string> {
   "use step";
 
   const host = env("SSH_HOST");
   const user = env("SSH_USER");
   const port = Number(env("SSH_PORT") ?? "22");
+  const privateKey = env("SSH_PRIVATE_KEY"); // raw key string (recommended)
 
   if (!host || !user) {
     throw new Error("SSH not configured (SSH_HOST/SSH_USER).");
   }
 
   const allowedPrefixes = csvEnv("SSH_ALLOWED_PREFIXES");
-  if (allowedPrefixes.length > 0 && !allowedPrefixes.some((p) => command.startsWith(p))) {
-    throw new Error(`SSH command not allowed by policy. Allowed prefixes: ${allowedPrefixes.join(", ")}`);
+  if (
+    allowedPrefixes.length > 0 &&
+    !allowedPrefixes.some((p) => command.startsWith(p))
+  ) {
+    throw new Error(
+      `SSH command not allowed by policy. Allowed prefixes: ${allowedPrefixes.join(", ")}`
+    );
   }
 
-  // Use your local ssh agent or a key file path env var (recommended)
-  const keyPath = env("SSH_KEY_PATH"); // e.g. /Users/weave1/.ssh/clawdbot_key
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
 
-  const args = [
-    "-p", String(port),
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    ...(keyPath ? ["-i", keyPath] : []),
-    `${user}@${host}`,
-    command,
-  ];
+    conn
+      .on("ready", () => {
+        conn.exec(command, (err, stream) => {
+          if (err) {
+            conn.end();
+            return reject(err);
+          }
 
-  const { stdout, stderr } = await execFileAsync("ssh", args, { timeout: 60_000 });
+          let output = "";
 
-  return (stdout || stderr || "").toString();
+          stream
+            .on("close", () => {
+              conn.end();
+              resolve(output);
+            })
+            .on("data", (data: Buffer) => {
+              output += data.toString();
+            });
+
+          stream.stderr.on("data", (data: Buffer) => {
+            output += data.toString();
+          });
+        });
+      })
+      .on("error", reject)
+      .connect({
+        host,
+        port,
+        username: user,
+        privateKey, // 🔑 no file system needed
+      });
+  });
 }
