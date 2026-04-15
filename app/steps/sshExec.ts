@@ -1,4 +1,9 @@
+import { createHash } from "node:crypto";
 import { env, csvEnv } from "@/app/lib/env";
+
+function toOpenSshSha256Fingerprint(rawHostKey: Buffer) {
+  return `SHA256:${createHash("sha256").update(rawHostKey).digest("base64").replace(/=+$/, "")}`;
+}
 
 export async function sshExec(command: string): Promise<string> {
   "use step";
@@ -15,14 +20,11 @@ export async function sshExec(command: string): Promise<string> {
       ? rawKey
       : Buffer.from(rawKey ?? "", "base64").toString("utf8");
 
-  const expectedHostKeySha256 = (env("SSH_HOST_KEY_SHA256") ?? "")
-    .trim()
-    .replace(/^SHA256:/, "");
+  const expectedFingerprint = (env("SSH_HOST_KEY_SHA256") ?? "").trim();
 
   if (!host || !user) {
     throw new Error("SSH not configured (SSH_HOST/SSH_USER).");
   }
-
   if (!privateKey) {
     throw new Error("SSH private key missing.");
   }
@@ -71,10 +73,13 @@ export async function sshExec(command: string): Promise<string> {
         port,
         username: user,
         privateKey,
-        hostHash: "sha256",
-        hostVerifier: (hashedKey: string) => {
-          console.log("ssh host key sha256:", hashedKey);
-          return hashedKey === expectedHostKeySha256;
+        algorithms: {
+          serverHostKey: ["ssh-ed25519"],
+        },
+        hostVerifier: (key: Buffer) => {
+          const actual = toOpenSshSha256Fingerprint(key);
+          console.log("SSH host fingerprint:", actual);
+          return actual === expectedFingerprint;
         },
       });
   });
