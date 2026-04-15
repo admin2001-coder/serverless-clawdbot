@@ -3,8 +3,6 @@ import { env, csvEnv } from "@/app/lib/env";
 export async function sshExec(command: string): Promise<string> {
   "use step";
 
-  const { Client } = await import("ssh2");
-
   const host = env("SSH_HOST");
   const user = env("SSH_USER");
   const port = Number(env("SSH_PORT") ?? "22");
@@ -24,7 +22,13 @@ export async function sshExec(command: string): Promise<string> {
     );
   }
 
-  return await new Promise((resolve, reject) => {
+  if (!privateKey) {
+    throw new Error("SSH not configured (SSH_PRIVATE_KEY).");
+  }
+
+  const { Client } = await import("ssh2");
+
+  return await new Promise<string>((resolve, reject) => {
     const conn = new Client();
 
     conn
@@ -52,7 +56,9 @@ export async function sshExec(command: string): Promise<string> {
           });
         });
       })
-      .on("error", reject)
+      .on("error", (err) => {
+        reject(err);
+      })
       .connect({
         host,
         port,
