@@ -6,7 +6,7 @@ export async function sshExec(command: string): Promise<string> {
   const host = env("SSH_HOST");
   const user = env("SSH_USER");
   const port = Number(env("SSH_PORT") ?? "22");
-  const privateKey = env("SSH_PRIVATE_KEY");
+  const privateKeyB64 = env("SSH_PRIVATE_KEY_B64");
 
   if (!host || !user) {
     throw new Error("SSH not configured (SSH_HOST/SSH_USER).");
@@ -22,10 +22,11 @@ export async function sshExec(command: string): Promise<string> {
     );
   }
 
-  if (!privateKey) {
-    throw new Error("SSH not configured (SSH_PRIVATE_KEY).");
+  if (!privateKeyB64) {
+    throw new Error("SSH not configured (SSH_PRIVATE_KEY_B64).");
   }
 
+  const privateKey = Buffer.from(privateKeyB64, "base64").toString("utf8");
   const { Client } = await import("ssh2");
 
   return await new Promise<string>((resolve, reject) => {
