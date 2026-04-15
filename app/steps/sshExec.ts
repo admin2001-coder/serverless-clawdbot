@@ -1,13 +1,14 @@
-import { Client } from "ssh2";
 import { env, csvEnv } from "@/app/lib/env";
 
 export async function sshExec(command: string): Promise<string> {
   "use step";
 
+  const { Client } = await import("ssh2");
+
   const host = env("SSH_HOST");
   const user = env("SSH_USER");
   const port = Number(env("SSH_PORT") ?? "22");
-  const privateKey = env("SSH_PRIVATE_KEY"); // raw key string (recommended)
+  const privateKey = env("SSH_PRIVATE_KEY");
 
   if (!host || !user) {
     throw new Error("SSH not configured (SSH_HOST/SSH_USER).");
@@ -23,7 +24,7 @@ export async function sshExec(command: string): Promise<string> {
     );
   }
 
-  return new Promise((resolve, reject) => {
+  return await new Promise((resolve, reject) => {
     const conn = new Client();
 
     conn
@@ -31,22 +32,23 @@ export async function sshExec(command: string): Promise<string> {
         conn.exec(command, (err, stream) => {
           if (err) {
             conn.end();
-            return reject(err);
+            reject(err);
+            return;
           }
 
           let output = "";
 
-          stream
-            .on("close", () => {
-              conn.end();
-              resolve(output);
-            })
-            .on("data", (data: Buffer) => {
-              output += data.toString();
-            });
+          stream.on("data", (data: Buffer) => {
+            output += data.toString();
+          });
 
           stream.stderr.on("data", (data: Buffer) => {
             output += data.toString();
+          });
+
+          stream.on("close", () => {
+            conn.end();
+            resolve(output);
           });
         });
       })
@@ -55,7 +57,7 @@ export async function sshExec(command: string): Promise<string> {
         host,
         port,
         username: user,
-        privateKey, // 🔑 no file system needed
+        privateKey,
       });
   });
 }
