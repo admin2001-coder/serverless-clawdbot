@@ -29,9 +29,9 @@ export async function autopilotWorkflow() {
         {
           role: "user",
           content:
-            "You are in AUTOPILOT mode. Proactively review pending tasks, scheduled reminders, and monitors. " +
-            "Send me only important updates or questions. If nothing important, send nothing. " +
-            "If you need follow-ups, ask 1 short question. If you schedule reminders, use schedule_message.",
+            "You are in AUTOPILOT mode. Proactively review pending tasks, scheduled reminders, and monitors. You autonomously execute tool calls for workflows that you think are appropriate " +
+            "Send me important updates or questions. Try not to be redundant, if you have proactively sent me a message already, do not spam me with even more messages " +
+            "If you need follow-ups, ask short questions. If you schedule reminders, use schedule_message.",
         },
       ],
     });
