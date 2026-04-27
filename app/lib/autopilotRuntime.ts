@@ -66,7 +66,7 @@ export async function startAutopilotIfNeeded(reason: "cron" | "ui") {
     };
   }
 
-  const acquiredLock = await acquireAutopilotStartLock();
+  const acquiredLock = await acquireAutopilotStartLock(`cron_${Date.now()}`);
   if (!acquiredLock) {
     return {
       enabled,
