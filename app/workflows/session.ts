@@ -1,10 +1,29 @@
 // app/workflows/session.ts
-import type { InboundMessage } from "@/app/lib/normalize";
+import { sleep } from "workflow";
 import type { ModelMessage } from "ai";
+import type { InboundMessage } from "@/app/lib/normalize";
+import type { QueuedInboundMessage, LogicalUserInput } from "@/app/lib/inboundQueue";
 
 import { agentTurn } from "@/app/steps/agentTurn";
 import { sendOutbound } from "@/app/steps/sendOutbound";
 import { loadHistoryStep, saveHistoryStep } from "@/app/steps/sessionStateSteps";
+import {
+  acquireSessionProcessorStep,
+  claimPendingInboundMessagesStep,
+  coalesceInboundMessagesStep,
+  completeInboundMessagesStep,
+  getCoalesceSleepSecondsStep,
+  getPendingSessionSnapshotStep,
+  markSessionQueueIdleStep,
+  requeueInboundMessagesStep,
+  releaseSessionProcessorStep,
+  renewSessionProcessorStep,
+} from "@/app/steps/inboundSteps";
+import {
+  loadDurableMemoryContextStep,
+  maybeSummarizeHistoryStep,
+  recordTurnMemoryStep,
+} from "@/app/steps/memorySteps";
 
 // -----------------------------
 // Helpers: multimodal user msg
@@ -17,15 +36,12 @@ function extractImages(msg: InboundMessage): ImageInput[] {
   const m: any = msg as any;
   const out: ImageInput[] = [];
 
-  // direct fields
   if (typeof m.imageUrl === "string" && m.imageUrl) out.push({ kind: "url", value: m.imageUrl });
   if (typeof m.image_url === "string" && m.image_url) out.push({ kind: "url", value: m.image_url });
 
-  // arrays of urls
   if (Array.isArray(m.imageUrls)) for (const u of m.imageUrls) if (typeof u === "string" && u) out.push({ kind: "url", value: u });
   if (Array.isArray(m.image_urls)) for (const u of m.image_urls) if (typeof u === "string" && u) out.push({ kind: "url", value: u });
 
-  // attachments/media/files
   const arrays: any[][] = [];
   if (Array.isArray(m.attachments)) arrays.push(m.attachments);
   if (Array.isArray(m.media)) arrays.push(m.media);
@@ -64,11 +80,9 @@ function extractImages(msg: InboundMessage): ImageInput[] {
     }
   }
 
-  // raw base64 fields
   if (typeof m.imageBase64 === "string" && m.imageBase64) out.push({ kind: "base64", value: m.imageBase64 });
   if (typeof m.image_base64 === "string" && m.image_base64) out.push({ kind: "base64", value: m.image_base64 });
 
-  // dedupe
   const seen = new Set<string>();
   return out.filter((x) => {
     const k = `${x.kind}:${x.value}`;
@@ -78,17 +92,25 @@ function extractImages(msg: InboundMessage): ImageInput[] {
   });
 }
 
-function buildUserModelMessage(msg: InboundMessage): ModelMessage {
-  const images = extractImages(msg);
+function buildUserModelMessage(input: LogicalUserInput, sourceMessages: QueuedInboundMessage[]): ModelMessage {
+  const images = sourceMessages.flatMap((msg) => extractImages(msg));
+  const uniqueImages: ImageInput[] = [];
+  const seen = new Set<string>();
+  for (const image of images) {
+    const key = `${image.kind}:${image.value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueImages.push(image);
+  }
 
-  if (!images.length) {
-    return { role: "user", content: msg.text ?? "" };
+  if (!uniqueImages.length) {
+    return { role: "user", content: input.text ?? "" };
   }
 
   const parts: any[] = [];
-  if (msg.text && msg.text.trim()) parts.push({ type: "text", text: msg.text });
+  if (input.text && input.text.trim()) parts.push({ type: "text", text: input.text });
 
-  for (const img of images) {
+  for (const img of uniqueImages) {
     if (img.kind === "url") parts.push({ type: "image", image: new URL(img.value) });
     else parts.push({ type: "image", image: img.value });
   }
@@ -97,41 +119,145 @@ function buildUserModelMessage(msg: InboundMessage): ModelMessage {
 }
 
 function trimHistory(history: ModelMessage[], maxMessages: number): ModelMessage[] {
-  const m = Math.max(6, Math.min(200, maxMessages));
+  const m = Math.max(8, Math.min(300, maxMessages));
   return history.length <= m ? history : history.slice(history.length - m);
+}
+
+
+function tinyStableHash(value: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    h ^= value.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function buildWorkflowTurnId(sessionId: string, input: LogicalUserInput): string {
+  return tinyStableHash(`${sessionId}|${input.sourceInboundIds.join(",")}|${input.text}`);
+}
+
+function textForMemory(input: LogicalUserInput): string {
+  return input.text?.trim() || "[non-text message]";
+}
+
+function groupById(messages: QueuedInboundMessage[]): Map<string, QueuedInboundMessage> {
+  const map = new Map<string, QueuedInboundMessage>();
+  for (const msg of messages) map.set(msg.inboundId, msg);
+  return map;
+}
+
+function firstSourceMessage(input: LogicalUserInput, byId: Map<string, QueuedInboundMessage>): QueuedInboundMessage | null {
+  for (const id of input.sourceInboundIds) {
+    const msg = byId.get(id);
+    if (msg) return msg;
+  }
+  return null;
+}
+
+async function processLogicalInput(args: {
+  sessionId: string;
+  input: LogicalUserInput;
+  sourceMessages: QueuedInboundMessage[];
+  history: ModelMessage[];
+}): Promise<ModelMessage[]> {
+  const first = args.sourceMessages[0];
+  if (!first) return args.history;
+
+  const userId = `${first.channel}:${first.senderId}`;
+  const turnId = buildWorkflowTurnId(args.sessionId, args.input);
+  const durableMemory = await loadDurableMemoryContextStep(userId, args.sessionId);
+
+  let history = trimHistory(args.history, 60);
+  history.push(buildUserModelMessage(args.input, args.sourceMessages));
+
+  const result = await agentTurn({
+    sessionId: args.sessionId,
+    userId,
+    channel: first.channel,
+    history,
+    showTyping: first.channel === "telegram",
+    turnId,
+    durableMemory,
+    deliveryIdempotencyKey: `turn:${turnId}:final`,
+  });
+
+  const text = String(result.text ?? "").trim();
+  history.push({ role: "assistant", content: text });
+  await saveHistoryStep(args.sessionId, history);
+
+  await recordTurnMemoryStep({
+    userId,
+    sessionId: args.sessionId,
+    turnId,
+    userText: textForMemory(args.input),
+    assistantText: text,
+  });
+  await maybeSummarizeHistoryStep({ userId, sessionId: args.sessionId, history });
+
+  if (!(result as any).delivered) {
+    await sendOutbound({
+      channel: first.channel,
+      sessionId: first.sessionId,
+      text,
+      idempotencyKey: `turn:${turnId}:final`,
+    });
+  }
+
+  return history;
 }
 
 // -----------------------------
 // The workflow (NO HOOKS)
 // -----------------------------
-export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
+export async function sessionWorkflow(sessionId: string) {
   "use workflow";
 
-  let history = (await loadHistoryStep(sessionId)) as ModelMessage[];
-  history = Array.isArray(history) ? history : [];
+  const claim = await acquireSessionProcessorStep(sessionId);
+  if (!claim.acquired) return { ok: true, skipped: "processor_already_running" };
 
-  const max = Number(process.env.HISTORY_MAX_MESSAGES ?? "30");
-  history = trimHistory(history, Number.isFinite(max) ? max : 30);
+  let processed = 0;
+  const coalesceSleepSeconds = await getCoalesceSleepSecondsStep();
 
-  history.push(buildUserModelMessage(msg));
+  try {
+    while (true) {
+      await renewSessionProcessorStep(sessionId, claim.token);
+      await sleep(`${coalesceSleepSeconds}s`);
 
-  const result = await agentTurn({
-    sessionId,
-    userId: `${msg.channel}:${msg.senderId}`,
-    channel: msg.channel,
-    history,
-    showTyping: msg.channel === "telegram",
-  });
+      const messages = await claimPendingInboundMessagesStep(sessionId);
+      if (!messages.length) {
+        const pending = await getPendingSessionSnapshotStep(sessionId);
+        if (pending.pending > 0) {
+          continue;
+        }
 
-  history.push({ role: "assistant", content: result.text });
-  await saveHistoryStep(sessionId, history);
+        await markSessionQueueIdleStep(sessionId);
+        return { ok: true, processed };
+      }
 
-  // ✅ Avoid duplicates: if Telegram streaming already delivered, do not send again
-  if (!(result as any).delivered) {
-    await sendOutbound({
-      channel: msg.channel,
-      sessionId: msg.sessionId,
-      text: result.text,
-    });
+      try {
+        const byId = groupById(messages);
+        const logicalInputs = await coalesceInboundMessagesStep(messages);
+        let history = await loadHistoryStep(sessionId);
+        history = Array.isArray(history) ? history : [];
+
+        for (const input of logicalInputs) {
+          await renewSessionProcessorStep(sessionId, claim.token);
+          const sourceMessages = input.sourceInboundIds.map((id) => byId.get(id)).filter(Boolean) as QueuedInboundMessage[];
+          const first = firstSourceMessage(input, byId);
+          if (!first || !sourceMessages.length) continue;
+          history = await processLogicalInput({ sessionId, input, sourceMessages, history });
+          await renewSessionProcessorStep(sessionId, claim.token);
+          processed += sourceMessages.length;
+        }
+
+        await completeInboundMessagesStep(messages.map((msg) => msg.inboundId));
+      } catch (error) {
+        await requeueInboundMessagesStep(messages);
+        throw error;
+      }
+    }
+  } finally {
+    await releaseSessionProcessorStep(sessionId, claim.token);
   }
 }

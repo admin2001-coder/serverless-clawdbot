@@ -22,6 +22,7 @@ export interface Store {
   // Sorted set helpers
   zadd(key: string, score: number, member: string): Promise<void>;
   zrangebyscore(key: string, min: number, max: number, opts?: { limit?: number }): Promise<string[]>;
+  zrevrangebyscore(key: string, max: number, min: number, opts?: { limit?: number }): Promise<string[]>;
   zrem(key: string, member: string): Promise<void>;
 }
 
@@ -70,18 +71,43 @@ class MemoryStore implements Store {
   private map = new Map<string, any>();
   private hmap = new Map<string, Map<string, any>>();
   private zmap = new Map<string, Array<{ score: number; member: string }>>();
+  private expiresAt = new Map<string, number>();
+
+  private isExpired(key: string): boolean {
+    const ts = this.expiresAt.get(key);
+    if (ts == null || ts > Date.now()) return false;
+
+    this.map.delete(key);
+    this.hmap.delete(key);
+    this.zmap.delete(key);
+    this.expiresAt.delete(key);
+    return true;
+  }
+
+  private hasLiveKey(key: string): boolean {
+    return !this.isExpired(key) && (this.map.has(key) || this.hmap.has(key) || this.zmap.has(key));
+  }
 
   async get<T>(key: string): Promise<T | null> {
+    if (this.isExpired(key)) return null;
     return this.map.has(key) ? (this.map.get(key) as T) : null;
   }
-  async set<T>(key: string, value: T, _opts?: { exSeconds?: number; nx?: boolean }): Promise<boolean> {
+  async set<T>(key: string, value: T, opts?: { exSeconds?: number; nx?: boolean }): Promise<boolean> {
+    if (opts?.nx && this.hasLiveKey(key)) return false;
+
     this.map.set(key, value);
+    if (opts?.exSeconds != null) {
+      this.expiresAt.set(key, Date.now() + Math.max(1, opts.exSeconds) * 1000);
+    } else {
+      this.expiresAt.delete(key);
+    }
     return true;
   }
   async del(key: string): Promise<void> {
     this.map.delete(key);
     this.hmap.delete(key);
     this.zmap.delete(key);
+    this.expiresAt.delete(key);
   }
 
   async hset<T>(key: string, field: string, value: T): Promise<void> {
@@ -101,7 +127,7 @@ class MemoryStore implements Store {
   }
 
   async zadd(key: string, score: number, member: string): Promise<void> {
-    const z = this.zmap.get(key) ?? [];
+    const z = (this.zmap.get(key) ?? []).filter((x) => x.member !== member);
     z.push({ score, member });
     z.sort((a, b) => a.score - b.score);
     this.zmap.set(key, z);
@@ -109,6 +135,15 @@ class MemoryStore implements Store {
   async zrangebyscore(key: string, min: number, max: number, opts?: { limit?: number }): Promise<string[]> {
     const z = this.zmap.get(key) ?? [];
     const filtered = z.filter((x) => x.score >= min && x.score <= max).map((x) => x.member);
+    if (opts?.limit != null) return filtered.slice(0, opts.limit);
+    return filtered;
+  }
+  async zrevrangebyscore(key: string, max: number, min: number, opts?: { limit?: number }): Promise<string[]> {
+    const z = this.zmap.get(key) ?? [];
+    const filtered = z
+      .filter((x) => x.score >= min && x.score <= max)
+      .sort((a, b) => b.score - a.score)
+      .map((x) => x.member);
     if (opts?.limit != null) return filtered.slice(0, opts.limit);
     return filtered;
   }
@@ -229,6 +264,43 @@ class UpstashStore implements Store {
     return v.map((x: any) => String(x));
   }
 
+  async zrevrangebyscore(
+    key: string,
+    max: number,
+    min: number,
+    opts?: { limit?: number }
+  ): Promise<string[]> {
+    const r: any = await this.redis();
+    const limit = opts?.limit;
+
+    let v: unknown;
+
+    if (typeof r.zrange === "function") {
+      v = await r.zrange(key, min, max, {
+        byScore: true,
+        rev: true,
+        ...(limit != null ? { offset: 0, count: limit } : {}),
+      });
+    } else if (typeof r.zrevrangebyscore === "function") {
+      v = await r.zrevrangebyscore(
+        key,
+        max,
+        min,
+        ...(limit != null ? ["LIMIT", 0, limit] : [])
+      );
+    } else {
+      throw new TypeError("Redis client does not support zrange/zrevrangebyscore");
+    }
+
+    if (!Array.isArray(v)) return [];
+
+    if (v.length > 0 && Array.isArray(v[0])) {
+      return v.map((row: any) => String(row[0]));
+    }
+
+    return v.map((x: any) => String(x));
+  }
+
   async zrem(key: string, member: string): Promise<void> {
     const r = await this.redis();
     await r.zrem(key, member);
@@ -241,7 +313,10 @@ export function getStore(): Store {
   if (_store) return _store;
   try {
     _store = new UpstashStore();
-  } catch {
+  } catch (error) {
+    if (process.env.NODE_ENV === "production" && process.env.ALLOW_MEMORY_STORE !== "true") {
+      throw error;
+    }
     _store = new MemoryStore();
   }
   return _store;
