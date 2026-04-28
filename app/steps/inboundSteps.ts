@@ -97,9 +97,10 @@ export async function getPendingSessionSnapshotStep(sessionId: string) {
   return await getPendingSessionSnapshot(sessionId);
 }
 
-export async function getCoalesceSleepSecondsStep(): Promise<number> {
+export async function getSessionQueuePollMsStep(): Promise<number> {
   "use step";
-  return Math.max(1, Math.min(15, Math.ceil(getCoalesceSleepMs() / 1000)));
+  const ms = parseIntOr(process.env.SESSION_QUEUE_POLL_MS, 250);
+  return Math.max(100, Math.min(2000, ms));
 }
 
 export async function claimPendingInboundMessagesStep(sessionId: string): Promise<QueuedInboundMessage[]> {
@@ -132,6 +133,9 @@ export async function coalesceInboundMessagesStep(messages: QueuedInboundMessage
 
   const fallback = fallbackCoalesceMessages(messages);
   if (messages.length <= 1) return fallback;
+
+  const useModel = (process.env.INTAKE_USE_MODEL ?? "false") === "true";
+  if (!useModel) return fallback;
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return fallback;
@@ -167,6 +171,6 @@ export async function coalesceInboundMessagesStep(messages: QueuedInboundMessage
 }
 
 export function getCoalesceSleepMs(): number {
-  const ms = parseIntOr(process.env.MESSAGE_COHERENCE_WINDOW_MS, 2200);
-  return Math.max(250, Math.min(15_000, ms));
+  const ms = parseIntOr(process.env.MESSAGE_COHERENCE_WINDOW_MS, 700);
+  return Math.max(150, Math.min(15_000, ms));
 }

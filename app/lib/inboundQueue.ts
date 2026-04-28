@@ -48,9 +48,61 @@ function sessionProcessorTtlSeconds(): number {
   return Number.isFinite(n) && n >= 30 ? Math.ceil(n) : 900;
 }
 
+function parsePositiveMs(value: string | undefined, fallback: number, min = 50, max = 15_000): number {
+  const n = Number(value ?? fallback);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
+}
+
 function coalesceQuietMs(): number {
-  const n = Number(process.env.MESSAGE_COHERENCE_WINDOW_MS ?? 2200);
-  return Number.isFinite(n) ? Math.max(250, Math.min(15_000, Math.floor(n))) : 2200;
+  return parsePositiveMs(process.env.MESSAGE_COHERENCE_WINDOW_MS, 700, 150, 15_000);
+}
+
+function longCoalesceQuietMs(): number {
+  return parsePositiveMs(
+    process.env.MESSAGE_COHERENCE_LONG_WINDOW_MS ?? process.env.SPLIT_MESSAGE_LONG_WINDOW_MS,
+    2200,
+    500,
+    20_000
+  );
+}
+
+function looksStructurallyIncomplete(text: string): boolean {
+  const t = String(text ?? "").trimEnd();
+  if (!t) return false;
+
+  const opens = (t.match(/[([{]/g) ?? []).length;
+  const closes = (t.match(/[)\]}]/g) ?? []).length;
+  if (opens > closes) return true;
+
+  const fenceCount = (t.match(/```/g) ?? []).length;
+  if (fenceCount % 2 === 1) return true;
+
+  const quoteCount = (t.match(/(?<!\\)"/g) ?? []).length;
+  if (quoteCount % 2 === 1 && t.length > 280) return true;
+
+  const last = t.at(-1) ?? "";
+  if (["-", "–", "—", ",", ":", ";", "/", "\\"].includes(last)) return true;
+
+  return false;
+}
+
+function adaptiveCoalesceQuietMs(messages: QueuedInboundMessage[]): number {
+  const base = coalesceQuietMs();
+  if (!messages.length) return base;
+
+  const newest = messages.reduce((latest, msg) =>
+    Number(msg.receivedAt || msg.ts || 0) > Number(latest.receivedAt || latest.ts || 0) ? msg : latest
+  );
+  const newestText = String(newest.text ?? "");
+
+  // Long provider-split messages usually arrive as large structural fragments.
+  // Keep the common case fast, but use a longer quiet window when the newest
+  // fragment looks unfinished.
+  if (newestText.length >= 1800 || looksStructurallyIncomplete(newestText)) {
+    return Math.max(base, longCoalesceQuietMs());
+  }
+
+  return base;
 }
 
 function getRaw(obj: unknown): any {
@@ -195,7 +247,8 @@ function pendingSnapshotFromMessages(messages: QueuedInboundMessage[], nowMs = D
   const times = messages.map((m) => Number(m.receivedAt || m.ts || nowMs)).filter((n) => Number.isFinite(n));
   const oldestReceivedAt = Math.min(...times);
   const newestReceivedAt = Math.max(...times);
-  const waitMs = Math.max(0, newestReceivedAt + coalesceQuietMs() - nowMs);
+  const quietMs = adaptiveCoalesceQuietMs(messages);
+  const waitMs = Math.max(0, newestReceivedAt + quietMs - nowMs);
 
   return {
     pending: messages.length,
@@ -327,15 +380,18 @@ export function fallbackCoalesceMessages(messages: QueuedInboundMessage[]): Logi
 
   const allSameSender = messages.every((m) => m.senderId === messages[0]!.senderId && m.sessionId === messages[0]!.sessionId);
   const spanMs = Math.max(...messages.map((m) => m.receivedAt)) - Math.min(...messages.map((m) => m.receivedAt));
-  const combined = messages.map((m) => String(m.text ?? "").trim()).filter(Boolean).join("\n");
+  const texts = messages.map((m) => String(m.text ?? "").trim()).filter(Boolean);
+  const combined = texts.join("\n");
+  const hasLargeFragment = texts.some((text) => text.length >= 1800);
+  const hasOpenFragment = texts.slice(0, -1).some((text) => looksStructurallyIncomplete(text));
 
-  if (allSameSender && spanMs <= Number(process.env.SPLIT_MESSAGE_JOIN_WINDOW_MS ?? 4500)) {
+  if (allSameSender && spanMs <= Number(process.env.SPLIT_MESSAGE_JOIN_WINDOW_MS ?? 4500) && (hasLargeFragment || hasOpenFragment)) {
     return [{
       id: shortHash({ sourceInboundIds: messages.map((m) => m.inboundId), text: combined }, 18),
       text: combined,
       sourceInboundIds: messages.map((m) => m.inboundId),
       relation: "joined_fragments",
-      confidence: 0.5,
+      confidence: hasLargeFragment ? 0.72 : 0.62,
     }];
   }
 

@@ -12,7 +12,7 @@ import {
   claimPendingInboundMessagesStep,
   coalesceInboundMessagesStep,
   completeInboundMessagesStep,
-  getCoalesceSleepSecondsStep,
+  getSessionQueuePollMsStep,
   getPendingSessionSnapshotStep,
   markSessionQueueIdleStep,
   requeueInboundMessagesStep,
@@ -184,17 +184,10 @@ async function processLogicalInput(args: {
 
   const text = String(result.text ?? "").trim();
   history.push({ role: "assistant", content: text });
-  await saveHistoryStep(args.sessionId, history);
 
-  await recordTurnMemoryStep({
-    userId,
-    sessionId: args.sessionId,
-    turnId,
-    userText: textForMemory(args.input),
-    assistantText: text,
-  });
-  await maybeSummarizeHistoryStep({ userId, sessionId: args.sessionId, history });
-
+  // Send before memory/summarization work. Telegram streaming usually already
+  // delivered inside agentTurn; non-streaming channels should not wait on Redis
+  // memory writes or model summarization before the user sees the answer.
   if (!(result as any).delivered) {
     await sendOutbound({
       channel: first.channel,
@@ -203,6 +196,16 @@ async function processLogicalInput(args: {
       idempotencyKey: `turn:${turnId}:final`,
     });
   }
+
+  await saveHistoryStep(args.sessionId, history);
+  await recordTurnMemoryStep({
+    userId,
+    sessionId: args.sessionId,
+    turnId,
+    userText: textForMemory(args.input),
+    assistantText: text,
+  });
+  await maybeSummarizeHistoryStep({ userId, sessionId: args.sessionId, history });
 
   return history;
 }
@@ -217,17 +220,18 @@ export async function sessionWorkflow(sessionId: string) {
   if (!claim.acquired) return { ok: true, skipped: "processor_already_running" };
 
   let processed = 0;
-  const coalesceSleepSeconds = await getCoalesceSleepSecondsStep();
+  const queuePollMs = await getSessionQueuePollMsStep();
 
   try {
     while (true) {
       await renewSessionProcessorStep(sessionId, claim.token);
-      await sleep(`${coalesceSleepSeconds}s`);
 
       const messages = await claimPendingInboundMessagesStep(sessionId);
       if (!messages.length) {
         const pending = await getPendingSessionSnapshotStep(sessionId);
         if (pending.pending > 0) {
+          const waitMs = Math.max(100, Math.min(2000, pending.waitMs || queuePollMs));
+          await sleep(`${waitMs}ms`);
           continue;
         }
 

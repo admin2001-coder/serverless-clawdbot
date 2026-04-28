@@ -3359,15 +3359,17 @@ function fallbackReasoningPolicy(args: {
         : "low"
     : "none";
 
+  const startingToolSteps = modelTier === "fast" ? Math.min(args.baseMaxToolSteps, 4) : args.baseMaxToolSteps;
+
   return {
     modelName: modelTier === "reasoning" ? args.reasoningModel : modelTier === "smart" ? args.smartModel : args.fastModel,
     modelTier,
     reasoningEffort,
-    maxToolSteps: Math.max(3, Math.min(40, Math.round(args.baseMaxToolSteps + complexity * 14))),
+    maxToolSteps: Math.max(1, Math.min(40, Math.round(startingToolSteps + complexity * 8))),
     temperature: modelTier === "fast" ? args.baseTemperature : Math.min(args.baseTemperature, 0.4),
     streamFinalText: true,
     progressMode: "silent_typing",
-    rationale: "metric fallback",
+    rationale: "local metric controller",
   };
 }
 
@@ -3383,7 +3385,16 @@ async function decideReasoningPolicy(args: {
   baseMaxToolSteps: number;
 }): Promise<ReasoningPolicy> {
   const fallback = fallbackReasoningPolicy(args);
-  if ((env("AGENT_DYNAMIC_REASONING") ?? "true") === "false") return fallback;
+
+  // Latency-first default: this controller is still dynamic, but it uses
+  // measurable runtime complexity locally instead of spending an extra model
+  // call before every response. Set AGENT_DYNAMIC_REASONING=model when you
+  // explicitly want the old model-router hop.
+  const routerMode = String(env("AGENT_DYNAMIC_REASONING") ?? env("AGENT_ROUTER_MODE") ?? "local")
+    .trim()
+    .toLowerCase();
+  const useModelRouter = routerMode === "model" || routerMode === "router";
+  if (!useModelRouter) return fallback;
   if (!env("OPENAI_API_KEY")) return fallback;
 
   const routerModel = env("ROUTER_MODEL_NAME") ?? env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? args.fastModel;
@@ -3493,6 +3504,12 @@ function isPromptBudgetRetryableError(error: unknown): boolean {
     text.includes("tokens per min") ||
     (text.includes("requested") && text.includes("tokens"))
   );
+}
+
+const EXTERNAL_TOOLS_REQUESTED_MARKER = "__EXTERNAL_TOOLS_REQUESTED__";
+
+function isExternalToolsRequestedError(error: unknown): boolean {
+  return stringifyError(error).includes(EXTERNAL_TOOLS_REQUESTED_MARKER);
 }
 
 function buildComposioSessionOptions(overrides?: ComposioSessionOverrides): ComposioSessionOverrides {
@@ -3869,7 +3886,7 @@ export async function agentTurn(args: {
   const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o";
   const reasoningModel = env("REASONING_MODEL_NAME") ?? env("THINKING_MODEL_NAME") ?? "";
   const baseTemperature = Number(env("MODEL_TEMPERATURE") ?? "0.7");
-  const baseMaxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 11));
+  const baseMaxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 6));
   const turnId = args.turnId ?? shortHash({ sessionId: args.sessionId, userId: args.userId, userText, at: Date.now() }, 32);
   const turnLifecycle = createAgentTurnController();
 
@@ -3877,9 +3894,10 @@ export async function agentTurn(args: {
   const telegramStreamingEnabled =
     isTelegram && (args.showTyping ?? true) && (env("TELEGRAM_STREAMING") ?? "true") !== "false";
 
-  const editThrottleMs = 120;
+  const editThrottleMs = Math.max(120, Math.min(1000, Number(env("TELEGRAM_EDIT_THROTTLE_MS") ?? 220)));
   const typingIntervalMs = Math.max(1000, Number(env("TELEGRAM_TYPING_INTERVAL_MS") ?? 4000));
   const maxEditChars = Math.max(800, Math.min(3800, Number(env("TELEGRAM_STREAM_CHUNK_CHARS") ?? 3500)));
+  const streamOpenChars = Math.max(8, Math.min(300, Number(env("TELEGRAM_STREAM_FIRST_CHARS") ?? 24)));
 
   let typingLoop: { stop: () => void } | null = null;
   let placeholderMsgId: number | null = null;
@@ -5010,18 +5028,32 @@ export async function agentTurn(args: {
   }
 
   // ============================================================
-  // Load Composio session meta tools and wrap them with deterministic asset resolution
+  // Tool setup: fast by default, full external tools on demand
   // ============================================================
-  let composioTools: ToolSet = {};
-  if (getComposioProjectApiKey(args.composio)) {
-    const rawTools = await getComposioToolsForUser(args.userId, args.composio?.session, args.composio).catch(
-      () => ({} as ToolSet)
-    );
-    composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
-      sessionAssets,
-      composioConfig: args.composio,
-    });
-  }
+  const hasComposioConfig = Boolean(getComposioProjectApiKey(args.composio));
+
+type RequestExternalToolsInput = {
+  reason?: string;
+};
+
+type RequestExternalToolsOutput = {
+  requested: true;
+  reason: string;
+  marker: string;
+};
+
+const requestExternalTools = tool<RequestExternalToolsInput, RequestExternalToolsOutput>({
+  description:
+    "Call this immediately when the user request requires any capability/tool that is not currently available in this fast path, including file/VFS work, sending media, scheduling, voice/TTS, SSH, external apps/services, browser automation, account auth, or Composio discovery/execution.",
+  inputSchema: zodSchema(
+    z.object({
+      reason: z.string().max(500).optional(),
+    })
+  ),
+  execute: async (input: RequestExternalToolsInput): Promise<RequestExternalToolsOutput> => {
+    throw new Error(`${EXTERNAL_TOOLS_REQUESTED_MARKER}: ${String(input.reason ?? "external tools needed")}`);
+  },
+});
 
   const nativeTools: ToolSet = {
     schedule_message: scheduleMessage,
@@ -5050,6 +5082,7 @@ export async function agentTurn(args: {
 
   function isReadOnlyToolForCoordination(toolName: string): boolean {
     return new Set([
+      "request_external_tools",
       "list_skills",
       "read_skill",
       "read_virtual_file",
@@ -5095,14 +5128,8 @@ export async function agentTurn(args: {
     return wrapped as ToolSet;
   }
 
-  const tools: ToolSet = wrapToolsWithCoordination({
-    ...composioTools,
-    ...nativeTools,
-  });
-
-  const retryTools: ToolSet = tools;
-
   const historyChars = primaryMessages.reduce((sum, message) => sum + approximateModelMessageChars(message), 0);
+  const estimatedToolCount = 1;
   const policy = await decideReasoningPolicy({
     fastModel,
     smartModel,
@@ -5110,13 +5137,50 @@ export async function agentTurn(args: {
     userText,
     hasRichMedia,
     historyChars,
-    toolCount: Object.keys(tools as Record<string, unknown>).length,
+    toolCount: estimatedToolCount,
     baseTemperature,
     baseMaxToolSteps,
   });
   const modelName = policy.modelName;
   const temperature = policy.temperature;
   const maxToolSteps = policy.maxToolSteps;
+
+  const baseTools: ToolSet = wrapToolsWithCoordination({
+    request_external_tools: requestExternalTools,
+  });
+
+  let fullToolsPromise: Promise<ToolSet> | null = null;
+  async function loadFullTools(): Promise<ToolSet> {
+    if (!fullToolsPromise) {
+      fullToolsPromise = (async () => {
+        let composioTools: ToolSet = {};
+        if (hasComposioConfig) {
+          const rawTools = await getComposioToolsForUser(args.userId, args.composio?.session, args.composio).catch(
+            () => ({} as ToolSet)
+          );
+          composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
+            sessionAssets,
+            composioConfig: args.composio,
+          });
+        }
+
+        return wrapToolsWithCoordination({
+          ...composioTools,
+          ...nativeTools,
+        });
+      })();
+    }
+    return await fullToolsPromise;
+  }
+
+  const fastPathToolsEnabled = (env("AGENT_FAST_PATH_TOOLS") ?? "true") !== "false";
+  const eagerTools =
+    !fastPathToolsEnabled ||
+    (env("AGENT_EAGER_TOOLS") ?? "false") === "true" ||
+    (hasComposioConfig &&
+      ((env("COMPOSIO_EAGER_TOOLS") ?? "false") === "true" ||
+        ((env("COMPOSIO_EAGER_ON_REASONING") ?? "false") === "true" && policy.modelTier === "reasoning")));
+  const tools: ToolSet = eagerTools ? await loadFullTools() : baseTools;
 
   // ============================================================
   // Telegram streaming helpers
@@ -5208,7 +5272,7 @@ export async function agentTurn(args: {
       if (force) return text.trim().length > 0;
       if (!policy.streamFinalText) return false;
       const t = text.trim();
-      return t.length >= 80 || /[.!?]\s*$/.test(t) || t.includes("\n");
+      return t.length >= streamOpenChars || /[.!?]\s*$/.test(t) || t.includes("\n");
     };
 
     const requestRender = async (force = false) => {
@@ -5249,6 +5313,24 @@ export async function agentTurn(args: {
             turnLifecycle.send({ type: "TEXT_SEEN" });
           }
           await requestRender(false);
+          break;
+        }
+
+        case "tool-call":
+        case "tool-call-streaming-start":
+        case "tool-call-delta": {
+          const toolName = String(part?.toolName ?? part?.tool_name ?? "");
+          if (toolName === "request_external_tools") {
+            throw new Error(`${EXTERNAL_TOOLS_REQUESTED_MARKER}: streamed tool request`);
+          }
+          break;
+        }
+
+        case "tool-result": {
+          const toolName = String(part?.toolName ?? part?.tool_name ?? "");
+          if (toolName === "request_external_tools") {
+            throw new Error(`${EXTERNAL_TOOLS_REQUESTED_MARKER}: streamed tool result`);
+          }
           break;
         }
 
@@ -5300,19 +5382,16 @@ export async function agentTurn(args: {
     "- For external side effects, trust tool results over assumptions. Never say something was changed/sent/created unless the tool result confirms it.",
     "",
     "CRITICAL TOOL RULES:",
-    "- If the user asks for an external action, use the appropriate tool.",
+    "- If the user asks for an action or a capability requiring a tool, use the appropriate tool; if the tool is not currently available and request_external_tools is available, call request_external_tools first.",
     "- Never claim an action succeeded unless a tool call returned success.",
     "- For external apps/services, prefer the Composio session meta tools already loaded for this user.",
     "- Let Composio search, authenticate, and execute dynamically at runtime instead of relying on hard-coded toolkit routing.",
     "",
     "COMPOSIO SESSION:",
     `- Active namespace: ${args.userId}`,
-    "- session.tools() returns Composio meta tools for discovery, auth, execution, browser automation toolkit discovery, and the persistent workbench sandbox.",
-    "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app/tool slug or need browser automation or other dynamic toolkit discovery.",
-    "- Use COMPOSIO_GET_TOOL_SCHEMAS to inspect exact tool inputs before execution.",
-    "- Use COMPOSIO_MANAGE_CONNECTIONS when auth may be missing or the user asks to connect an app.",
-    "- Use COMPOSIO_MULTI_EXECUTE_TOOL or COMPOSIO_EXECUTE_TOOL to run Composio actions after discovery.",
-    "- Use COMPOSIO_REMOTE_WORKBENCH or COMPOSIO_REMOTE_BASH_TOOL for the Composio code sandbox/workbench.",
+    "- For latency, full Composio session tools may be loaded lazily instead of before every simple chat reply.",
+    "- If request_external_tools is available and the user needs any missing tool/action/file/send/schedule/voice/external app/browser/account capability, call it immediately before answering; the runtime will retry this turn with the full tool set loaded.",
+    "- When full Composio tools are available, use COMPOSIO_SEARCH_TOOLS for dynamic discovery, COMPOSIO_GET_TOOL_SCHEMAS for exact inputs, COMPOSIO_MANAGE_CONNECTIONS for auth, COMPOSIO_MULTI_EXECUTE_TOOL/COMPOSIO_EXECUTE_TOOL for actions, and COMPOSIO_REMOTE_WORKBENCH/COMPOSIO_REMOTE_BASH_TOOL for sandbox work.",
     "- Use composio_api_request for project-scoped Composio platform APIs that are outside session meta tools, including /webhook_subscriptions, /trigger_instances, /triggers_types, /connected_accounts, /auth_configs, /toolkits, /tools, /files, /mcp, /tool_router, and /org/project/config.",
     "- Use composio_org_api_request only for org-level project administration endpoints such as /org/owner/project/list or /org/owner/project/new when an org key is configured.",
     "- Use composio_get_mcp_server to retrieve MCP connection info for this user session.",
@@ -5547,6 +5626,10 @@ export async function agentTurn(args: {
         recovered,
       });
     } catch (error) {
+      if (isExternalToolsRequestedError(error)) {
+        turnLifecycle.send({ type: "MODEL_ERROR" });
+        throw error;
+      }
       if (isPromptBudgetRetryableError(error) && !options.sourceError) {
         turnLifecycle.send({ type: "MODEL_ERROR" });
         throw error;
@@ -5562,11 +5645,24 @@ export async function agentTurn(args: {
       try {
         return await runStreamingAttempt(primaryMessages, tools);
       } catch (error) {
+        if (isExternalToolsRequestedError(error)) {
+          const fullTools = await loadFullTools();
+          try {
+            return await runStreamingAttempt(primaryMessages, fullTools, "RETRY_STREAMING");
+          } catch (externalRetryError) {
+            return await runGenerateAttempt(retryMessages, fullTools, {
+              deliverTelegram: true,
+              lifecycleEvent: "RETRY_GENERATE",
+              sourceError: externalRetryError,
+            });
+          }
+        }
+
         if (isPromptBudgetRetryableError(error)) {
           try {
-            return await runStreamingAttempt(retryMessages, retryTools, "RETRY_STREAMING");
+            return await runStreamingAttempt(retryMessages, tools, "RETRY_STREAMING");
           } catch (retryError) {
-            return await runGenerateAttempt(retryMessages, retryTools, {
+            return await runGenerateAttempt(retryMessages, tools, {
               deliverTelegram: true,
               lifecycleEvent: "RETRY_GENERATE",
               sourceError: retryError,
@@ -5574,7 +5670,7 @@ export async function agentTurn(args: {
           }
         }
 
-        return await runGenerateAttempt(retryMessages, retryTools, {
+        return await runGenerateAttempt(retryMessages, tools, {
           deliverTelegram: true,
           lifecycleEvent: "RETRY_GENERATE",
           sourceError: error,
@@ -5585,10 +5681,18 @@ export async function agentTurn(args: {
     try {
       return await runGenerateAttempt(primaryMessages, tools);
     } catch (error) {
+      if (isExternalToolsRequestedError(error)) {
+        const fullTools = await loadFullTools();
+        return await runGenerateAttempt(primaryMessages, fullTools, {
+          lifecycleEvent: "RETRY_GENERATE",
+          sourceError: error,
+        });
+      }
+
       if (!isPromptBudgetRetryableError(error)) {
         return await resultFromModelFailure(error, false);
       }
-      return await runGenerateAttempt(retryMessages, retryTools, {
+      return await runGenerateAttempt(retryMessages, tools, {
         lifecycleEvent: "RETRY_GENERATE",
         sourceError: error,
       });
