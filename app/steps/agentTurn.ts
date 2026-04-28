@@ -22,6 +22,7 @@ import { shortHash } from "@/app/lib/hash";
 import type { Channel } from "@/app/lib/identity";
 import { createSendTask } from "@/app/lib/tasks";
 import { sshExec } from "@/app/steps/sshExec";
+import { createAgentTurnController } from "@/app/lib/agentTurnMachine";
 
 import {
   telegramSendMessage,
@@ -3670,6 +3671,160 @@ function createEditCoalescer(opts: {
   };
 }
 
+
+function extractStreamTextDelta(part: any): string {
+  if (!part || typeof part !== "object") return "";
+  for (const key of ["text", "delta", "textDelta", "text_delta"]) {
+    const value = part[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return "";
+}
+
+function safeJsonForRecovery(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+function extractTextFromArbitraryContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (!part || typeof part !== "object") return "";
+        const p: any = part;
+        if (typeof p.text === "string") return p.text;
+        if (typeof p.delta === "string") return p.delta;
+        if (typeof p.textDelta === "string") return p.textDelta;
+        if (p.type === "tool-result" || p.type === "tool-output-available") {
+          return safeJsonForRecovery(p.result ?? p.output ?? p.content ?? p);
+        }
+        if (p.type === "file" || p.type === "image") return "[" + p.type + "]";
+        return "";
+      })
+      .filter((x) => x.trim().length > 0)
+      .join("\n");
+  }
+
+  if (typeof content === "object") {
+    const c: any = content;
+    if (typeof c.text === "string") return c.text;
+    if (typeof c.content === "string") return c.content;
+  }
+
+  return "";
+}
+
+function extractAssistantTextFromResponseMessages(messages: unknown): string {
+  if (!Array.isArray(messages)) return "";
+
+  const chunks: string[] = [];
+  for (const message of messages) {
+    const m: any = message;
+    if (!m || m.role !== "assistant") continue;
+    const text = extractTextFromArbitraryContent(m.content).trim();
+    if (text) chunks.push(text);
+  }
+
+  return chunks.join("\n").trim();
+}
+
+function modelMessageForRecovery(message: unknown): string {
+  const m: any = message;
+  if (!m || typeof m !== "object") return String(message ?? "");
+  const role = String(m.role ?? "message");
+  const contentText = extractTextFromArbitraryContent(m.content).trim();
+  if (contentText) return role + ": " + contentText;
+  return role + ": " + safeJsonForRecovery(m).slice(0, 3000);
+}
+
+function responseMessageForRecovery(message: unknown): string {
+  const m: any = message;
+  if (!m || typeof m !== "object") return String(message ?? "");
+  const role = String(m.role ?? "response");
+  const contentText = extractTextFromArbitraryContent(m.content).trim();
+  if (contentText) return role + ": " + contentText;
+  return role + ": " + safeJsonForRecovery(m).slice(0, 3000);
+}
+
+async function readStreamResultText(result: any): Promise<string> {
+  const value = result?.text;
+  try {
+    if (typeof value === "string") return value;
+    if (value && typeof value.then === "function") return String(await value);
+  } catch {
+    // fall through
+  }
+  return "";
+}
+
+async function readStreamResponseMessages(result: any): Promise<any[]> {
+  try {
+    const value = result?.response;
+    const response = value && typeof value.then === "function" ? await value : value;
+    return Array.isArray(response?.messages) ? response.messages : [];
+  } catch {
+    return [];
+  }
+}
+
+async function recoverEmptyAssistantText(args: {
+  modelName: string;
+  system: string;
+  originalMessages: ModelMessage[];
+  responseMessages: any[];
+  temperature: number;
+  reasoningEffort: ReasoningEffort;
+}): Promise<string> {
+  const transcript = [
+    "Original conversation:",
+    ...args.originalMessages.map(modelMessageForRecovery),
+    "",
+    "Model/tool transcript from the previous attempt:",
+    ...(args.responseMessages.length ? args.responseMessages.map(responseMessageForRecovery) : ["(No response messages were returned.)"]),
+  ].join("\n");
+
+  const prompt = [
+    "The previous model/tool loop ended without assembled assistant text.",
+    "Do not call tools again. Use only the transcript below and provide the final user-facing answer now.",
+    "If the transcript does not contain enough information, say exactly what is missing and ask one concise follow-up question.",
+    "",
+    truncateForModelContext(transcript, 18000),
+  ].join("\n");
+
+  const request: any = {
+    model: openai(args.modelName),
+    system: args.system,
+    prompt,
+    providerOptions: {
+      openai: {
+        parallelToolCalls: false,
+      },
+    },
+  };
+
+  if (isReasoningModel(args.modelName) && args.reasoningEffort !== "none") {
+    request.providerOptions.openai.reasoningEffort = args.reasoningEffort;
+  }
+
+  if (shouldSendTemperature(args.modelName, args.temperature)) {
+    request.temperature = args.temperature;
+  }
+
+  try {
+    const result = await generateText(request);
+    return String(result.text ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -3716,6 +3871,7 @@ export async function agentTurn(args: {
   const baseTemperature = Number(env("MODEL_TEMPERATURE") ?? "0.7");
   const baseMaxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 11));
   const turnId = args.turnId ?? shortHash({ sessionId: args.sessionId, userId: args.userId, userText, at: Date.now() }, 32);
+  const turnLifecycle = createAgentTurnController();
 
   const isTelegram = args.channel === "telegram";
   const telegramStreamingEnabled =
@@ -5085,16 +5241,19 @@ export async function agentTurn(args: {
       const type = String(part?.type ?? "");
 
       switch (type) {
-        case "text": {
-          full += String(part?.text ?? "");
+        case "text":
+        case "text-delta": {
+          const delta = extractStreamTextDelta(part);
+          if (delta) {
+            full += delta;
+            turnLifecycle.send({ type: "TEXT_SEEN" });
+          }
           await requestRender(false);
           break;
         }
 
-        case "text-delta": {
-          full += String(part?.delta ?? part?.textDelta ?? "");
-          await requestRender(false);
-          break;
+        case "error": {
+          throw new Error("AI stream error: " + stringifyError(part?.error ?? part));
         }
 
         case "finish":
@@ -5191,7 +5350,104 @@ export async function agentTurn(args: {
     "Be concise, accurate, and tool-grounded. For long tasks, preserve continuity with durable work items and memory rather than trying to hold everything only in transient chat history.",
   ].join("\n");
 
-  async function runStreamingAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
+  function operationalFallbackText(error: unknown, reason: string): string {
+    const lower = stringifyError(error).toLowerCase();
+
+    if (lower.includes("openai_api_key") || lower.includes("api key")) {
+      return "I can see your message, but this deployment is missing the model API key/config it needs to answer. Once that’s set, I’ll respond normally.";
+    }
+
+    if (lower.includes("rate_limit") || lower.includes("rate limit") || lower.includes("tokens per min")) {
+      return "I got rate-limited while answering that. Please try once more in a moment.";
+    }
+
+    if (lower.includes("context_length") || lower.includes("maximum context") || lower.includes("too many tokens")) {
+      return "That came through, but the conversation/context is too large for the model to finish cleanly. Send the most important part again and I’ll handle it from there.";
+    }
+
+    if (reason === "empty_model_output") {
+      return "I got your message, but the response came back empty. Send “retry” or restate it and I’ll run it again.";
+    }
+
+    return "I got your message, but hit a temporary generation issue before I could send the answer. Please try again.";
+  }
+
+  function lifecyclePayload<T extends Record<string, any>>(payload: T): T & {
+    lifecycle: ReturnType<typeof turnLifecycle.snapshot>;
+    lifecycleTrace: ReturnType<typeof turnLifecycle.trace>;
+  } {
+    return {
+      ...payload,
+      lifecycle: turnLifecycle.snapshot(),
+      lifecycleTrace: turnLifecycle.trace(),
+    };
+  }
+
+  async function deliverTelegramText(text: string) {
+    try {
+      const result = await deliverFinalTelegram(text);
+      turnLifecycle.send({ type: "DELIVERED" });
+      return result;
+    } catch (error) {
+      turnLifecycle.send({ type: "DELIVERY_ERROR" });
+      throw error;
+    }
+  }
+
+  async function recoverEmptyText(args: {
+    attemptMessages: ModelMessage[];
+    responseMessages: any[];
+    sourceError?: unknown;
+  }): Promise<{ text: string; recovered: boolean }> {
+    turnLifecycle.send({ type: "NO_ASSISTANT_TEXT" });
+
+    const recovered = await recoverEmptyAssistantText({
+      modelName,
+      system,
+      originalMessages: args.attemptMessages,
+      responseMessages: args.responseMessages,
+      temperature,
+      reasoningEffort: policy.reasoningEffort,
+    });
+
+    if (recovered.trim()) {
+      turnLifecycle.send({ type: "FALLBACK_TEXT" });
+      return { text: recovered.trim(), recovered: true };
+    }
+
+    turnLifecycle.send({ type: "FALLBACK_TEXT" });
+    return {
+      text: operationalFallbackText(args.sourceError, "empty_model_output"),
+      recovered: true,
+    };
+  }
+
+  async function resultFromModelFailure(error: unknown, deliverTelegram: boolean) {
+    turnLifecycle.send({ type: "MODEL_ERROR" });
+    const text = operationalFallbackText(error, "model_error");
+    turnLifecycle.send({ type: "FALLBACK_TEXT" });
+
+    if (deliverTelegram) {
+      await deliverTelegramText(text);
+    }
+
+    return lifecyclePayload({
+      text,
+      responseMessages: [] as any[],
+      delivered: deliverTelegram,
+      recovered: true,
+      recoveryReason: "model_error",
+      error: stringifyError(error),
+    });
+  }
+
+  async function runStreamingAttempt(
+    attemptMessages: ModelMessage[],
+    attemptTools: ToolSet,
+    lifecycleEvent: "START_STREAMING" | "RETRY_STREAMING" = "START_STREAMING"
+  ) {
+    turnLifecycle.send({ type: lifecycleEvent });
+
     const s = streamText(
       buildModelCallArgs({
         modelName,
@@ -5204,46 +5460,99 @@ export async function agentTurn(args: {
       })
     );
 
-    const streamedText = await streamToTelegram(s.fullStream as AsyncIterable<any>);
-
-    const maybeText = (s as any).text;
-    const fallbackText =
-      typeof maybeText === "string"
-        ? maybeText
-        : maybeText && typeof maybeText.then === "function"
-          ? await maybeText
-          : "";
-
-    const text = String(streamedText || fallbackText || "").trim();
-
-    if (!text) {
-      throw new Error("Streaming completed without assistant text");
+    let streamedText = "";
+    try {
+      streamedText = await streamToTelegram(s.fullStream as AsyncIterable<any>);
+    } catch (error) {
+      turnLifecycle.send({ type: "STREAM_ERROR" });
+      throw error;
     }
 
-    await deliverFinalTelegram(text);
+    const promiseText = await readStreamResultText(s);
+    const responseMessages = await readStreamResponseMessages(s);
+    const responseText = extractAssistantTextFromResponseMessages(responseMessages);
 
-    const responseMessages = Array.isArray((await (s as any).response)?.messages)
-      ? ((await (s as any).response).messages as any[])
-      : [];
+    let text = String(streamedText || promiseText || responseText || "").trim();
+    let recovered = false;
 
-    return { text, responseMessages, delivered: true };
+    if (!text) {
+      const recovery = await recoverEmptyText({
+        attemptMessages,
+        responseMessages,
+      });
+      text = recovery.text;
+      recovered = recovery.recovered;
+    } else {
+      turnLifecycle.send({ type: "GENERATED_TEXT" });
+    }
+
+    await deliverTelegramText(text);
+
+    return lifecyclePayload({
+      text,
+      responseMessages,
+      delivered: true,
+      recovered,
+    });
   }
 
+  async function runGenerateAttempt(
+    attemptMessages: ModelMessage[],
+    attemptTools: ToolSet,
+    options: {
+      deliverTelegram?: boolean;
+      lifecycleEvent?: "START_GENERATE" | "RETRY_GENERATE";
+      sourceError?: unknown;
+    } = {}
+  ) {
+    turnLifecycle.send({ type: options.lifecycleEvent ?? "START_GENERATE" });
 
-  async function runGenerateAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
-    const r = await generateText(
-      buildModelCallArgs({
-        modelName,
-        system,
-        messages: attemptMessages,
-        tools: attemptTools,
-        temperature,
-        maxToolSteps,
-        reasoningEffort: policy.reasoningEffort,
-      })
-    );
+    try {
+      const r = await generateText(
+        buildModelCallArgs({
+          modelName,
+          system,
+          messages: attemptMessages,
+          tools: attemptTools,
+          temperature,
+          maxToolSteps,
+          reasoningEffort: policy.reasoningEffort,
+        })
+      );
 
-    return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
+      const responseMessages = (r.response?.messages as any[]) ?? [];
+      let text = String(r.text || extractAssistantTextFromResponseMessages(responseMessages) || "").trim();
+      let recovered = false;
+
+      if (!text) {
+        const recovery = await recoverEmptyText({
+          attemptMessages,
+          responseMessages,
+          sourceError: options.sourceError,
+        });
+        text = recovery.text;
+        recovered = recovery.recovered;
+      } else {
+        turnLifecycle.send({ type: "GENERATED_TEXT" });
+      }
+
+      if (options.deliverTelegram) {
+        await deliverTelegramText(text);
+      }
+
+      return lifecyclePayload({
+        text,
+        responseMessages,
+        delivered: Boolean(options.deliverTelegram),
+        recovered,
+      });
+    } catch (error) {
+      if (isPromptBudgetRetryableError(error) && !options.sourceError) {
+        turnLifecycle.send({ type: "MODEL_ERROR" });
+        throw error;
+      }
+      return await resultFromModelFailure(error, Boolean(options.deliverTelegram));
+    }
   }
 
   try {
@@ -5253,18 +5562,39 @@ export async function agentTurn(args: {
       try {
         return await runStreamingAttempt(primaryMessages, tools);
       } catch (error) {
-        if (!isPromptBudgetRetryableError(error)) throw error;
-        return await runStreamingAttempt(retryMessages, retryTools);
+        if (isPromptBudgetRetryableError(error)) {
+          try {
+            return await runStreamingAttempt(retryMessages, retryTools, "RETRY_STREAMING");
+          } catch (retryError) {
+            return await runGenerateAttempt(retryMessages, retryTools, {
+              deliverTelegram: true,
+              lifecycleEvent: "RETRY_GENERATE",
+              sourceError: retryError,
+            });
+          }
+        }
+
+        return await runGenerateAttempt(retryMessages, retryTools, {
+          deliverTelegram: true,
+          lifecycleEvent: "RETRY_GENERATE",
+          sourceError: error,
+        });
       }
     }
 
     try {
       return await runGenerateAttempt(primaryMessages, tools);
     } catch (error) {
-      if (!isPromptBudgetRetryableError(error)) throw error;
-      return await runGenerateAttempt(retryMessages, retryTools);
+      if (!isPromptBudgetRetryableError(error)) {
+        return await resultFromModelFailure(error, false);
+      }
+      return await runGenerateAttempt(retryMessages, retryTools, {
+        lifecycleEvent: "RETRY_GENERATE",
+        sourceError: error,
+      });
     }
   } finally {
     typingLoop?.stop();
+    turnLifecycle.stop();
   }
 }

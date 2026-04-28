@@ -1,0 +1,25 @@
+@@ -263,3 +263,24 @@
+ `MESSAGE_COHERENCE_WINDOW_MS` is the quiet window before a pending inbound batch is claimed. `SPLIT_MESSAGE_JOIN_WINDOW_MS` is the maximum span that the fallback coalescer will join without a model call. Keep the quiet window short for snappier replies; raise it if your provider frequently splits long messages.
+ 
+ For production/serverless deployments, Redis is required. In-memory storage is local-only; set `ALLOW_MEMORY_STORE=true` only for local experiments.
++
++---
++
++## Blank-stream recovery and XState lifecycle guard
++
++This build also fixes the runtime failure where Telegram showed typing but no response and logs contained `Streaming completed without assistant text`.
++
++- Agent turns are now guarded by an XState v5 lifecycle machine in `app/lib/agentTurnMachine.ts`.
++- Streaming turns no longer throw just because the live stream had no text deltas.
++- The agent reads text from the live stream, the final stream result, and response messages.
++- If a tool-only or empty stream still has no user-facing text, the agent runs a no-tool recovery generation from the transcript.
++- If streaming fails, the turn falls back to non-streaming generation and still delivers a Telegram reply.
++- Final fallback replies are sent instead of requeueing the same inbound message forever.
++
++After applying this code, clear the old build output before rebuilding:
++
++```bash
++rm -rf .next
++npm install
++npm run build
++```
