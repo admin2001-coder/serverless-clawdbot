@@ -4,10 +4,7 @@
         {
           "name": "web",
           "runtime": "node",
-          "start_cmd": ["node", "server.js"],
-          "browser": {
-            "entry": "web.browser.js"
-          }
+          "start_cmd": ["node", "server.js"]
         }
       ]
     }
